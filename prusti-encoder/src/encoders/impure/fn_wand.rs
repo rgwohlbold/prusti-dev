@@ -1,5 +1,6 @@
 use crate::encoders::{
     ImpureEncVisitor, MirLocalDefEncOutput, MirSpecEnc,
+    mir_fn::MethodEnc,
     pure::spec::{EncodedPledge, MirSpecEncMode, PledgeArgs, PledgeExpr},
     ty::{RustTyDecomposition, generics::GParams, indirect::IndirectPredicatesEnc},
 };
@@ -24,11 +25,11 @@ pub enum WandEncError {
     Unsupported(#[allow(dead_code)] String),
 }
 
-impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
+impl<'vir> ImpureEncVisitor<'vir, '_> {
     pub fn package_wands(
         &mut self,
         final_borrow_state: &BorrowsState<'_, 'vir>,
-    ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
+    ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, MethodEnc>> {
         let mut wand_packages = Vec::new();
         let label = self.new_label("package_post");
         let result = self.local_defs.locals[mir::RETURN_PLACE].impure_snap;
@@ -214,12 +215,12 @@ impl<'vir> WandEncOutput<'vir> {
         })
     }
 
-    pub fn apply_wands<E: TaskEncoder>(
+    pub fn apply_wands(
         &self,
         arguments: &[vir::ExprSnap<'vir>],
         label_pre: &'vir str,
         label_post: &'vir str,
-        visitor: &mut ImpureEncVisitor<'vir, '_, E>,
+        visitor: &mut ImpureEncVisitor<'vir, '_>,
     ) {
         let result = visitor
             .vcx

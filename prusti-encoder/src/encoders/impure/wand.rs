@@ -6,8 +6,6 @@ use pcg::{
     coupling::PcgCoupledEdgeKind,
     pcg::PcgNode,
 };
-use task_encoder::TaskEncoder;
-
 use crate::encoders::ImpureEncVisitor;
 
 use super::r#loop::WandOldOuter;
@@ -17,7 +15,7 @@ type Output<'a> = AbstractionOutputTarget<'a>;
 type Inputs<'a> = Vec<Input<'a>>;
 type Outputs<'a> = Vec<Output<'a>>;
 
-impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
+impl<'vir, 'enc> ImpureEncVisitor<'vir, 'enc> {
     pub(super) fn get_abstraction_edges<'a>(
         &self,
         g: &'a BorrowsGraph<'vir>,

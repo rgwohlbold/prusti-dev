@@ -35,7 +35,8 @@ use prusti_rustc_interface::{
     span::{Span, def_id::DefId},
 };
 use prusti_utils::config;
-use task_encoder::{EncodeFullError, TaskEncoder, TaskEncoderDependencies};
+use task_encoder::{EncodeFullError, TaskEncoderDependencies};
+use crate::encoders::mir_fn::{MethodEnc, MethodEncError};
 use vir::{CastType, CompType, LocalDeclData};
 
 use crate::encoders::{
@@ -145,12 +146,12 @@ impl LocationLabelPrefix {
     }
 }
 
-pub struct ImpureEncVisitor<'vir, 'enc, E: TaskEncoder>
+pub struct ImpureEncVisitor<'vir, 'enc>
 where
     'vir: 'enc,
 {
     pub vcx: &'vir vir::VirCtxt<'vir>,
-    pub deps: &'enc mut TaskEncoderDependencies<'vir, E>,
+    pub deps: &'enc mut TaskEncoderDependencies<'vir, MethodEnc>,
     pub def_id: DefId,
     pub local_decls: &'enc mir::LocalDecls<'vir>,
     pub fpcs_analysis: PcgOutput<'enc, 'vir>,
@@ -201,7 +202,7 @@ macro_rules! comment {
     ) };
 }
 
-type EncodeResult<'vir, T, E> = Result<T, EncodeFullError<'vir, E>>;
+type EncodeResult<'vir, T> = Result<T, EncodeFullError<'vir, MethodEnc>>;
 
 struct EncodedRvalue<'vir> {
     /// A snapshot of the rvalue. This snapshot is guaranteed to be well-formed
@@ -248,18 +249,18 @@ impl<'vir> From<vir::ExprSnap<'vir>> for EncodedRvalue<'vir> {
     }
 }
 
-enum EncodeRvalueError<'vir, E: TaskEncoder> {
+enum EncodeRvalueError<'vir> {
     UnsupportedRvalue,
-    EncoderError(EncodeFullError<'vir, E>),
+    EncoderError(EncodeFullError<'vir, MethodEnc>),
 }
 
-impl<'vir, E: TaskEncoder> From<EncodeFullError<'vir, E>> for EncodeRvalueError<'vir, E> {
-    fn from(e: EncodeFullError<'vir, E>) -> Self {
+impl<'vir> From<EncodeFullError<'vir, MethodEnc>> for EncodeRvalueError<'vir> {
+    fn from(e: EncodeFullError<'vir, MethodEnc>) -> Self {
         EncodeRvalueError::EncoderError(e)
     }
 }
 
-impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
+impl<'vir, 'enc> ImpureEncVisitor<'vir, 'enc> {
     pub(crate) fn pcg_ctxt(&self) -> CompilerCtxt<'enc, 'vir> {
         self.fpcs_analysis.ctxt()
     }
@@ -288,7 +289,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         rvalue: &mir::Rvalue<'vir>,
         span: Span,
-    ) -> Result<EncodedRvalue<'vir>, EncodeRvalueError<'vir, E>> {
+    ) -> Result<EncodedRvalue<'vir>, EncodeRvalueError<'vir>> {
         let rvalue_ty = rvalue.ty(self.local_decls, self.vcx.tcx());
         match rvalue {
             mir::Rvalue::Use(op) => Ok(self
@@ -560,7 +561,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         label: Option<&'vir str>,
         edge_to_loop: bool,
         to_skip: &mut Vec<mir::BasicBlock>,
-    ) -> EncodeResult<'vir, (), E> {
+    ) -> EncodeResult<'vir, ()> {
         let conditions = edge.conditions();
 
         // For each block `b` where the edge is only valid if control flow
@@ -614,7 +615,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         label: Option<&'vir str>,
         edge_to_loop: bool,
         to_skip: &mut Vec<mir::BasicBlock>,
-    ) -> EncodeResult<'vir, (), E> {
+    ) -> EncodeResult<'vir, ()> {
         match edge.kind() {
             BorrowPcgEdgeKind::Borrow(borrow) if borrow.is_mut() && edge_action.is_remove() => {
                 // For a borrow e.g. let x = &mut y; the capability to `y` is
@@ -762,7 +763,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                                 .chain(args.iter().map(|operand| {
                                     self.encode_operand_snap_immediate(&operand.node)
                                 }))
-                                .collect::<Result<Vec<_>, EncodeFullError<'vir, E>>>()?;
+                                .collect::<Result<Vec<_>, EncodeFullError<'vir, MethodEnc>>>()?;
                         let (label_pre, label_post) = self.call_labels[&call.location().block];
                         wands.apply_wands(&wand_args, label_pre, label_post, self);
                     }
@@ -793,7 +794,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         borrows_state: &BorrowsState<'_, 'vir>,
         actions: &[BorrowPcgUnblockAction<'vir>],
         label: Option<&'vir str>,
-    ) -> EncodeResult<'vir, (), E> {
+    ) -> EncodeResult<'vir, ()> {
         let mut to_skip = Vec::new();
         for action in actions {
             self.pcs_handle_edge(
@@ -813,7 +814,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         pcg: &Pcg<'_, 'vir>,
         actions: &PcgActions<'vir>,
         edge_to_loop: bool,
-    ) -> EncodeResult<'vir, (), E> {
+    ) -> EncodeResult<'vir, ()> {
         for action in actions.iter() {
             match action {
                 PcgAction::Borrow(action) => self.borrow_action(pcg, action, edge_to_loop)?,
@@ -827,7 +828,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         pcg: &Pcg<'_, 'vir>,
         action: &BorrowPcgAction<'vir>,
         edge_to_loop: bool,
-    ) -> EncodeResult<'vir, (), E> {
+    ) -> EncodeResult<'vir, ()> {
         let mut to_skip = Vec::new();
         match action.kind() {
             //Restore(RestoreCapability<'tcx>),
@@ -1005,7 +1006,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     fn encode_operand(
         &mut self,
         operand: &mir::Operand<'vir>,
-    ) -> EncodeResult<'vir, vir::ExprRef<'vir>, E> {
+    ) -> EncodeResult<'vir, vir::ExprRef<'vir>> {
         let ty = operand.ty(self.local_decls, self.vcx.tcx());
         let (encode_place_result, ty_out) = match operand {
             &mir::Operand::Move(source) => {
@@ -1034,7 +1035,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     fn encode_operand_snap_immediate(
         &mut self,
         operand: &mir::Operand<'vir>,
-    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, E>> {
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, MethodEnc>> {
         match operand {
             &mir::Operand::Move(source) | &mir::Operand::Copy(source) => {
                 Ok(self.encode_place_with_snap(Place::from(source)).1)
@@ -1219,7 +1220,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         block: mir::BasicBlock,
         data: &mir::BasicBlockData<'vir>,
-    ) -> Result<(), EncodeFullError<'vir, E>> {
+    ) -> Result<(), EncodeFullError<'vir, MethodEnc>> {
         // We are verifying the absence of panics, so cleanup block should never
         // be reached, or even referenced.
         if data.is_cleanup {
@@ -1247,12 +1248,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         let cfpcs = match self.fpcs_analysis.get_all_for_bb(block) {
             Ok(cfpcs) => cfpcs.unwrap(),
             Err(e) => {
-                let span = data.terminator().source_info.span;
-                return Err(EncodeFullError::DependencyError(vec![(
-                    "PCG analysis",
-                    format!("{e:?}"),
-                    vec![span],
-                )]));
+                let error_msg = format!("unsupported feature in function body: {e:?}");
+                return Err(EncodeFullError::EncodingError(
+                    MethodEncError::PcgError(error_msg),
+                    None,
+                ));
             }
         };
 
@@ -1319,7 +1319,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         statement: &mir::Statement<'vir>,
         location: mir::Location,
-    ) -> Result<(), EncodeFullError<'vir, E>> {
+    ) -> Result<(), EncodeFullError<'vir, MethodEnc>> {
         self.vcx.with_span(statement.source_info.span, |_vcx| {
             self.deps().check_cycle()?;
 
@@ -1444,7 +1444,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         terminator: &mir::Terminator<'vir>,
         location: mir::Location,
-    ) -> Result<(), EncodeFullError<'vir, E>> {
+    ) -> Result<(), EncodeFullError<'vir, MethodEnc>> {
         self.deps().check_cycle()?;
 
         self.new_before_label(location);
@@ -1895,7 +1895,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    pub fn visit_body(&mut self, body: &mir::Body<'vir>) -> Result<(), EncodeFullError<'vir, E>> {
+    pub fn visit_body(&mut self, body: &mir::Body<'vir>) -> Result<(), EncodeFullError<'vir, MethodEnc>> {
         for (block, data) in body.basic_blocks.iter_enumerated() {
             self.visit_basic_block_data(block, data)?;
         }
@@ -1903,8 +1903,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     }
 }
 
-impl<'vir, 'enc, E: TaskEncoder> PureRvalueEnc<'vir> for ImpureEncVisitor<'vir, 'enc, E> {
-    type Encoder = E;
+impl<'vir, 'enc> PureRvalueEnc<'vir> for ImpureEncVisitor<'vir, 'enc> {
+    type Encoder = MethodEnc;
     type EncodePlaceCtxt = ();
     type ExprCurr = ();
     type ExprNext = !;
@@ -1933,7 +1933,7 @@ impl<'vir, 'enc, E: TaskEncoder> PureRvalueEnc<'vir> for ImpureEncVisitor<'vir, 
         &mut self,
         operand: &mir::Operand<'vir>,
         _ctxt: &Self::EncodePlaceCtxt,
-    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, E>> {
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, MethodEnc>> {
         match operand {
             &mir::Operand::Move(source) => {
                 let (result, snap_val, _, ty_out) =

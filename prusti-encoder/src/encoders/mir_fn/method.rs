@@ -107,23 +107,24 @@ impl TaskEncoder for MethodCallEnc {
 
 // Method encoder
 
-pub(super) struct MethodEnc;
+pub(crate) struct MethodEnc;
 
 #[derive(Debug, Clone)]
-pub(super) struct MethodEncOutputRef<'vir> {
+pub(crate) struct MethodEncOutputRef<'vir> {
     method_ref: MethodIdn<'vir, (vir::ManyRef, vir::ManyTyVal, vir::ManyCSnap)>,
 }
 
 impl<'vir> OutputRefAny for MethodEncOutputRef<'vir> {}
 
-#[derive(Debug, Clone)]
-pub(super) struct MethodEncOutput<'vir> {
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MethodEncOutput<'vir> {
     method: vir::Method<'vir>,
-    encoding_errors: Vec<(String, prusti_rustc_interface::span::Span)>,
 }
 
 #[derive(Clone, Debug)]
-pub enum MethodEncError {}
+pub enum MethodEncError {
+    PcgError(String),
+}
 
 impl TaskEncoder for MethodEnc {
     task_encoder::encoder_cache!(MethodEnc);
@@ -134,6 +135,12 @@ impl TaskEncoder for MethodEnc {
     type OutputFullLocal<'vir> = MethodEncOutput<'vir>;
 
     type EncodingError = MethodEncError;
+
+    fn describe_error(error: Self::EncodingError) -> String {
+        match error {
+            MethodEncError::PcgError(msg) => msg,
+        }
+    }
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -231,7 +238,6 @@ impl TaskEncoder for MethodEnc {
             let local_def_id = def_id
                 .as_local()
                 .filter(|_| !trusted && is_function_with_body(vcx.tcx(), def_id));
-            let mut encoding_errors = Vec::new();
             let blocks = if let Some(local_def_id) = local_def_id {
                 let body_with_facts = vcx.body_mut().get_impure_fn_body_with_facts(local_def_id);
                 let body = &body_with_facts.body;
@@ -296,16 +302,11 @@ impl TaskEncoder for MethodEnc {
                 // if we encountered an error/cycle during encoding, we don't emit a method body
                 let visit_ok = match visitor.visit_body(body) {
                     Ok(()) => true,
-                    Err(EncodeFullError::AlreadyEncoded) => {
-                        return Err(EncodeFullError::AlreadyEncoded);
-                    }
-                    Err(e) => {
-                        encoding_errors.push((
-                            format!("{e:?}"),
-                            vcx.tcx().def_span(task_key),
-                        ));
-                        false
-                    }
+                    // AlreadyEncoded and EncodingError must propagate
+                    Err(EncodeFullError::AlreadyEncoded) => return Err(EncodeFullError::AlreadyEncoded),
+                    Err(e @ EncodeFullError::EncodingError(..)) => return Err(e),
+                    // DependencyErrors are reported by the failing encoder
+                    Err(EncodeFullError::DependencyError(_)) => false,
                 };
                 if visit_ok {
                     start_stmts.extend(
@@ -328,7 +329,7 @@ impl TaskEncoder for MethodEnc {
                         vcx.alloc(vir::TerminatorStmtData::Exit),
                     ));
 
-                        visitor.deps.check_cycle()?;
+                    visitor.deps.check_cycle()?;
 
                     Some(visitor.encoded_blocks)
                 } else {
@@ -352,7 +353,6 @@ impl TaskEncoder for MethodEnc {
                         vcx.alloc_slice(&posts),
                         blocks.map(|blocks| vcx.alloc_slice(&blocks)),
                     ),
-                    encoding_errors,
                 },
                 (),
             ))
@@ -362,7 +362,6 @@ impl TaskEncoder for MethodEnc {
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
         for output in Self::all_outputs_local_no_errors(program) {
             program.add_method(output.method);
-            program.encoder_errors().extend(output.encoding_errors);
         }
     }
 }

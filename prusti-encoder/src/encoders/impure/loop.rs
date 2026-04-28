@@ -12,7 +12,6 @@ use pcg::{
 };
 use prusti_rustc_interface::middle::mir;
 
-use task_encoder::TaskEncoder;
 use vir::Reify;
 
 use crate::encoders::{
@@ -25,7 +24,7 @@ pub(super) enum WandOldOuter<'vir> {
     Label(Option<&'vir str>),
 }
 
-impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
+impl<'vir: 'a, 'a, 'enc> ImpureEncVisitor<'vir, 'enc> {
     /// Calculate invariant at loop head
     pub(crate) fn get_loop_inv(
         &mut self,
