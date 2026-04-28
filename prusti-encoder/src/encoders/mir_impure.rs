@@ -1244,7 +1244,17 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             self.vcx
                 .alloc(vir::CfgBlockLabelData::BasicBlock(block.as_usize())),
         );
-        let cfpcs = self.fpcs_analysis.get_all_for_bb(block).unwrap().unwrap();
+        let cfpcs = match self.fpcs_analysis.get_all_for_bb(block) {
+            Ok(cfpcs) => cfpcs.unwrap(),
+            Err(e) => {
+                let span = data.terminator().source_info.span;
+                return Err(EncodeFullError::DependencyError(vec![(
+                    "PCG analysis",
+                    format!("{e:?}"),
+                    vec![span],
+                )]));
+            }
+        };
 
         // Calculate invariant at loop head
         let invariant = self
