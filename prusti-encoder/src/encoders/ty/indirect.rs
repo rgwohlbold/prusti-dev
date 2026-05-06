@@ -2,7 +2,10 @@ use pcg::borrow_pcg::region_projection::{LifetimeProjection, PcgRegion};
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, Reify};
 
-use crate::encoders::{TyUseImpureEnc, ty::RustTyDecomposition};
+use crate::encoders::{
+    Pure, TyUseImpureEnc,
+    ty::{RustTyDecomposition, generics::GArgsCastEnc},
+};
 
 use super::{
     data::{StructData, TySpecifics},
@@ -97,6 +100,8 @@ impl TaskEncoder for IndirectPredicatesEnc {
                     let inner_impure = deps.require_dep::<TyUseImpureEnc>(inner_ty)?;
                     let ref_region = PcgRegion::from(ty.args.args()[0].expect_region());
                     let task_region = task_key.region(());
+                    // If this `&mut`'s lifetime matches the projection we're
+                    // computing, add `acc(p_Param(deref, T))` for its pointee.
                     if ref_region == task_region {
                         predicate_applications.push(vcx.mk_lazy_expr(
                             "ref_indirect",
@@ -107,8 +112,23 @@ impl TaskEncoder for IndirectPredicatesEnc {
                             }),
                         ));
                     }
+                    // Recurse for deeper indirects: normalize only for nested
+                    // MutRef (avoids looping through recursive structs); the
+                    // pure caster lifts the opaque snap (which the `p_Param`
+                    // we hold suffices to read) to the shape the recursion
+                    // expects.
+                    let inner_normalized = data.decompose_normalize(ty.args);
+                    let (recurse_ty, snap_via_caster) =
+                        if let TySpecifics::MutRef(..) = inner_normalized.ty.specifics {
+                            let pure_caster = deps.require_dep::<GArgsCastEnc<Pure>>(
+                                data.decompose_compare_normalize(ty.ty.params, ty.args),
+                            )?;
+                            (inner_normalized, Some(pure_caster))
+                        } else {
+                            (inner_ty, None)
+                        };
                     if let Some(new_projection) =
-                        LifetimeProjection::new(inner_ty, task_key.region(()), None, ())
+                        LifetimeProjection::new(recurse_ty, task_key.region(()), None, ())
                     {
                         let inner_indirect =
                             deps.require_dep::<IndirectPredicatesEnc>(new_projection)?;
@@ -121,15 +141,14 @@ impl TaskEncoder for IndirectPredicatesEnc {
                                         "ref_inner_indirect",
                                         vir::TYPE_BOOL,
                                         Box::new(move |vcx, self_expr: vir::ExprGenSnap<_, _>| {
-                                            inner_expr
-                                                .reify(
-                                                    vcx,
-                                                    inner_impure.ref_to_snap(
-                                                        ref_domain
-                                                            .deref_access(self_expr.downcast_ty()),
-                                                    ),
-                                                )
-                                                .kind
+                                            let inner_addr =
+                                                ref_domain.deref_access(self_expr.downcast_ty());
+                                            let opaque_snap = inner_impure.ref_to_snap(inner_addr);
+                                            let snap = match snap_via_caster {
+                                                Some(c) => c.cast_to_caller_ctx(opaque_snap),
+                                                None => opaque_snap,
+                                            };
+                                            inner_expr.reify(vcx, snap).kind
                                         }),
                                     )
                                 }),
