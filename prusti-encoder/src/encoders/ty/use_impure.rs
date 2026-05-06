@@ -63,6 +63,9 @@ pub struct TyUseImpureMutRef<'vir> {
     args: GArgsTy<'vir>,
     impure: <ImpureTyDatas as TyDatas<'vir>>::MutRefData,
     ref_to_snap: vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
+    /// `TyUseImpure` for the `Param` type used to build the indirect
+    /// `p_Param(deref_addr, type_val)` predicate that pairs with `p_Ref_mutable`.
+    inner_use: TyUseImpure<'vir>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -161,11 +164,17 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             }
             TySpecifics::MutRef(data) => {
                 let caster = self.encode_normalized(*data.0, ty.0.params);
+                let inner_decomp = data.0.decompose_context(ty.0.params, self.args);
+                let inner_use = self
+                    .deps
+                    .require_dep::<TyUseImpureEnc>(inner_decomp)
+                    .unwrap();
                 TySpecifics::mk_mutref(TyUseImpureMutRef {
                     caster,
                     args: self.args_t,
                     impure: *data.1,
                     ref_to_snap: ty.1.ref_to_snap,
+                    inner_use,
                 })
             }
             TySpecifics::ArrayLike(data) => {
@@ -531,6 +540,17 @@ impl<'vir> TyUseImpureMutRef<'vir> {
 
     pub fn prim_to_snap_assign(&self, self_ref: vir::ExprRef<'vir>) -> vir::ExprCSnap<'vir> {
         (self.impure.arbitrary_value)(self_ref)
+    }
+
+    /// `acc(p_Param(deref_addr, type_val))` for the pointee, the resource
+    /// `make_concrete`/`make_generic` operate on.
+    pub fn indirect_pred<'tcx>(
+        &self,
+        vcx: &'vir vir::VirCtxt<'tcx>,
+        self_ref: vir::ExprRef<'vir>,
+    ) -> vir::ExprBool<'vir> {
+        self.inner_use
+            .ref_to_pred(vcx, self.deref(self_ref, None), None)
     }
 
     fn fold(

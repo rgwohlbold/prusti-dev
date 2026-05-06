@@ -2,7 +2,7 @@ use crate::encoders::{
     TyUseImpureEnc,
     ty::{
         RustTyDatas,
-        data::{StructData, TyData},
+        data::{StructData, TyData, TySpecifics},
         impure::{ImpureTyDatas, PredicateBuilder, TyImpureEnc, TyImpureFieldData},
         pure::{AdtBuilder, PureTyDatas, TyPureEnc, TyPureFieldData, TyPureStructData},
         use_pure::TyUsePureEnc,
@@ -121,6 +121,24 @@ pub(crate) fn ty_impure_variant<'vir>(
         })
         .collect::<Vec<_>>();
 
+    // For each &mut T field, add acc(p_Param(deref_addr, type_val)) so that
+    // make_concrete/make_generic calls can find the required p_Param resource
+    // after unfolding this struct's predicate.
+    let indirect_preds = fields.iter().zip(&field_accessors).filter_map(
+        |(field, TyImpureFieldData { ref_to_field_ref })| {
+            if let TySpecifics::MutRef(mutref_data) = &field.specifics {
+                let field_ref = ref_to_field_ref(
+                    ref_self,
+                    builder.params.ty_exprs(),
+                    builder.params.const_exprs(),
+                );
+                Some(mutref_data.indirect_pred(builder.vcx, field_ref))
+            } else {
+                None
+            }
+        },
+    );
+
     // main variant predicate
     let mut pred_name = String::new();
     if !prefix.is_empty() {
@@ -141,6 +159,7 @@ pub(crate) fn ty_impure_variant<'vir>(
                     None,
                 )
             })
+            .chain(indirect_preds)
             .collect::<Vec<_>>(),
     );
     let pred_owned = builder.mk_predicate(&pred_name, Some(pred_expr));
