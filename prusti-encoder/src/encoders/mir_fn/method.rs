@@ -10,6 +10,7 @@ use crate::encoders::{
     Impure, ImpureEncVisitor, MirLocalDefEnc, MirLocalDefEncTask, MirSpecEnc, WandEnc, WandEncTask,
     mir_fn::{CallTaskDescription, RustSignature, SpecBlocks, SpecBlocksEnc},
     pure::spec::MirSpecEncMode,
+    ty::indirect_node::IndirectCheckEnc,
     ty::generics::{
         GArgCaster, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc,
         trait_impls::TraitImplEnc,
@@ -206,6 +207,10 @@ impl TaskEncoder for MethodEnc {
                 (def_id, def_id, MirSpecEncMode::Impure),
                 span,
             )?;
+            // TODO: remove together with `IndirectCheckEnc`. Before the wands,
+            // whose encoding fails for recursive types; failures are ignored.
+            let _ = deps.require_ref::<IndirectCheckEnc>(def_id);
+
             let function_data = FunctionData::new(def_id);
             let wands = deps
                 .require_dep_spanned::<WandEnc>(

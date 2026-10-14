@@ -2,6 +2,7 @@ pub mod pure;
 pub mod inhabited;
 pub mod indirect;
 pub mod indirect_pred;
+pub mod indirect_node;
 pub mod lifetime_query;
 pub mod impure;
 pub mod kinds;
