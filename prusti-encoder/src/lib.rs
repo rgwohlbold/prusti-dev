@@ -30,6 +30,7 @@ use crate::encoders::{
                 TraitImplConditionEnc, TraitImplDefaultFnEnc, TraitImplEnc, TraitImplItemEnc,
             },
         },
+        indirect_node::IndirectCheckEnc,
         interpretation::{bitvec::BitVecEnc, float_conv::FloatBitVecConvEnc},
         lifted::TyConstructorEnc,
     },
@@ -94,6 +95,9 @@ pub fn test_entrypoint<'tcx>(
 
     program.header("user methods");
     crate::encoders::MethodCallEnc::emit_outputs(&mut program);
+    // TODO: remove together with `IndirectCheckEnc`.
+    program.header("indirect predicate checks");
+    IndirectCheckEnc::emit_outputs(&mut program);
 
     program.header("MIR builtins");
     crate::encoders::MirBuiltinUnOpEnc::emit_outputs(&mut program);
