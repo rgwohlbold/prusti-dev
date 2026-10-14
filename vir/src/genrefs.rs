@@ -18,7 +18,7 @@ pub type DomainAxiomGen<'vir, Curr, Next> =
     &'vir crate::gendata::DomainAxiomGenData<'vir, Curr, Next>;
 pub type DomainGen<'vir, Curr, Next> = &'vir crate::gendata::DomainGenData<'vir, Curr, Next>;
 typed_gen!(Bool => ExprGenBool, Int => ExprGenInt, Perm => ExprGenPerm, Ref => ExprGenRef, Set => ExprGenSet, Multiset => ExprGenMultiset, Seq => ExprGenSeq, Map => ExprGenMap);
-typed_gen!(CSnap => ExprGenCSnap, PSnap => ExprGenPSnap, TyVal => ExprGenTyVal);
+typed_gen!(CSnap => ExprGenCSnap, PSnap => ExprGenPSnap, TyVal => ExprGenTyVal, LifetimeQuery => ExprGenLifetimeQuery);
 typed_gen!(Prim => ExprGenPrim, Snap => ExprGenSnap, Dyn => ExprGenDyn);
 pub type ExprGen<'vir, Curr, Next, T> = &'vir crate::gendata::ExprGenData<'vir, Curr, Next, T>;
 pub type ExprKindGen<'vir, Curr, Next> = &'vir crate::gendata::ExprKindGenData<'vir, Curr, Next>;
