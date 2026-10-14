@@ -40,6 +40,9 @@ pub(crate) struct IndCastersEnc;
 pub(crate) struct IndCasters<'vir> {
     pub(crate) make_generic: IndCaster<'vir>,
     pub(crate) make_concrete: IndCaster<'vir>,
+    /// The pure cast of the keys (`make_generic_s_X`).
+    pub(crate) make_generic_s:
+        vir::FunctionIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap), vir::PSnap>,
 }
 
 pub(crate) type IndCaster<'vir> =
@@ -83,15 +86,16 @@ impl TaskEncoder for IndCastersEnc {
                 vir::vir_format_identifier!(vcx, "make_concrete_ind_{base_name}"),
                 (vir::TYPE_PSNAP.upcast_ty(), args.1, args.2, args.3),
             );
+            let casters = deps.require_ref::<CastersEnc<Pure>>(*task_key)?;
             deps.emit_output_ref(
                 *task_key,
                 IndCasters {
                     make_generic: make_generic_ident,
                     make_concrete: make_concrete_ident,
+                    make_generic_s: casters.make_generic,
                 },
             )?;
 
-            let casters = deps.require_ref::<CastersEnc<Pure>>(*task_key)?;
             let ty_constructor = deps.require_ref::<TyConstructorEnc>(concrete)?.ty_constructor;
             let concrete_ind = deps.require_ref::<TyIndirectEnc>(concrete)?;
             let concrete_dep = deps.require_dep::<TyIndirectEnc>(concrete)?;
@@ -115,7 +119,7 @@ impl TaskEncoder for IndCastersEnc {
             };
             let concrete_ext = |k, kp| (concrete_ind.ext)(k, tys, consts, kp, q);
             let param_ext = |p, pp| (param_ind.ext)(p, &[lifted_ty], &[], pp, q);
-            // `pre(q) ==> forall K :: { trigger } agree ==> body`
+            // `forall K :: { trigger } agree ==> body`
             let equation = |k_decl: vir::LocalDeclSnap<'vir>,
                              trigger: vir::ExprSnap<'vir>,
                              agree: Option<vir::ExprBool<'vir>>,
@@ -126,17 +130,11 @@ impl TaskEncoder for IndCastersEnc {
                         .downcast_ty(),
                     None => body,
                 };
-                let forall = vcx.mk_forall_expr(
+                vcx.mk_forall_expr(
                     vcx.alloc_slice(&[k_decl]),
                     vcx.alloc_slice(&[vcx.mk_trigger(&[trigger])]),
                     body,
-                );
-                match concrete_dep.query_pre {
-                    Some(pre) => vcx
-                        .mk_bin_op_expr(vir::BinOpKind::Implies, pre.reify(vcx, q), forall)
-                        .downcast_ty(),
-                    None => forall,
-                }
+                )
             };
 
             // make_generic_ind_X
@@ -154,12 +152,24 @@ impl TaskEncoder for IndCastersEnc {
                     make_generic(vcx.mk_old_expr(concrete_ext(big_k, k))),
                 ),
             );
+            // The instance `K := k` (the piece's own key) of the equation,
+            // stated explicitly so that its terms exist after the call (the
+            // quantified version needs a trigger term).
+            let k_generic = make_generic(k).upcast_ty();
+            let generic_instance = vcx.mk_eq_expr(
+                param_ext(k_generic, k_generic).downcast_ty::<vir::PSnap>(),
+                make_generic(vcx.mk_old_expr(concrete_ext(k, k))),
+            );
             let make_generic_method = vcx.mk_method(
                 make_generic_ident,
                 (k_decl, generics.ty_decls(), generics.const_decls(), q_decl),
                 &[],
                 vcx.alloc_slice(&[concrete_pred(k)]),
-                vcx.alloc_slice(&[param_pred(make_generic(k).upcast_ty()), generic_equation]),
+                vcx.alloc_slice(&[
+                    param_pred(make_generic(k).upcast_ty()),
+                    generic_equation,
+                    generic_instance,
+                ]),
                 None,
             );
 
@@ -180,6 +190,11 @@ impl TaskEncoder for IndCastersEnc {
                     make_generic(concrete_ext_app),
                 ),
             );
+            // the instance `K := p` (see `make_generic_ind_X`)
+            let concrete_instance = vcx.mk_eq_expr(
+                vcx.mk_old_expr(param_ext(p, p)).downcast_ty::<vir::PSnap>(),
+                make_generic(concrete_ext(make_concrete(p), make_concrete(p))),
+            );
             let make_concrete_method = vcx.mk_method(
                 make_concrete_ident,
                 (p_decl, generics.ty_decls(), generics.const_decls(), q_decl),
@@ -189,6 +204,7 @@ impl TaskEncoder for IndCastersEnc {
                     concrete_pred(make_concrete(p)),
                     vcx.mk_eq_expr(make_generic(make_concrete(p)), p.downcast_ty()),
                     concrete_equation,
+                    concrete_instance,
                 ]),
                 None,
             );

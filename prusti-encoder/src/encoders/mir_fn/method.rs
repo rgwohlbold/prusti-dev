@@ -11,7 +11,6 @@ use crate::encoders::{
     WandEnc, WandEncTask,
     mir_fn::{CallTaskDescription, RustSignature, SpecBlocks, SpecBlocksEnc},
     pure::spec::MirSpecEncMode,
-    ty::indirect_node::IndirectCheckEnc,
     ty::generics::{
         GArgCaster, GArgs, GArgsCastEnc, GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc,
         trait_impls::TraitImplEnc,
@@ -208,10 +207,6 @@ impl TaskEncoder for MethodEnc {
                 (def_id, def_id, MirSpecEncMode::Impure),
                 span,
             )?;
-            // TODO: remove together with `IndirectCheckEnc`. Before the wands,
-            // whose encoding fails for recursive types; failures are ignored.
-            let _ = deps.require_ref::<IndirectCheckEnc>(def_id);
-
             let function_data = FunctionData::new(def_id);
             let wands = deps
                 .require_dep_spanned::<WandEnc>(
@@ -366,6 +361,15 @@ impl TaskEncoder for MethodEnc {
 
                     current_block: None,
                     current_block_pres: None,
+                    current_phase: None,
+                    labelled_phase: None,
+                    pending_expansions: Vec::new(),
+                    pending_aggregates: Vec::new(),
+                    expired_aggregates: Vec::new(),
+                    aggregate_variant: None,
+                    pending_aggregate_casts: Vec::new(),
+                    nested_at_exit: Default::default(),
+                    early_expansions: Vec::new(),
                     current_block_succs: None,
                     current_block_label: None,
                     current_fpcs: None,

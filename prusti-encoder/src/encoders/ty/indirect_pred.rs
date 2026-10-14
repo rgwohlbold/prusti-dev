@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 use prusti_rustc_interface::middle::ty;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, FunctionIdn, PredicateIdn, Reify};
@@ -7,18 +5,21 @@ use vir::{CastType, FunctionIdn, PredicateIdn, Reify};
 use crate::encoders::TyUseImpureEnc;
 
 use super::{
-    RustParamData, RustTy, RustTyDecomposition, TySpecifics,
+    RustTy, RustTyDecomposition, TySpecifics,
     data::StructData,
     generics::{GArgsTyEnc, GParams, GenericParamsEnc},
-    lifetime_query::{LifetimeQueryEnc, LifetimeQueryFns, LifetimeQueryShapeEnc},
+    lifetime_query::{LifetimeQueryEnc, LifetimeQueryFns},
+    occurrences::{End, Occurrence, occurrence_query, occurrences, param_position},
     pure::{PureTyDatas, TyPureEnc},
     rust_ty::RustTyDatas,
 };
 
 /// Encodes for a type constructor `X`:
 /// - the indirect predicate `p_X_ind(key: s_X, T.., q: LifetimeQuery)`: what
-///   `X` reaches through references whose lifetimes the query `q` selects. The
-///   key is the shallow snapshot of the value.
+///   `X` reaches through the references of the one parameter occurrence the
+///   query `q` selects, i.e. all occurrences of that parameter in the fields
+///   (one conjunct each, see `occurrences`). The key is the shallow snapshot
+///   of the value.
 /// - the key extension `ext_X(K: s_X, T.., Kp: s_X, pq: LifetimeQuery): s_X`:
 ///   the key `K` with the cells owned by the piece `p_X_ind(Kp, .., pq)` read
 ///   in. `K` supplies the values, `Kp` only the permission; both must agree on
@@ -47,16 +48,10 @@ impl<'vir> task_encoder::OutputRefAny for TyIndirectRef<'vir> {}
 pub(crate) type Agree<'vir> =
     vir::ExprGenBool<'vir, (vir::ExprSnap<'vir>, vir::ExprSnap<'vir>), vir::ExprKind<'vir>>;
 
-/// What `ext_X(.., pq)` requires of the query `pq`.
-pub(crate) type QueryPre<'vir> =
-    vir::ExprGenBool<'vir, vir::ExprLifetimeQuery<'vir>, vir::ExprKind<'vir>>;
-
 #[derive(Clone)]
 pub struct TyIndirectDep<'vir> {
     /// `None` if `ext_X` requires no agreement.
     pub(crate) agree: Option<Agree<'vir>>,
-    /// `None` if `ext_X` requires nothing of its query.
-    pub(crate) query_pre: Option<QueryPre<'vir>>,
 }
 
 #[derive(Clone)]
@@ -128,21 +123,18 @@ impl TaskEncoder for TyIndirectEnc {
                     let referent = rust.referent.decompose(ty.params);
                     let referent_impure = builder.deps.require_dep::<TyUseImpureEnc>(referent)?;
                     let addr = pure.deref_access.call()(key);
-                    // the own lifetime (0) and what is selected inside the referent (type arg 0)
-                    let own = builder.query.selects_lifetime(builder.q, 0);
-                    let inner = builder.query.selects_in_arg(builder.q, 0);
-                    let inner_query = builder.query.selection_in_arg(builder.q, 0);
-                    // If the own lifetime is selected, this piece owns the referent
-                    // and reads the key of the inner selection from it; otherwise
-                    // the inner selection is keyed by the (filled) value slot.
-                    let owned_key = referent_impure.ref_to_snap(addr);
+                    // `q_here(0)`: the reference itself, which owns the referent;
+                    // `q_in(0, rest)`: inside the referent, keyed by the (filled)
+                    // value slot.
                     let slot_key: vir::ExprSnap<'vir> = pure.value_access.call()(key).upcast_ty();
-                    let owned_inner = builder.apply(referent, owned_key, inner_query)?;
-                    let slot_inner = builder.apply(referent, slot_key, inner_query)?;
+                    let inner = builder.apply(referent, slot_key, builder.query.rest(builder.q))?;
                     Some(vcx.mk_conj(&[
-                        mk_implies(vcx, own, referent_impure.ref_to_pred(vcx, addr, None)),
-                        mk_implies(vcx, vcx.mk_conj(&[own, inner]), owned_inner),
-                        mk_implies(vcx, vcx.mk_conj(&[mk_not(vcx, own), inner]), slot_inner),
+                        mk_implies(
+                            vcx,
+                            builder.query.is_here(builder.q, 0),
+                            referent_impure.ref_to_pred(vcx, addr, None),
+                        ),
+                        mk_implies(vcx, builder.query.is_in(builder.q, 0), inner),
                     ]))
                 }
                 TySpecifics::StructLike(data) => {
@@ -165,14 +157,15 @@ impl TaskEncoder for TyIndirectEnc {
                     }
                     Some(vcx.mk_conj(&variants))
                 }
-                // Nothing behind these.
-                TySpecifics::Primitive(_) | TySpecifics::Raw(_) | TySpecifics::Builtin(_) => {
-                    Some(vcx.mk_bool::<true>())
-                }
+                // Nothing behind these. TODO: shared references and the
+                // elements of arrays/slices (see `occurrences`).
+                TySpecifics::Primitive(_)
+                | TySpecifics::Raw(_)
+                | TySpecifics::Builtin(_)
+                | TySpecifics::ImmRef(_)
+                | TySpecifics::ArrayLike(_) => Some(vcx.mk_bool::<true>()),
                 // Abstract: the instantiation is unknown.
                 TySpecifics::Param(_) | TySpecifics::Opaque(_) => None,
-                // TODO: shared references and the elements of arrays/slices.
-                TySpecifics::ImmRef(_) | TySpecifics::ArrayLike(_) => None,
             };
             let predicate = vcx.mk_predicate(
                 pred,
@@ -195,39 +188,26 @@ impl TaskEncoder for TyIndirectEnc {
             };
             let unfolding = |expr: vir::ExprSnap<'vir>| vcx.mk_unfolding_expr(parent(), expr);
             let mut pres = vec![vcx.mk_predicate_app_expr(parent())];
-            let mut query_pre = None;
             let (body, agree) = match &combined.specifics {
                 TySpecifics::MutRef((rust, pure)) => {
                     let (k, kp) = (k.downcast_ty::<vir::CSnap>(), kp.downcast_ty::<vir::CSnap>());
                     let referent = rust.referent.decompose(ty.params);
                     let referent_impure = builder.deps.require_dep::<TyUseImpureEnc>(referent)?;
-                    let own = builder.query.selects_lifetime(builder.q, 0);
-                    let inner = builder.query.selects_in_arg(builder.q, 0);
-                    let inner_query = builder.query.selection_in_arg(builder.q, 0);
-                    let fns = builder.query;
-                    query_pre = Some(vcx.mk_lazy_expr(
-                        "ext_query_pre",
-                        vir::TYPE_BOOL,
-                        Box::new(move |vcx, pq: vir::ExprLifetimeQuery<'vir>| {
-                            vcx.mk_disj(&[fns.selects_lifetime(pq, 0), fns.selects_in_arg(pq, 0)])
-                                .kind
-                        }),
-                    ));
-                    // If the own lifetime is in the parent, the parent owns the
-                    // referent: the value slot becomes its snapshot (extended by
-                    // the parent's inner selection). Otherwise extend inside it.
+                    // The reference itself: the value slot becomes the snapshot
+                    // of the referent the parent owns. Inside the referent:
+                    // extend the slot.
                     let owned = referent_impure.ref_to_snap(pure.deref_access.call()(kp));
-                    let owned_ext = builder.ext(referent, owned, owned, inner_query)?;
+                    let slot = pure.value_access.call()(k).upcast_ty();
                     let slot_ext = builder.ext(
                         referent,
-                        pure.value_access.call()(k).upcast_ty(),
+                        slot,
                         pure.value_access.call()(kp).upcast_ty(),
-                        inner_query,
+                        builder.query.rest(builder.q),
                     )?;
                     let value = vcx.mk_ternary_expr(
-                        own,
-                        vcx.mk_ternary_expr(inner, owned_ext, owned),
-                        slot_ext,
+                        builder.query.is_here(builder.q, 0),
+                        owned,
+                        vcx.mk_ternary_expr(builder.query.is_in(builder.q, 0), slot_ext, slot),
                     );
                     let cons = (pure.prim_to_snap)(
                         pure.deref_access.call()(k),
@@ -305,17 +285,13 @@ impl TaskEncoder for TyIndirectEnc {
                     let body = if branches { unfolding(body) } else { body };
                     (Some(body), agree)
                 }
-                TySpecifics::Primitive(_) | TySpecifics::Raw(_) | TySpecifics::Builtin(_) => {
-                    (Some(k), None)
-                }
-                TySpecifics::Param(_)
-                | TySpecifics::Opaque(_)
+                TySpecifics::Primitive(_)
+                | TySpecifics::Raw(_)
+                | TySpecifics::Builtin(_)
                 | TySpecifics::ImmRef(_)
-                | TySpecifics::ArrayLike(_) => (None, None),
+                | TySpecifics::ArrayLike(_) => (Some(k), None),
+                TySpecifics::Param(_) | TySpecifics::Opaque(_) => (None, None),
             };
-            if let Some(query_pre) = query_pre {
-                pres.push(query_pre.reify(vcx, builder.q));
-            }
             if let Some(agree) = agree {
                 pres.push(agree.reify(vcx, (k, kp)));
             }
@@ -327,7 +303,7 @@ impl TaskEncoder for TyIndirectEnc {
                 None,
                 body,
             );
-            Ok((TyIndirectLocal { predicate, ext }, TyIndirectDep { agree, query_pre }))
+            Ok((TyIndirectLocal { predicate, ext }, TyIndirectDep { agree }))
         })
     }
 
@@ -337,25 +313,33 @@ impl TaskEncoder for TyIndirectEnc {
             program.add_function(output.ext);
         }
         LifetimeQueryEnc::emit_outputs(program);
-        LifetimeQueryShapeEnc::emit_outputs(program);
     }
 }
 
-/// A `selects_*` guard of a query.
+
+/// A generic parameter of the constructor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Guard {
-    /// `selects_lifetime(q, i)`
+enum Param {
     Lifetime(usize),
-    /// `selects_in_arg(q, j)`
-    Arg(usize),
+    Ty(usize),
 }
 
-/// The query of a field (or part of one), in terms of the query `q` of the
-/// constructor. Empty if it is statically `q_none()`.
-struct SubQuery<'vir> {
-    expr: vir::ExprLifetimeQuery<'vir>,
-    /// The query is `q_none()` unless one of these holds.
-    guards: BTreeSet<Guard>,
+/// The occurrences of the constructor's parameters in the type of a field.
+struct FieldOccurrences<'vir> {
+    ty: RustTyDecomposition<'vir>,
+    occurrences: Vec<Occurrence<'vir>>,
+    /// Per occurrence: the parameter it is, `None` for others (e.g. `'static`).
+    params: Vec<Option<Param>>,
+}
+
+impl FieldOccurrences<'_> {
+    /// The parameters occurring, in order.
+    fn params(&self) -> Vec<Param> {
+        let mut params = self.params.iter().flatten().copied().collect::<Vec<_>>();
+        params.sort();
+        params.dedup();
+        params
+    }
 }
 
 struct IndirectBuilder<'a, 'vir> {
@@ -369,28 +353,78 @@ struct IndirectBuilder<'a, 'vir> {
 }
 
 impl<'vir> IndirectBuilder<'_, 'vir> {
-    /// `guards ==> p_F_ind(key(field), .., query(field))` for every field `F`
-    /// with a non-empty query.
+    /// Per parameter selected by `q`: `guard ==> pieces`, the pieces of its
+    /// occurrences in the fields.
     fn fields(
         &mut self,
         key: vir::ExprCSnap<'vir>,
         data: &StructData<'vir, (RustTyDatas, PureTyDatas)>,
     ) -> EncResult<'vir, Vec<vir::ExprBool<'vir>>> {
-        let mut conjuncts = Vec::new();
+        let mut by_param: Vec<(Param, Vec<vir::ExprBool<'vir>>)> = Vec::new();
         for (rust, pure) in &data.fields {
-            let field_ty = rust.ty().decompose(self.params);
-            let Some(query) = self.ty_query(field_ty)? else {
-                continue;
-            };
+            let field = self.field_occurrences(rust.ty().decompose(self.params));
             let field_key = pure.read.call()(key);
-            let pred = self.apply(field_ty, field_key, query.expr)?;
-            conjuncts.push(mk_implies(self.vcx, self.guards(&query.guards), pred));
+            for param in field.params() {
+                let pieces = self.pieces(&field, param, field_key)?;
+                match by_param.iter_mut().find(|(p, _)| *p == param) {
+                    Some((_, all)) => all.extend(pieces),
+                    None => by_param.push((param, pieces)),
+                }
+            }
         }
-        Ok(conjuncts)
+        by_param.sort_by_key(|(p, _)| *p);
+        Ok(by_param
+            .into_iter()
+            .map(|(param, pieces)| mk_implies(self.vcx, self.guard(param), self.vcx.mk_conj(&pieces)))
+            .collect())
     }
 
-    /// Per field: `guards ? ext_F(K.f, .., Kp.f, query(field)) : K.f`, or just
-    /// `K.f` if its query is empty. `None` if no field is extended.
+    /// The pieces of the occurrences of `param` in a field with key `key`.
+    /// The key of an occurrence is extended by the pieces of the occurrences
+    /// of the same parameter enclosing it (the others are in `key` already).
+    fn pieces(
+        &mut self,
+        field: &FieldOccurrences<'vir>,
+        param: Param,
+        key: vir::ExprSnap<'vir>,
+    ) -> EncResult<'vir, Vec<vir::ExprBool<'vir>>> {
+        let keys = self.occurrence_keys(field, param, key)?;
+        let mut pieces = Vec::new();
+        for (idx, key) in keys {
+            let query = self.occurrence_query(field, idx);
+            pieces.push(self.apply(field.ty, key, query)?);
+        }
+        Ok(pieces)
+    }
+
+    /// The occurrences of `param` in the field and their keys, enclosing ones
+    /// first.
+    fn occurrence_keys(
+        &mut self,
+        field: &FieldOccurrences<'vir>,
+        param: Param,
+        key: vir::ExprSnap<'vir>,
+    ) -> EncResult<'vir, Vec<(usize, vir::ExprSnap<'vir>)>> {
+        let mut keys: Vec<(usize, vir::ExprSnap<'vir>)> = Vec::new();
+        for (idx, occurrence) in field.occurrences.iter().enumerate() {
+            if field.params[idx] != Some(param) {
+                continue;
+            }
+            let mut occurrence_key = key;
+            for (parent, parent_key) in keys.clone() {
+                if occurrence.parents.contains(&parent) {
+                    let query = self.occurrence_query(field, parent);
+                    occurrence_key = self.ext(field.ty, occurrence_key, parent_key, query)?;
+                }
+            }
+            keys.push((idx, occurrence_key));
+        }
+        Ok(keys)
+    }
+
+    /// Per field: the field of `K` extended by the occurrences of the
+    /// parameter `pq` selects, or just `K.f` if none occurs. `None` if no
+    /// field is extended.
     fn ext_fields(
         &mut self,
         k: vir::ExprCSnap<'vir>,
@@ -400,18 +434,20 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
         let mut extended = false;
         let mut values = Vec::new();
         for (rust, pure) in &data.fields {
-            let field_ty = rust.ty().decompose(self.params);
+            let field = self.field_occurrences(rust.ty().decompose(self.params));
             let field_k = pure.read.call()(k);
-            values.push(match self.ty_query(field_ty)? {
-                Some(query) => {
-                    extended = true;
-                    let field_kp = pure.read.call()(kp);
-                    let ext = self.ext(field_ty, field_k, field_kp, query.expr)?;
-                    self.vcx
-                        .mk_ternary_expr(self.guards(&query.guards), ext, field_k)
+            let field_kp = pure.read.call()(kp);
+            let mut value = field_k;
+            for param in field.params().into_iter().rev() {
+                extended = true;
+                let mut ext = field_k;
+                for (idx, parent_key) in self.occurrence_keys(&field, param, field_kp)? {
+                    let query = self.occurrence_query(&field, idx);
+                    ext = self.ext(field.ty, ext, parent_key, query)?;
                 }
-                None => field_k,
-            });
+                value = self.vcx.mk_ternary_expr(self.guard(param), ext, value);
+            }
+            values.push(value);
         }
         Ok(extended.then_some(values))
     }
@@ -425,7 +461,7 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
         let mut result = Vec::new();
         for (rust, pure) in &data.fields {
             let field_ty = rust.ty().decompose(self.params);
-            if self.ty_query(field_ty)?.is_none() {
+            if self.field_occurrences(field_ty).params().is_empty() {
                 continue;
             }
             if let Some(agree) = self.deps.require_dep::<TyIndirectEnc>(field_ty.ty)?.agree {
@@ -461,79 +497,46 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
         Ok(self.vcx.mk_predicate_app_expr(app))
     }
 
-    fn guards(&self, guards: &BTreeSet<Guard>) -> vir::ExprBool<'vir> {
-        let guards = guards
-            .iter()
-            .map(|guard| match *guard {
-                Guard::Lifetime(i) => self.query.selects_lifetime(self.q, i),
-                Guard::Arg(j) => self.query.selects_in_arg(self.q, j),
-            })
-            .collect::<Vec<_>>();
-        self.vcx.mk_disj(&guards)
+    /// Does `q` select `param`?
+    fn guard(&self, param: Param) -> vir::ExprBool<'vir> {
+        match param {
+            Param::Lifetime(i) => self.query.is_here(self.q, i),
+            Param::Ty(j) => self.query.is_in(self.q, j),
+        }
     }
 
-    /// The query of a value of type `ty` inside the constructor. A type
-    /// parameter passes on what `q` selects inside it; any other type gets a
-    /// query of its own shape, built from its generic arguments.
-    fn ty_query(&mut self, ty: RustTyDecomposition<'vir>) -> EncResult<'vir, Option<SubQuery<'vir>>> {
-        if let TySpecifics::Param(RustParamData::Generic) = &ty.ty.specifics {
-            let arg = ty.args.args()[0].expect_ty();
-            return Ok(match arg.kind() {
-                ty::TyKind::Param(param) => {
-                    let j = self.position(param.index, |arg| arg.as_type().is_some());
-                    Some(SubQuery {
-                        expr: self.query.selection_in_arg(self.q, j),
-                        guards: BTreeSet::from([Guard::Arg(j)]),
-                    })
-                }
-                // TODO: lifetimes inside associated types are not covered.
-                _ => None,
-            });
-        }
-        let mut guards = BTreeSet::new();
-        let mut lifetimes = Vec::new();
-        let mut args = Vec::new();
-        for arg in ty.args.args() {
-            if let Some(region) = arg.as_region() {
-                lifetimes.push(match region.kind() {
-                    ty::RegionKind::ReEarlyParam(param) => {
-                        let i = self.position(param.index, |arg| arg.as_region().is_some());
-                        guards.insert(Guard::Lifetime(i));
-                        self.query.selects_lifetime(self.q, i)
-                    }
+    /// The query of occurrence `idx` in the field's type; inside a type
+    /// parameter, it continues with the rest of `q`.
+    fn occurrence_query(&self, field: &FieldOccurrences<'vir>, idx: usize) -> vir::ExprLifetimeQuery<'vir> {
+        occurrence_query(
+            &self.query,
+            &field.occurrences[idx].path,
+            Some(self.query.rest(self.q)),
+        )
+    }
+
+    fn field_occurrences(&self, ty: RustTyDecomposition<'vir>) -> FieldOccurrences<'vir> {
+        // TODO: lifetimes enclosing each other are not supported (the nodes
+        // of such a type cannot be encoded either).
+        let occurrences = occurrences(ty).unwrap_or_default();
+        let params = occurrences
+            .iter()
+            .map(|o| match o.end {
+                End::Region(region) => match region.kind() {
+                    ty::RegionKind::ReEarlyParam(param) => Some(Param::Lifetime(param_position(
+                        self.params,
+                        param.index,
+                        |arg| arg.as_region().is_some(),
+                    ))),
                     // Not a lifetime of the constructor (e.g. `'static`).
-                    _ => self.vcx.mk_bool::<false>(),
-                });
-            } else if let Some(arg_ty) = arg.as_type() {
-                let arg_ty = RustTyDecomposition::from_ty(arg_ty, self.params);
-                args.push(match self.ty_query(arg_ty)? {
-                    Some(query) => {
-                        guards.extend(query.guards);
-                        query.expr
-                    }
-                    None => self.query.q_none(),
-                });
-            }
-        }
-        if guards.is_empty() {
-            return Ok(None);
-        }
-        let shape = self
-            .deps
-            .require_dep::<LifetimeQueryShapeEnc>((lifetimes.len(), args.len()))?;
-        Ok(Some(SubQuery {
-            expr: shape(lifetimes.as_slice(), args.as_slice()),
-            guards,
-        }))
-    }
-
-    /// The position of the constructor's generic parameter `index` among
-    /// those of its kind.
-    fn position(&self, index: u32, of_kind: impl Fn(ty::GenericArg<'vir>) -> bool) -> usize {
-        self.params.rust_params()[..index as usize]
-            .iter()
-            .filter(|arg| of_kind(**arg))
-            .count()
+                    _ => None,
+                },
+                End::Param(param) => Some(Param::Ty(param_position(self.params, param.index, |arg| {
+                    arg.as_type().is_some()
+                }))),
+            })
+            .collect();
+        FieldOccurrences { ty, occurrences, params }
     }
 }
 
@@ -567,10 +570,5 @@ fn mk_implies<'vir>(
     rhs: vir::ExprBool<'vir>,
 ) -> vir::ExprBool<'vir> {
     vcx.mk_bin_op_expr(vir::BinOpKind::Implies, lhs, rhs)
-        .downcast_ty()
-}
-
-fn mk_not<'vir>(vcx: &'vir vir::VirCtxt<'_>, expr: vir::ExprBool<'vir>) -> vir::ExprBool<'vir> {
-    vcx.mk_unary_op_expr(vir::UnOpKind::Not, expr.upcast_ty())
         .downcast_ty()
 }

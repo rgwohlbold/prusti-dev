@@ -218,11 +218,6 @@ impl TaskEncoder for TyImpureEnc {
             };
             let output = TyData::new(data, specifics).alloc();
 
-            // TODO: remove! Encodes the indirect predicate of every type only so
-            // that its definition can be inspected; once the encoding of PCG
-            // unfolds/folds requires `TyIndirectEnc` itself, this must go.
-            deps.require_ref::<TyIndirectEnc>(*task_key)?;
-
             Ok((builder.inner.build(), output))
         })
     }
@@ -244,7 +239,7 @@ impl TaskEncoder for TyImpureEnc {
                 program.add_method(method);
             }
         }
-        // TODO: remove together with the `require_ref` in `do_encode_full`.
+        // The indirect predicates of the types used as bases of PCG nodes.
         TyIndirectEnc::emit_outputs(program);
     }
 }
