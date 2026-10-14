@@ -5,6 +5,7 @@ use crate::encoders::{
     pure::spec::MirSpecEncMode,
     ty::{
         RustTyDecomposition,
+        indirect_node::IndirectNodesEnc,
         generics::{GArgs, GParams},
         use_pure::{TyUsePure, TyUsePureEnc},
     },
@@ -16,7 +17,7 @@ use prusti_rustc_interface::{
     index::IndexVec,
     middle::{
         mir,
-        ty::{self, TyKind},
+        ty::{self, RegionExt, TyKind},
     },
     span::{Span, Spanned, def_id::DefId},
 };
@@ -293,6 +294,12 @@ struct Enc<'vir: 'enc, 'enc> {
     rel1_mode: bool,
     before_expiry_mode: bool,
     impure_context: bool,
+    /// An impure method's contract: all indirect pieces of the arguments and
+    /// the result are held, so `&mut` referents are read from the arguments'
+    /// snapshots extended by the pieces (see `IndirectNodes::extend_all`).
+    contract_context: bool,
+    /// Whether the place being encoded is read from an extended snapshot.
+    read_extended: bool,
 }
 
 struct EncodedPlace<'vir> {
@@ -404,6 +411,14 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                     ..
                 } | PureKind::SpecBlock(..)
             ),
+            contract_context: matches!(
+                kind,
+                PureKind::Spec {
+                    mode: MirSpecEncMode::Impure,
+                    ..
+                }
+            ),
+            read_extended: false,
         }
     }
 
@@ -1131,6 +1146,12 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                         let snap = encoded_place.snap.downcast_ty();
                         let metadata = e_ty.metadata_access(snap);
                         let ref_expr = e_ty.deref_access(snap);
+                        if self.read_extended {
+                            // The extended snapshot holds the referent.
+                            let val_expr = e_ty.value_access(snap);
+                            return Ok(EncodedPlace::new(val_expr, Some(ref_expr))
+                                .with_metadata(metadata));
+                        }
                         if !self.impure_context {
                             // The value field of a mutable reference's snapshot
                             // is never constrained to the referent (see
@@ -1264,9 +1285,62 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         } else {
             self.mk_local_ex(place.local, curr_ver[&place.local])
         };
+        // In a contract, a place reading through a `&mut` is read from the
+        // snapshot of its local extended by all its indirect pieces; the
+        // extension reads the heap (the pieces).
+        let derefs_mut = place.iter_projections().any(|(base, elem)| {
+            matches!(elem, mir::ProjectionElem::Deref)
+                && matches!(
+                    base.ty(&self.body.local_decls, self.vcx.tcx()).ty.kind(),
+                    TyKind::Ref(.., ty::Mutability::Mut)
+                )
+        });
+        self.read_extended = false;
+        let expr = if self.contract_context && derefs_mut {
+            // The regions of a spec body's MIR are erased; the contract's pieces
+            // are those of the signature, whose regions are (usually) distinct.
+            let mut counter = 0;
+            let local_ty = ty::fold_regions(self.vcx.tcx(), place_ty.ty, |r, _| {
+                if r.is_erased() {
+                    counter += 1;
+                    ty::Region::new_var(self.vcx.tcx(), ty::RegionVid::from_u32(counter))
+                } else {
+                    r
+                }
+            });
+            let local_ty = RustTyDecomposition::from_ty(local_ty, self.context);
+            match self.deps.require_dep::<IndirectNodesEnc>(local_ty) {
+                Ok(nodes) => {
+                    self.read_extended = true;
+                    // (as the heap read below, only for the pinned snapshots)
+                    let extended = nodes.extend_all(expr);
+                    let extended = match should_wrap && self.old_mode {
+                        true => self.vcx.mk_lazy_expr(
+                            "old_mode_wrap",
+                            extended.ty(),
+                            Box::new(move |vcx, lctx: ExprInput<'vir>| {
+                                use vir::Reify;
+                                vcx.mk_old(extended.reify(vcx, lctx), lctx.2).kind
+                            }),
+                        ),
+                        false => extended,
+                    };
+                    match should_wrap && self.before_expiry_mode {
+                        true => self.vcx.mk_old_lhs_expr(extended),
+                        false => extended,
+                    }
+                }
+                Err(_) => expr,
+            }
+        } else {
+            expr
+        };
+        let read_extended = self.read_extended;
         let mut encoded_place = EncodedPlace::new(expr, None);
         // TODO: factor this out (duplication with impure encoder)?
         for elem in place.projection {
+            // (encoding an index may encode another place in between)
+            self.read_extended = read_extended;
             // The snapshots of the arguments and the result are pinned to a
             // state, so the only read of the heap is the dereference of a
             // mutable reference in an impure context; only that is wrapped.
@@ -1276,6 +1350,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             // when inhaling it, where `old[lhs]` is undefined.
             let heap_read = should_wrap
                 && self.impure_context
+                && !read_extended
                 && matches!(elem, mir::ProjectionElem::Deref)
                 && matches!(place_ty.ty.kind(), TyKind::Ref(.., ty::Mutability::Mut));
             encoded_place = self.encode_place_element(curr_ver, place_ty, *elem, encoded_place)?;
@@ -1296,6 +1371,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 encoded_place.snap = self.vcx.mk_old_lhs_expr(encoded_place.snap);
             }
         }
+        self.read_extended = false;
         // Can we ever have the use of a projected place?
         assert!(place_ty.variant_index.is_none());
 

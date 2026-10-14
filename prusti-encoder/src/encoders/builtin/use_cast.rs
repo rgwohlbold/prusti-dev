@@ -10,6 +10,7 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition, RustTySpecial, TySpecifics,
         generics::{GArgsTy, GArgsTyEnc},
+        lifetime_query::LifetimeQueryEnc,
     },
 };
 
@@ -58,12 +59,26 @@ pub enum MirBuiltinUseCastOutput<'vir> {
 #[derive(Debug, Copy, Clone)]
 pub struct MirBuiltinUnsize<'vir> {
     cast: FunctionIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap), vir::CSnap>,
-    unsize: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
-    undo: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
+    unsize: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap, vir::LifetimeQuery)>>,
+    undo: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap, vir::LifetimeQuery)>>,
     /// The operand and result referent type values `[U, V]`, used by the `cast`
     /// function (to construct the metadata) and by the `unsize`/`undo` methods (to
     /// transfer the referent's `p_Param` predicate and value).
     generics: GArgsTy<'vir>,
+    /// The query of the operand's own lifetime, whose indirect piece holds the
+    /// referent the `unsize`/`undo` methods transfer.
+    query: vir::ExprLifetimeQuery<'vir>,
+}
+
+impl<'vir> MirBuiltinUnsize<'vir> {
+    /// The query, usable in any expression context (it has no lazy parts).
+    fn query<Curr, Next>(&self) -> vir::ExprGenLifetimeQuery<'vir, Curr, Next> {
+        // SAFETY: as `GArgsTy::get_ty`, a fully reified expression is valid in
+        // any context.
+        let query = self.query as *const vir::ExprData<'vir, vir::LifetimeQuery>
+            as *const vir::ExprGenData<'vir, Curr, Next, vir::LifetimeQuery>;
+        unsafe { &*query }
+    }
 }
 
 impl<'vir> MirBuiltinUseCastOutput<'vir> {
@@ -87,7 +102,7 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
             MirBuiltinUseCastOutput::Simple(..) => None,
             MirBuiltinUseCastOutput::Unsize(u) => u
                 .unsize
-                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const()))
+                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const(), u.query()))
                 .map(vir::StmtKindGenData::alloc),
         }
     }
@@ -100,7 +115,7 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
             MirBuiltinUseCastOutput::Simple(..) => None,
             MirBuiltinUseCastOutput::Unsize(u) => u
                 .undo
-                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const()))
+                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const(), u.query()))
                 .map(vir::StmtKindGenData::alloc),
         }
     }
@@ -151,11 +166,14 @@ impl TaskEncoder for MirBuiltinUseCastEnc {
                         &[],
                     )
                 });
+                // the operand's own piece, `q_here(0)`
+                let query = deps.require_dep::<LifetimeQueryEnc>(())?.here(0);
                 let unsize = MirBuiltinUnsize {
                     cast,
                     unsize,
                     undo,
                     generics,
+                    query,
                 };
                 // Recover the operand/result referent (`[T; N]` / `[T]`) structure by
                 // normalizing the reference's (generic `p_Param`) referent type

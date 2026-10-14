@@ -16,11 +16,10 @@ use pcg::{
 use prusti_rustc_interface::middle::mir;
 
 use task_encoder::TaskEncoder;
-use vir::Reify;
 
 use crate::encoders::{
     EncodeResult, ImpureEncVisitor, TyUseImpureEnc,
-    ty::{RustTyDecomposition, indirect::IndirectPredicatesEnc, use_impure::TyUseImpure},
+    ty::{RustTyDecomposition, indirect_node::IndirectNodesEnc, use_impure::TyUseImpure},
 };
 
 pub(super) enum WandOldOuter<'vir> {
@@ -63,17 +62,13 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             // for example, if we add an invariant for x and x is a reference, then we also want to add
             // an invariant for *x
             let projs = ctxt.extract_lifetime_projections(place.with_inherent_region(ctxt));
-            for proj in projs {
-                let indirect = self
-                    .deps
-                    .require_dep::<IndirectPredicatesEnc>(proj.with_base(task))
-                    .unwrap();
-                inv.extend(indirect.predicate_applications.iter().map(|p| {
-                    p.reify(
-                        self.vcx,
-                        ty_out.ref_to_snap(place_res.expr.expect_predicate()),
-                    )
-                }));
+            let nodes = self.deps.require_dep::<IndirectNodesEnc>(task)?;
+            let snap = ty_out.ref_to_snap(place_res.expr.expect_predicate());
+            // enclosing regions first, so that the keys are well-defined
+            for idx in nodes.order() {
+                if projs.iter().any(|proj| proj.region_idx() == *idx) {
+                    inv.extend(nodes.pred(*idx, snap));
+                }
             }
         }
 
@@ -151,15 +146,9 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             PcgLifetimeProjectionBase::Const(c) => todo!("{c:?}"),
         };
         let ty = RustTyDecomposition::from_ty(ty.ty, self.def_id);
-        let indirect = self
-            .deps
-            .require_dep::<IndirectPredicatesEnc>(r.with_base(ty))
-            .unwrap();
-        Ok(indirect
-            .predicate_applications
-            .into_iter()
-            .map(|expr| expr.reify(self.vcx, place_snap))
-            .collect::<Vec<_>>())
+        let nodes = self.deps.require_dep::<IndirectNodesEnc>(ty)?;
+        let idx = r.region_idx();
+        Ok(nodes.pred(idx, place_snap).into_iter().collect())
     }
 
     fn get_place(place: MaybeRemotePlace<'vir>) -> Place<'vir> {
