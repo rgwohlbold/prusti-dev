@@ -409,10 +409,6 @@ impl TaskEncoder for CastersEnc<Impure> {
                 vcx.alloc_slice(&[concrete_predicate, make_concrete_same_snap]),
                 None,
             );
-            // TODO: remove! Encodes the indirect casts of every pair only so
-            // that their definitions can be inspected; once the encoding of PCG
-            // unfolds/folds requires `IndCastersEnc` itself, this must go.
-            deps.require_ref::<IndCastersEnc>(*task_key)?;
             Ok((vec![make_generic, make_concrete], ()))
         })
     }
@@ -423,7 +419,7 @@ impl TaskEncoder for CastersEnc<Impure> {
                 program.add_method(method);
             }
         }
-        // TODO: remove together with the `require_ref` in `do_encode_full`.
+        // The indirect casts of the pairs whose referents carry an indirect piece.
         IndCastersEnc::emit_outputs(program);
     }
 }
