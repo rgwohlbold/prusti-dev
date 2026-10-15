@@ -58,6 +58,8 @@ pub struct NestedPathState<'vir> {
     pending_expansions: Vec<PendingExpansion<'vir>>,
     early_expansions: Vec<BorrowPcgExpansion<'vir>>,
     expired_aggregates: Vec<(Place<'vir>, usize)>,
+    pending_regions_in: Vec<crate::encoders::impure::regions_in::PendingRegionsIn<'vir>>,
+    applied_wands: Vec<mir::BasicBlock>,
 }
 
 /// The cast of the pieces of a part `source↓idx` of a value built from parts
@@ -94,6 +96,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         self.pending_expansions = state.pending_expansions;
         self.early_expansions = state.early_expansions;
         self.expired_aggregates = state.expired_aggregates;
+        self.pending_regions_in = state.pending_regions_in;
+        self.applied_wands = state.applied_wands;
     }
 
     /// At the end of `block`: save the state for its successors.
@@ -102,6 +106,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             pending_expansions: self.pending_expansions.clone(),
             early_expansions: self.early_expansions.clone(),
             expired_aggregates: self.expired_aggregates.clone(),
+            pending_regions_in: self.pending_regions_in.clone(),
+            applied_wands: self.applied_wands.clone(),
         };
         self.nested_at_exit.insert(block, state);
     }
@@ -140,7 +146,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// the place's own predicate (which an expansion may have unfolded or a
     /// deref may not have produced yet), this only needs the own pieces of the
     /// references on the path, as at the start of a phase.
-    fn path_snap(&mut self, place: Place<'vir>) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
+    pub(crate) fn path_snap(&mut self, place: Place<'vir>) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
         let Some((parent, elem)) = place.last_projection() else {
             return Ok(self.encode_place_with_snap(place)?.1);
         };
@@ -455,23 +461,85 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// An `Aggregate` borrow-flow edge was removed. Removing an edge that
     /// built a value from parts means that the loans the parts held expire:
-    /// their pieces go back to the lenders, so the value's piece is not
-    /// refolded when it is collapsed.
+    /// their pieces go back to the lenders. If the value's piece is folded, it
+    /// is unfolded (once), and a part at a generic field position is cast back
+    /// to its concrete pieces; the value's piece is not refolded when it is
+    /// collapsed.
     pub(crate) fn nested_aggregate_removed(
         &mut self,
         source: MaybeLabelledPlace<'vir>,
+        source_idx: RegionIdx,
         target: MaybeLabelledPlace<'vir>,
         target_idx: usize,
-    ) {
+        kind: &BorrowFlowEdgeKind<'vir>,
+    ) -> EncodeResult<'vir, (), E> {
         let target_place = target.place();
         if source.place().is_prefix_of(target_place) || target_place.is_prefix_of(source.place()) {
-            return;
+            return Ok(());
         }
+        let open = self
+            .pending_expansions
+            .iter()
+            .any(|p| p.base == target_place && p.region.index() == target_idx);
         if !self.expired_aggregates.contains(&(target_place, target_idx)) {
             self.expired_aggregates.push((target_place, target_idx));
+            if !open {
+                let idx = RegionIdx::from(target_idx);
+                let key_label = match target {
+                    MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
+                    MaybeLabelledPlace::Current(_) => None,
+                };
+                for piece in self.node_pred_apps(target_place, idx, key_label)?.into_iter().rev() {
+                    self.stmt(self.vcx.mk_unfold_stmt(piece));
+                }
+                self.released_aggregates.push((target_place, target_idx));
+            }
         }
         self.pending_expansions
             .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
+
+        // the part at a generic field position: back to its concrete pieces
+        let BorrowFlowEdgeKind::Aggregate { field_idx, .. } = kind else {
+            return Ok(());
+        };
+        if !self.released_aggregates.contains(&(target_place, target_idx))
+            || self.released_parts.contains(&(source, source_idx))
+        {
+            return Ok(());
+        }
+        let Some(normalized) = self.generic_part_field(target_place, *field_idx) else {
+            return Ok(());
+        };
+        self.released_parts.push((source, source_idx));
+        let casters = self
+            .deps
+            .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?;
+        let ty_args = self.deps.require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
+        let label = match source {
+            MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
+            MaybeLabelledPlace::Current(_) => None,
+        };
+        let place = source.place();
+        let ty = place.ty(self.pcg_ctxt()).ty;
+        let nodes = self
+            .deps
+            .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+        let snap = self.vcx.maybe_apply_label(self.encode_place_with_snap(place)?.1, label);
+        // enclosing pieces first: the concrete keys of the enclosed ones read them
+        for piece in nodes.pieces_of(source_idx) {
+            let key = nodes.key(piece, snap);
+            let generic = (casters.make_generic_s)(key.downcast_ty(), ty_args.get_ty(), ty_args.get_const());
+            self.stmt(
+                (casters.make_concrete)(
+                    generic.upcast_ty(),
+                    ty_args.get_ty(),
+                    ty_args.get_const(),
+                    nodes.piece(piece).query,
+                )
+                .alloc(),
+            );
+        }
+        Ok(())
     }
 
     /// An `Aggregate` borrow-flow edge was added: either a value built from
@@ -511,24 +579,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             return Ok(());
         }
         // the part, at its generic field position
-        let target_ty = target_place.ty(self.pcg_ctxt());
-        let decomp = RustTyDecomposition::from_ty(target_ty.ty, self.def_id);
-        let field = match &decomp.ty.specifics {
-            TySpecifics::StructLike(data) => data.fields.get(*field_idx).map(|f| f.ty()),
-            TySpecifics::EnumLike(data) => target_ty
-                .variant_index
-                .or(self
-                    .aggregate_variant
-                    .filter(|(place, _)| *place == target_place)
-                    .map(|(_, v)| v))
-                .and_then(|v| data.variants.iter().find(|var| var.data.vid == v))
-                .and_then(|var| var.inner.fields.get(*field_idx))
-                .map(|f| f.ty()),
-            _ => None,
-        };
-        if let Some(normalized) =
-            field.and_then(|f| f.decompose_compare_normalize(decomp.ty.params, decomp.args))
-        {
+        if let Some(normalized) = self.generic_part_field(target_place, *field_idx) {
             let casters = self
                 .deps
                 .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?;
@@ -572,6 +623,32 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             }
         }
         Ok(())
+    }
+
+    /// The field `field_idx` of the value at `target_place` built from parts,
+    /// if it is at a generic position (and concrete).
+    fn generic_part_field(
+        &self,
+        target_place: Place<'vir>,
+        field_idx: usize,
+    ) -> Option<crate::encoders::ty::RustTyNormalized<'vir>> {
+        let target_ty = target_place.ty(self.pcg_ctxt());
+        let decomp = RustTyDecomposition::from_ty(target_ty.ty, self.def_id);
+        let field = match &decomp.ty.specifics {
+            TySpecifics::StructLike(data) => data.fields.get(field_idx).map(|f| f.ty()),
+            TySpecifics::EnumLike(data) => target_ty
+                .variant_index
+                .or(self
+                    .aggregate_variants
+                    .iter()
+                    .find(|(place, _)| *place == target_place)
+                    .map(|(_, v)| *v))
+                .and_then(|v| data.variants.iter().find(|var| var.data.vid == v))
+                .and_then(|var| var.inner.fields.get(field_idx))
+                .map(|f| f.ty()),
+            _ => None,
+        };
+        field.and_then(|f| f.decompose_compare_normalize(decomp.ty.params, decomp.args))
     }
 
     /// At the end of a phase: cast the parts at generic field positions, then

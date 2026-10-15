@@ -123,6 +123,7 @@ pub fn test_entrypoint<'tcx>(
     program.header("type constructors");
     TyConstructorEnc::emit_outputs(&mut program);
     crate::encoders::TyInhabitedEnc::emit_outputs(&mut program);
+    crate::encoders::ty::has_ind::TyHasIndEnc::emit_outputs(&mut program);
 
     program.header("constants");
     ConstEnc::emit_outputs(&mut program);
