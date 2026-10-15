@@ -186,6 +186,11 @@ where
     pub labelled_phase: Option<(mir::Location, EvalStmtPhase)>,
     /// The lifetime projections unfolded at a PCG expansion and not folded yet.
     pub pending_expansions: Vec<crate::encoders::impure::nested::PendingExpansion<'vir>>,
+    /// The unfolded `RegionsIn(T)` pieces of places (see `impure::regions_in`).
+    pub pending_regions_in: Vec<crate::encoders::impure::regions_in::PendingRegionsIn<'vir>>,
+    /// The calls whose wands were applied on the current path (a call's
+    /// wands are applied at the removal of its first coupled edge).
+    pub applied_wands: Vec<mir::BasicBlock>,
     /// The lifetime projections to fold at the end of the current phase
     /// (targets of `Aggregate` edges of a constructed value).
     pub pending_aggregates: Vec<(MaybeLabelledPlace<'vir>, usize)>,
@@ -199,9 +204,13 @@ where
     /// The open nested pieces at the end of each encoded block (see
     /// `impure::nested::NestedPathState`).
     pub nested_at_exit: FxHashMap<mir::BasicBlock, crate::encoders::impure::nested::NestedPathState<'vir>>,
-    /// The enum place last assigned an aggregate and its variant (the PCG
+    /// The enum places assigned an aggregate and their variants (the PCG
     /// `Aggregate` edges do not name it).
-    pub aggregate_variant: Option<(Place<'vir>, prusti_rustc_interface::abi::VariantIdx)>,
+    pub aggregate_variants: Vec<(Place<'vir>, prusti_rustc_interface::abi::VariantIdx)>,
+    /// Values built from parts whose piece was unfolded when their loans
+    /// expired, and the parts cast back to concrete.
+    pub released_aggregates: Vec<(Place<'vir>, usize)>,
+    pub released_parts: Vec<(MaybeLabelledPlace<'vir>, crate::encoders::ty::indirect_node::RegionIdx)>,
     pub current_block_succs: Option<FxHashMap<mir::BasicBlock, vir::CfgBlockLabel<'vir>>>,
     pub current_block_label: Option<vir::CfgBlockLabel<'vir>>,
     pub current_stmts: Option<Vec<vir::Stmt<'vir>>>,
@@ -320,7 +329,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         self.current_stmts.as_mut().unwrap().push(stmt);
     }
 
-    fn stmts(&mut self, stmts: impl IntoIterator<Item = vir::Stmt<'vir>>) {
+    pub(crate) fn stmts(&mut self, stmts: impl IntoIterator<Item = vir::Stmt<'vir>>) {
         for stmt in stmts {
             self.stmt(stmt);
         }
@@ -330,7 +339,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         self.stmt(self.vcx.mk_comment_stmt(msg));
     }
 
-    fn ty_use_impure(&mut self, ty: ty::Ty<'vir>) -> TyUseImpure<'vir> {
+    pub(crate) fn ty_use_impure(&mut self, ty: ty::Ty<'vir>) -> TyUseImpure<'vir> {
         let ty_task = RustTyDecomposition::from_ty(ty, self.def_id);
         self.deps.require_dep::<TyUseImpureEnc>(ty_task).unwrap()
     }
@@ -614,6 +623,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         if nested {
             self.nested_before_place_fold(place)?;
         }
+        if matches!(fold_or_unfold, FoldOrUnfold::Fold) {
+            self.regions_in_before_fold(place, label)?;
+        }
         let (stmts, frame) = match fold_or_unfold {
             FoldOrUnfold::Unfold => (
                 data.unfold(place_ty.variant_index, ref_p, index, None, label),
@@ -631,6 +643,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         self.stmts(stmts);
         if nested {
             self.nested_after_place_fold(place)?;
+        }
+        if matches!(fold_or_unfold, FoldOrUnfold::Fold) {
+            self.regions_in_after_fold(place, label)?;
         }
         Ok(Some(frame))
     }
@@ -718,7 +733,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         edge_action: EdgeAction,
         edge_to_loop: bool,
         to_skip: &mut Vec<mir::BasicBlock>,
-        mut footprint: Option<&mut Footprint<'_, 'vir>>,
+        footprint: Option<&mut Footprint<'_, 'vir>>,
     ) -> EncodeResult<'vir, (), E> {
         // In a package script, current places are read in the state before the
         // package.
@@ -815,9 +830,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     } else {
                         self.nested_aggregate_removed(
                             source,
+                            borrow_flow.long().region_idx(),
                             borrow_flow.short().base(),
                             borrow_flow.short().region_idx().index(),
-                        );
+                            &borrow_flow.kind(),
+                        )?;
                     }
                 }
             }
@@ -885,46 +902,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 //   function call; instead we should figure out which
                 //   wand it is based on the edge info.
                 // TODO: closures
-                let wands = self.deps.require_dep::<WandEnc>(WandEncTask {
-                    data: call.function_data().unwrap(),
-                })?;
-                let bb = &self.body[call.location().block];
-                let terminator = bb.terminator.as_ref().unwrap();
-                match &terminator.kind {
-                    mir::TerminatorKind::Call {
-                        func,
-                        args,
-                        destination,
-                        ..
-                    } => {
-                        // Calls not encoded as impure method calls create no
-                        // wands (e.g., a Viper function application).
-                        if self.wandless_calls.contains(&call.location().block) {
-                            return Ok(());
-                        }
-                        let (_, caller_substs) = self.get_call_data(func);
-
-                        let (_, dest_snap, _, _) =
-                            self.encode_place_with_snap((*destination).into())?;
-                        let wand_args =
-                            std::iter::once(Ok(dest_snap))
-                                .chain(args.iter().map(|operand| {
-                                    self.encode_operand_snap_immediate(&operand.node)
-                                }))
-                                .collect::<EncodeResult<'vir, Vec<_>, E>>()?;
-                        let (label_pre, label_post) = self.call_labels[&call.location().block];
-                        let call_ctx = self.gargs(caller_substs);
-                        let wands =
-                            wands.call_wands(&wand_args, label_pre, label_post, call_ctx, self);
-                        for wand in wands {
-                            if let Some(footprint) = &mut footprint {
-                                footprint.parts.push(self.vcx.mk_wand_expr(wand));
-                            }
-                            self.stmt(self.vcx.mk_apply_stmt(wand));
-                        }
-                    }
-                    _ => unreachable!(),
-                }
+                self.apply_call_wands(
+                    call.location().block,
+                    call.function_data().unwrap(),
+                    footprint,
+                )?;
             }
             BorrowPcgEdgeKind::Abstraction(at @ AbstractionEdge::Loop(_)) => {
                 self.pcs_handle_wand(
@@ -946,7 +928,66 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    fn pcs_unblock_actions(
+    /// Apply the wands of the call terminating `block` (once per path),
+    /// converting the pieces at a generic callee's generic positions.
+    pub(crate) fn apply_call_wands(
+        &mut self,
+        block: mir::BasicBlock,
+        function_data: pcg::borrow_pcg::FunctionData<'vir>,
+        mut footprint: Option<&mut Footprint<'_, 'vir>>,
+    ) -> EncodeResult<'vir, (), E> {
+        if self.applied_wands.contains(&block) {
+            return Ok(());
+        }
+        self.applied_wands.push(block);
+        let wands = self.deps.require_dep::<WandEnc>(WandEncTask { data: function_data })?;
+        let bb = &self.body[block];
+        let terminator = bb.terminator.as_ref().unwrap();
+        let mir::TerminatorKind::Call {
+            func,
+            args,
+            destination,
+            ..
+        } = &terminator.kind
+        else {
+            unreachable!()
+        };
+        // Calls not encoded as impure method calls create no wands (e.g., a
+        // Viper function application).
+        if self.wandless_calls.contains(&block) {
+            return Ok(());
+        }
+        let (_, caller_substs) = self.get_call_data(func);
+        let (_, dest_snap, _, _) = self.encode_place_with_snap((*destination).into())?;
+        let wand_args = std::iter::once(Ok(dest_snap))
+            .chain(args.iter().map(|operand| self.encode_operand_snap_immediate(&operand.node)))
+            .collect::<EncodeResult<'vir, Vec<_>, E>>()?;
+        let (label_pre, label_post) = self.call_labels[&block];
+        let call_ctx = self.gargs(caller_substs);
+        // a generic callee: convert the pieces at its generic positions
+        let generic = wands.generic_nodes(self.vcx, self.deps, call_ctx);
+        let dest_ty = destination.ty(self.local_decls, self.vcx.tcx()).ty;
+        let dest_snap = self.vcx.mk_local_labelled_old_expr(dest_snap, label_post);
+        self.generic_wand_regroup(&generic, dest_ty, dest_snap)?;
+        let wands = wands.call_wands(&wand_args, label_pre, label_post, call_ctx, self);
+        for wand in wands {
+            if let Some(footprint) = &mut footprint {
+                footprint.parts.push(self.vcx.mk_wand_expr(wand));
+            }
+            self.stmt(self.vcx.mk_apply_stmt(wand));
+        }
+        let arg_snaps = args
+            .iter()
+            .zip(&wand_args[1..])
+            .map(|(arg, snap)| {
+                let ty = arg.node.ty(self.local_decls, self.vcx.tcx());
+                (ty, self.vcx.mk_local_labelled_old_expr(*snap, label_pre))
+            })
+            .collect::<Vec<_>>();
+        self.generic_wand_split(&generic, &arg_snaps)
+    }
+
+    pub(crate) fn pcs_unblock_actions(
         &mut self,
         borrows_state: &BorrowsState<'_, 'vir>,
         footprint: &mut Footprint<'_, 'vir>,
@@ -1086,6 +1127,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             // unfolded in the same phase: its key reads the place's predicate
             // and own piece (see `impure::nested`).
             if let Some(place) = Self::place_unfolded_by(action) {
+                let children = self.children_unfolded_by(action);
+                self.regions_in_unfold(place, children)?;
                 let mut early = Vec::new();
                 for later in &actions[i + 1..] {
                     if let PcgAction::Borrow(later) = later
@@ -1131,6 +1174,34 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             PcgAction::Owned(action) => match action.kind() {
                 RepackOp::Expand(expand) => Some(expand.from()),
                 _ => None,
+            },
+        }
+    }
+
+    /// The places that `action` unfolds a place into (see
+    /// [Self::place_unfolded_by]).
+    fn children_unfolded_by(&self, action: &PcgAction<'vir>) -> Vec<Place<'vir>> {
+        match action {
+            PcgAction::Borrow(action) => match action.kind() {
+                BorrowPcgActionKind::AddEdge { edge } => match edge.kind() {
+                    BorrowPcgEdgeKind::Deref(deref) => vec![deref.deref_place().place()],
+                    BorrowPcgEdgeKind::BorrowPcgExpansion(expansion) => expansion
+                        .expansion()
+                        .into_iter()
+                        .filter_map(|node| match node {
+                            PcgNode::Place(place) => Some(place.place()),
+                            PcgNode::LifetimeProjection(_) => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            PcgAction::Owned(action) => match action.kind() {
+                RepackOp::Expand(expand) if !matches!(expand.capability(), CapabilityKind::Write) => {
+                    expand.target_places(self.pcg_ctxt())
+                }
+                _ => Vec::new(),
             },
         }
     }
@@ -1233,6 +1304,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     //assert!(matches!(repack_op, RepackOp::Collapse(..)));
                     if !matches!(repack_op, RepackOp::Collapse(..)) {
                         comment!(self, "expected RepackOp::Collapse but got {repack_op:?}");
+                    } else {
+                        self.regions_in_drop(place);
                     }
                     return Ok(());
                 }
@@ -1252,7 +1325,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 } else if matches!(repack_op, pcg::free_pcs::RepackOp::Collapse(..)) {
                     // the nested pieces are folded at the `Aggregate` edges
                     self.nested_before_place_fold(place)?;
+                    self.regions_in_before_fold(place, None)?;
                     self.stmts(data.fold(place_ty.variant_index, place_enc, index, None, None));
+                    self.regions_in_after_fold(place, None)?;
                 } else {
                     unreachable!()
                 }
@@ -1648,7 +1723,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         RustSignature::get_def_id_and_caller_substs(func_ty)
     }
 
-    fn new_tmp<T: CompType>(&mut self, ty: vir::Type<'vir, T>) -> vir::Expr<'vir, T> {
+    pub(crate) fn new_tmp<T: CompType>(&mut self, ty: vir::Type<'vir, T>) -> vir::Expr<'vir, T> {
         let name = vir::vir_format!(self.vcx, "_tmp{}", self.tmp_ctr);
         let local = vir::vir_local_decl! { self.vcx; [name] : [ty] };
         self.tmp_ctr += 1;
@@ -2364,13 +2439,17 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                                 _,
                             ) = rvalue
                             {
-                                self.aggregate_variant = match kind {
-                                    mir::AggregateKind::Adt(_, variant, ..) => {
-                                        Some((Place::from(*dest), *variant))
-                                    }
+                                let dest_place = Place::from(*dest);
+                                self.aggregate_variants.retain(|(p, _)| *p != dest_place);
+                                if let mir::AggregateKind::Adt(_, variant, ..) = kind {
+                                    self.aggregate_variants.push((dest_place, *variant));
+                                }
+                                self.nested_aggregate_assigned(Place::from(*dest))?;
+                                let vid = match kind {
+                                    mir::AggregateKind::Adt(_, variant, ..) => Some(*variant),
                                     _ => None,
                                 };
-                                self.nested_aggregate_assigned(Place::from(*dest))?;
+                                self.regions_in_aggregate(dest_place, vid)?;
                             }
                         }
                         Err(_) => {
@@ -2522,6 +2601,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     [EvalStmtPhase::PostMain]
                     .borrow_pcg();
                 self.nested_fold_at_return()?;
+                self.regions_in_fold_at_return()?;
                 let wand_packages = self.package_wands(borrows)?;
                 self.current_fpcs = Some(current_fpcs);
                 self.stmts(wand_packages);
@@ -2590,6 +2670,32 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                             span,
                         )?;
 
+                        // a generic callee: convert the pieces at its generic positions
+                        let generic = match self.deps.require_dep::<WandEnc>(WandEncTask {
+                            data: pcg::borrow_pcg::FunctionData::new(func_def_id),
+                        }) {
+                            Ok(wands) => {
+                                let call_ctx = self.gargs(caller_substs);
+                                wands.generic_nodes(self.vcx, self.deps, call_ctx)
+                            }
+                            Err(_) => Vec::new(),
+                        };
+                        let arg_places = args
+                            .iter()
+                            .map(|arg| match &arg.node {
+                                mir::Operand::Move(place) | mir::Operand::Copy(place) => Some(*place),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let arg_snaps = args
+                            .iter()
+                            .map(|arg| {
+                                let ty = arg.node.ty(self.local_decls, self.vcx.tcx());
+                                Ok((ty, self.encode_operand_snap_immediate(&arg.node)?))
+                            })
+                            .collect::<EncodeResult<'vir, Vec<_>, E>>()?;
+                        self.generic_call_regroup(&generic, &arg_snaps)?;
+
                         let method_in = args
                             .iter()
                             .map(|arg| self.encode_operand(&arg.node).unwrap())
@@ -2612,9 +2718,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                             },
                         );
                         self.stmts(call);
+                        self.generic_call_split(&generic, &arg_places, *destination, label_pre)?;
                         let label_post = self.new_label("post");
                         self.call_labels
                             .insert(location.block, (label_pre, label_post));
+                        // a new call: its wands are not applied yet
+                        self.applied_wands.retain(|b| *b != location.block);
                     }
                     Ok(())
                 })?;

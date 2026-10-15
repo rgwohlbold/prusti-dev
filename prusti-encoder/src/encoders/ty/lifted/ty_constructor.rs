@@ -95,6 +95,8 @@ impl TaskEncoder for TyConstructorEnc {
                 },
             )?;
             SizednessEnc::require(task_key);
+            // `has_ind` for every type that appears as a type value
+            let _ = deps.require_ref::<crate::encoders::ty::has_ind::TyHasIndEnc>(*task_key);
 
             let args = ty_accessor_functions
                 .iter()

@@ -4,16 +4,18 @@ use vir::{AdtDestructor, CastType, FunctionIdn};
 /// Encodes the `LifetimeQuery` adt, which selects the one occurrence of a
 /// lifetime in a type that an indirect predicate covers:
 /// ```text
-/// adt LifetimeQuery { q_here(q_idx: Int)  q_in(q_arg: Int, q_rest: LifetimeQuery) }
+/// adt LifetimeQuery { q_here(q_idx: Int)  q_in(q_arg: Int, q_rest: LifetimeQuery)  q_all() }
 /// ```
 /// `q_here(i)` selects the type's own lifetime parameter `i`, `q_in(j, rest)`
-/// the occurrence `rest` inside its type parameter `j`.
+/// the occurrence `rest` inside its type parameter `j`, `q_all()` every
+/// occurrence (opaque for a type parameter: `RegionsIn(T)`).
 pub struct LifetimeQueryEnc;
 
 #[derive(Debug, Clone, Copy)]
 pub struct LifetimeQueryFns<'vir> {
     q_here: FunctionIdn<'vir, vir::Int, vir::LifetimeQuery>,
     q_in: FunctionIdn<'vir, (vir::Int, vir::LifetimeQuery), vir::LifetimeQuery>,
+    q_all: FunctionIdn<'vir, (), vir::LifetimeQuery>,
     q_arg: AdtDestructor<'vir, vir::LifetimeQuery, vir::Int>,
     q_rest: AdtDestructor<'vir, vir::LifetimeQuery, vir::LifetimeQuery>,
 }
@@ -31,6 +33,16 @@ impl<'vir> LifetimeQueryFns<'vir> {
         rest: vir::ExprLifetimeQuery<'vir>,
     ) -> vir::ExprLifetimeQuery<'vir> {
         vir::with_vcx(|vcx| (self.q_in)(mk_int(vcx, index), rest))
+    }
+
+    /// `q_all()`
+    pub fn all(&self) -> vir::ExprLifetimeQuery<'vir> {
+        (self.q_all)()
+    }
+
+    /// `query == q_all()`
+    pub fn is_all(&self, query: vir::ExprLifetimeQuery<'vir>) -> vir::ExprBool<'vir> {
+        vir::with_vcx(|vcx| vcx.mk_eq_expr(query, self.all()))
     }
 
     /// `query == q_here(index)`
@@ -88,6 +100,7 @@ impl TaskEncoder for LifetimeQueryEnc {
                         "q_in",
                         vcx.alloc_slice(&[arg_decl.as_dyn(), rest_decl.as_dyn()]),
                     ),
+                    vcx.mk_adt_constructor::<(), !, vir::Dyn>("q_all", &[]),
                 ]),
             );
             Ok((
@@ -99,6 +112,7 @@ impl TaskEncoder for LifetimeQueryEnc {
                         (vir::TYPE_INT, query_ty),
                         query_ty,
                     ),
+                    q_all: FunctionIdn::new(vir::ViperIdent::new("q_all"), (), query_ty),
                     q_arg: vcx.mk_adt_destructor("q_arg", query_ty, vir::TYPE_INT),
                     q_rest: vcx.mk_adt_destructor("q_rest", query_ty, query_ty),
                 },
