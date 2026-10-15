@@ -4,6 +4,7 @@ pub mod indirect_pred;
 pub mod indirect_node;
 pub mod lifetime_query;
 pub mod occurrences;
+pub mod has_ind;
 pub mod impure;
 pub mod kinds;
 pub mod use_impure;

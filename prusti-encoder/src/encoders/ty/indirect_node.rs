@@ -33,21 +33,25 @@ impl<'tcx> ExtractRegionsCtxt<'tcx, RustTyDecomposition<'tcx>, PcgRegion<'tcx>> 
     }
 }
 
-/// The lifetime projection of `decomp` for the generalized lifetime `idx` of
-/// `ty`, `None` for a `RegionsIn(T)` lifetime.
-pub fn projection_for_generalized_idx<'tcx>(
+/// The node of `decomp` for the generalized lifetime `idx` of `ty`: a region,
+/// or `RegionsIn(T)` of a type parameter (`None` for other opaque types).
+pub fn node_for_generalized_idx<'tcx>(
     ty: ty::Ty<'tcx>,
     idx: LifetimeProjectionIdx<pcg::borrow_pcg::region_projection::Generalized>,
     decomp: RustTyDecomposition<'tcx>,
     tcx: ty::TyCtxt<'tcx>,
-) -> Option<LifetimeProjection<'tcx, RustTyDecomposition<'tcx>, Region>> {
+) -> Option<NodeId> {
     use pcg::borrow_pcg::GeneralizedLifetime;
     let lifetimes: IndexVec<_, GeneralizedLifetime<'tcx>> = tcx.extract_regions(ty);
-    let region = match lifetimes.get(idx)? {
-        GeneralizedLifetime::Region(r) => *r,
-        GeneralizedLifetime::RegionsIn(_) => return None,
-    };
-    LifetimeProjection::new(decomp, region, None, PrustiPcgCtxt)
+    match lifetimes.get(idx)? {
+        GeneralizedLifetime::Region(r) => LifetimeProjection::new(decomp, *r, None, PrustiPcgCtxt)
+            .map(|lp| NodeId::Region(lp.region_idx())),
+        GeneralizedLifetime::RegionsIn(opaque) => match opaque.ty(tcx).kind() {
+            ty::TyKind::Param(param) => Some(NodeId::RegionsIn(*param)),
+            // TODO: `RegionsIn` of an associated type
+            _ => None,
+        },
+    }
 }
 
 /// Encodes, for a type `T` (the type of the base of PCG lifetime projection
@@ -59,10 +63,19 @@ pub fn projection_for_generalized_idx<'tcx>(
 /// `ext_T(.. ext_T(S, .., key(o_1), Q_o1) .., key(o_k), Q_ok)`.
 pub struct IndirectNodesEnc;
 
-/// The piece of one occurrence of a region.
+/// What a piece belongs to: a region of the type (a PCG node), or everything
+/// inside a type parameter (`RegionsIn(T)`, only in function shapes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeId {
+    Region(RegionIdx),
+    RegionsIn(ty::ParamTy),
+}
+
+/// The piece of one occurrence of a region, or of a type parameter (query
+/// `path ++ q_all()`).
 #[derive(Clone, Debug)]
 pub struct NodePiece<'vir> {
-    pub region: RegionIdx,
+    pub node: NodeId,
     pub path: Vec<Step>,
     pub query: vir::ExprLifetimeQuery<'vir>,
     /// The pieces enclosing this one.
@@ -84,13 +97,13 @@ pub struct IndirectNodes<'vir> {
 impl<'vir> IndirectNodes<'vir> {
     /// Does node `p↓idx` hold anything?
     pub fn holds(&self, idx: RegionIdx) -> bool {
-        self.pieces.iter().any(|p| p.region == idx)
+        self.pieces.iter().any(|p| p.node == NodeId::Region(idx))
     }
 
     /// The pieces of node `p↓idx`, enclosing ones first.
     pub fn pieces_of(&self, idx: RegionIdx) -> Vec<usize> {
         (0..self.pieces.len())
-            .filter(|i| self.pieces[*i].region == idx)
+            .filter(|i| self.pieces[*i].node == NodeId::Region(idx))
             .collect()
     }
 
@@ -101,6 +114,42 @@ impl<'vir> IndirectNodes<'vir> {
     /// The number of pieces.
     pub fn len(&self) -> usize {
         self.pieces.len()
+    }
+
+    /// The same pieces for other (Viper) type arguments of the type: e.g. a
+    /// callee's view of its argument, instantiated with a caller's types.
+    pub fn with_args(&self, args: crate::encoders::ty::generics::GArgsTy<'vir>) -> Self {
+        Self {
+            tys: args.get_ty(),
+            consts: args.get_const(),
+            ..self.clone()
+        }
+    }
+
+    /// The pieces of `node`, enclosing ones first.
+    pub fn pieces_of_node(&self, node: NodeId) -> Vec<usize> {
+        (0..self.pieces.len())
+            .filter(|i| self.pieces[*i].node == node)
+            .collect()
+    }
+
+    /// The predicate of `node`, `None` if it holds nothing.
+    pub fn pred_of_node(&self, node: NodeId, s: vir::ExprSnap<'vir>) -> Option<vir::ExprBool<'vir>> {
+        let apps = self
+            .pieces_of_node(node)
+            .into_iter()
+            .map(|piece| self.app(piece, self.key(piece, s), None))
+            .collect::<Vec<_>>();
+        vir::with_vcx(|vcx| {
+            (!apps.is_empty()).then(|| {
+                vcx.mk_conj(
+                    &apps
+                        .into_iter()
+                        .map(|app| vcx.mk_predicate_app_expr(app))
+                        .collect::<Vec<_>>(),
+                )
+            })
+        })
     }
 
     /// The pieces enclosing `piece`.
@@ -234,25 +283,25 @@ impl TaskEncoder for IndirectNodesEnc {
         let occurrences =
             occurrences(decomp).map_err(|err| EncodeFullError::EncodingError(err, None))?;
 
-        // TODO: `RegionsIn(T)` of a type parameter.
-        let kept = (0..occurrences.len())
-            .filter(|i| matches!(occurrences[*i].end, End::Region(_)))
-            .collect::<Vec<_>>();
-        let pieces = kept
+        let pieces = occurrences
             .iter()
-            .map(|i| {
-                let occurrence = &occurrences[*i];
-                let End::Region(region) = occurrence.end else { unreachable!() };
-                let region = PcgRegion::from(region);
+            .map(|occurrence| {
+                let (node, query) = match occurrence.end {
+                    End::Region(region) => {
+                        let region = PcgRegion::from(region);
+                        let idx = regions.iter_enumerated().find(|(_, r)| **r == region).unwrap().0;
+                        (NodeId::Region(idx), occurrence_query(&query, &occurrence.path, None))
+                    }
+                    End::Param(param) => (
+                        NodeId::RegionsIn(param),
+                        occurrence_query(&query, &occurrence.path, Some(query.all())),
+                    ),
+                };
                 NodePiece {
-                    region: regions.iter_enumerated().find(|(_, r)| **r == region).unwrap().0,
+                    node,
                     path: occurrence.path.clone(),
-                    query: occurrence_query(&query, &occurrence.path, None),
-                    parents: occurrence
-                        .parents
-                        .iter()
-                        .filter_map(|p| kept.iter().position(|k| k == p))
-                        .collect(),
+                    query,
+                    parents: occurrence.parents.clone(),
                 }
             })
             .collect::<Vec<_>>();
@@ -260,7 +309,8 @@ impl TaskEncoder for IndirectNodesEnc {
         // enclosing regions first
         let encloses = |a: RegionIdx, b: RegionIdx| {
             pieces.iter().any(|piece| {
-                piece.region == b && piece.parents.iter().any(|p| pieces[*p].region == a)
+                piece.node == NodeId::Region(b)
+                    && piece.parents.iter().any(|p| pieces[*p].node == NodeId::Region(a))
             })
         };
         let mut order = Vec::new();

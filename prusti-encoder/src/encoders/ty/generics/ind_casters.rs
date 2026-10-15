@@ -43,6 +43,8 @@ pub(crate) struct IndCasters<'vir> {
     /// The pure cast of the keys (`make_generic_s_X`).
     pub(crate) make_generic_s:
         vir::FunctionIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap), vir::PSnap>,
+    /// The pure cast back (`make_concrete_s_X`).
+    pub(crate) make_concrete_s: vir::AdtDestructor<'vir, vir::PSnap, vir::CSnap>,
 }
 
 pub(crate) type IndCaster<'vir> =
@@ -93,6 +95,7 @@ impl TaskEncoder for IndCastersEnc {
                     make_generic: make_generic_ident,
                     make_concrete: make_concrete_ident,
                     make_generic_s: casters.make_generic,
+                    make_concrete_s: casters.make_concrete,
                 },
             )?;
 
