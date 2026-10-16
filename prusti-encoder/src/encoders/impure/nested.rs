@@ -13,6 +13,10 @@
 //!   its current key.
 //! - The pieces of a value built from parts (`t = C { f: op }`, PCG
 //!   `Aggregate` edges) are folded at the end of the phase.
+//!
+//! The nodes `p↓RegionsIn(T)` of type parameters are handled the same way.
+//! Their parts are guarded by `has_ind(T)`: at an expansion, a child's piece
+//! is made empty (`ind_empty` or a fold) if `T` holds nothing.
 
 use pcg::{
     borrow_pcg::{
@@ -37,7 +41,10 @@ use crate::encoders::{
             GArgsTy, GArgsTyEnc,
             ind_casters::{IndCasters, IndCastersEnc},
         },
+        has_ind::TyHasIndEnc,
         indirect_node::{IndirectNodesEnc, RegionIdx},
+        indirect_pred::TyIndirectEnc,
+        occurrences::Step,
     },
 };
 
@@ -50,6 +57,14 @@ pub struct PendingExpansion<'vir> {
     casts: Vec<ChildCast<'vir>>,
 }
 
+/// A `RegionsIn(T)` node unfolded at `expansion`, with the keys its pieces
+/// were unfolded with (the children's pieces are made from them).
+#[derive(Clone)]
+pub struct OpenedRegionsIn<'vir> {
+    expansion: BorrowPcgExpansion<'vir>,
+    keys: Vec<(usize, vir::ExprSnap<'vir>)>,
+}
+
 /// The bookkeeping of open nested pieces along one path: it is saved at the
 /// end of a block and restored for its successors (a successor sees the state
 /// of a predecessor, not of the block encoded last).
@@ -58,7 +73,7 @@ pub struct NestedPathState<'vir> {
     pending_expansions: Vec<PendingExpansion<'vir>>,
     early_expansions: Vec<BorrowPcgExpansion<'vir>>,
     expired_aggregates: Vec<(Place<'vir>, usize)>,
-    pending_regions_in: Vec<crate::encoders::impure::regions_in::PendingRegionsIn<'vir>>,
+    opened_regions_in: Vec<OpenedRegionsIn<'vir>>,
     applied_wands: Vec<mir::BasicBlock>,
 }
 
@@ -96,7 +111,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         self.pending_expansions = state.pending_expansions;
         self.early_expansions = state.early_expansions;
         self.expired_aggregates = state.expired_aggregates;
-        self.pending_regions_in = state.pending_regions_in;
+        self.opened_regions_in = state.opened_regions_in;
         self.applied_wands = state.applied_wands;
     }
 
@@ -106,7 +121,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             pending_expansions: self.pending_expansions.clone(),
             early_expansions: self.early_expansions.clone(),
             expired_aggregates: self.expired_aggregates.clone(),
-            pending_regions_in: self.pending_regions_in.clone(),
+            opened_regions_in: self.opened_regions_in.clone(),
             applied_wands: self.applied_wands.clone(),
         };
         self.nested_at_exit.insert(block, state);
@@ -262,6 +277,31 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let Some((base, region, _)) = Self::lp_expansion(expansion) else {
             return Ok(());
         };
+        let base = strip_downcasts(base);
+        let ty = base.ty(self.pcg_ctxt()).ty;
+        let nodes = self
+            .deps
+            .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+        if nodes.is_regions_in(region) {
+            // the children's pieces are made from the keys: bind them
+            let snap = match key_label {
+                Some(_) => self.path_snap(base)?,
+                None => self.encode_place_with_snap(base)?.1,
+            };
+            let keys = nodes
+                .pieces_of(region)
+                .into_iter()
+                .map(|piece| (piece, self.bind(self.vcx.maybe_apply_label(nodes.key(piece, snap), key_label))))
+                .collect::<Vec<_>>();
+            for (piece, key) in keys.iter().rev() {
+                self.stmt(self.vcx.mk_unfold_stmt(nodes.app(*piece, *key, None)));
+            }
+            self.opened_regions_in.push(OpenedRegionsIn {
+                expansion: expansion.clone(),
+                keys,
+            });
+            return Ok(());
+        }
         for piece in self.node_pred_apps(base, region, key_label)?.into_iter().rev() {
             self.stmt(self.vcx.mk_unfold_stmt(piece));
         }
@@ -283,6 +323,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         if !unfolded {
             let label = self.current_phase_label();
             self.nested_expansion_unfold(expansion, Some(label))?;
+        }
+        if let Some(i) = self.opened_regions_in.iter().position(|o| o.expansion == *expansion) {
+            let opened = self.opened_regions_in.remove(i);
+            self.regions_in_empty_children(base_place, &children, &opened.keys)?;
         }
         let mut casts = Vec::new();
         for (child, child_idx) in children {
@@ -318,21 +362,142 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// At `return`: fold the pending pieces of the arguments (owned values
     /// whose expansions the PCG does not collapse at the end), keyed by their
-    /// pre-state snapshots as in the postcondition.
+    /// pre-state snapshots as in the postcondition. Of `RegionsIn(T)` nodes,
+    /// only those the postcondition gives back unblocked (the others moved
+    /// with the values), including expansions inside the argument (deepest
+    /// first); the others stay pending for the wand packages.
     pub(crate) fn nested_fold_at_return(&mut self) -> EncodeResult<'vir, (), E> {
         let pending = std::mem::take(&mut self.pending_expansions);
+        let unblocked = self
+            .wands
+            .unblocked_regions_in(self.vcx, self.deps)
+            .into_iter()
+            .map(|(local, idx)| (local, Place::from(local).regions(self.pcg_ctxt())[idx]))
+            .collect::<Vec<_>>();
+        let mut regions_in = Vec::new();
         for p in pending.iter().rev() {
-            if p.base.projection().is_empty()
+            let ty = p.base.ty(self.pcg_ctxt()).ty;
+            let nodes = self
+                .deps
+                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+            if nodes.is_regions_in(p.region) {
+                regions_in.push(p.clone());
+            } else if p.base.projection().is_empty()
                 && self.body.local_kind(p.base.local) == mir::LocalKind::Arg
             {
-                let ty = p.base.ty(self.pcg_ctxt()).ty;
-                let nodes = self
-                    .deps
-                    .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
                 let snap = self.vcx.mk_old_expr(self.encode_place_with_snap(p.base)?.1);
                 for piece in nodes.apps(p.region, snap) {
                     self.stmt(self.vcx.mk_fold_stmt(piece));
                 }
+            }
+        }
+        // deepest first
+        regions_in.sort_by_key(|p| std::cmp::Reverse(p.base.projection().len()));
+        let mut keep = Vec::new();
+        for p in regions_in {
+            let local = p.base.local;
+            let region = p.base.regions(self.pcg_ctxt())[p.region];
+            if self.body.local_kind(local) != mir::LocalKind::Arg
+                || self.body.local_decls[local].ty.is_ref()
+                || p.base.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref))
+                || !unblocked.contains(&(local, region))
+            {
+                keep.push(p);
+                continue;
+            }
+            let mut casts = p.casts.clone();
+            casts.sort_by_key(|cast| std::cmp::Reverse(cast.piece));
+            for cast in casts {
+                let key = self.child_key(&cast)?;
+                self.stmt(
+                    (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.query)
+                        .alloc(),
+                );
+            }
+            let ty = p.base.ty(self.pcg_ctxt()).ty;
+            let nodes = self
+                .deps
+                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+            let snap = self.vcx.mk_old_expr(self.path_snap(p.base)?);
+            for piece in nodes.apps(p.region, snap) {
+                self.stmt(self.vcx.mk_fold_stmt(piece));
+            }
+        }
+        self.pending_expansions = keep;
+        Ok(())
+    }
+
+    /// A place was collapsed without capability (moved out or dropped): the
+    /// pieces of its open `RegionsIn(T)` expansions went with the moved
+    /// values. Those of a by-value argument stay for the fold at `return`.
+    pub(crate) fn nested_drop(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
+        let mut keep = Vec::new();
+        for p in std::mem::take(&mut self.pending_expansions) {
+            let ty = p.base.ty(self.pcg_ctxt()).ty;
+            let nodes = self
+                .deps
+                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+            let by_value_arg = self.body.local_kind(p.base.local) == mir::LocalKind::Arg
+                && !self.body.local_decls[p.base.local].ty.is_ref();
+            if !nodes.is_regions_in(p.region) || !place.is_prefix_of(p.base) || by_value_arg {
+                keep.push(p);
+            }
+        }
+        self.pending_expansions = keep;
+        Ok(())
+    }
+
+    /// After unfolding the `RegionsIn(T_j)` pieces (with `keys`) of `base` at
+    /// an expansion into `children`: a part is guarded by `has_ind(T_j)`, so
+    /// without it, make the child's piece empty: `ind_empty` for a field of
+    /// type `T_j` (`p_Param_ind`, before any cast), a fold for a constructor
+    /// around `T_j`.
+    fn regions_in_empty_children(
+        &mut self,
+        base: Place<'vir>,
+        children: &[(Place<'vir>, RegionIdx)],
+        keys: &[(usize, vir::ExprSnap<'vir>)],
+    ) -> EncodeResult<'vir, (), E> {
+        let vid = base.ty(self.pcg_ctxt()).variant_index;
+        let base = strip_downcasts(base);
+        let decomp = RustTyDecomposition::from_ty(base.ty(self.pcg_ctxt()).ty, self.def_id);
+        let nodes = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
+        let dep = self.deps.require_dep::<TyIndirectEnc>(decomp.ty)?;
+        let args = self.deps.require_dep::<GArgsTyEnc>(decomp.args)?;
+        let param_ind = self
+            .deps
+            .require_ref::<TyIndirectEnc>(RustTyDecomposition::param())?;
+        for (g, key) in keys {
+            let Some((Step::In(j), rest)) = nodes.piece(*g).path.split_first() else {
+                continue;
+            };
+            for part in dep.ty_param_parts[*j].iter().filter(|p| p.vid == vid) {
+                let Some(child) = children
+                    .iter()
+                    .map(|(c, _)| *c)
+                    .find(|c| child_field(decomp, *c) == Some(part.field_idx))
+                else {
+                    continue;
+                };
+                let child_decomp = RustTyDecomposition::from_ty(child.ty(self.pcg_ctxt()).ty, self.def_id);
+                let child_nodes = self.deps.require_dep::<IndirectNodesEnc>(child_decomp)?;
+                let path = part.path.iter().chain(rest).copied().collect::<Vec<_>>();
+                let Some(piece) = child_nodes.find(&path) else {
+                    continue;
+                };
+                let k = part.read.read(*key);
+                let tau = args.get_ty()[*j];
+                let no_ind = self
+                    .vcx
+                    .mk_unary_op_expr(vir::UnOpKind::Not, TyHasIndEnc::has_ind_fn().call()(tau).upcast_ty())
+                    .downcast_ty::<vir::Bool>();
+                let empty = if part.path.is_empty() {
+                    let query = child_nodes.piece(piece).query;
+                    (param_ind.empty.unwrap())(k, &[tau], &[], query).alloc()
+                } else {
+                    self.vcx.mk_fold_stmt(child_nodes.app(piece, k, None))
+                };
+                self.stmt(self.vcx.mk_if_stmt(no_ind, self.vcx.alloc_slice(&[empty]), &[]));
             }
         }
         Ok(())
@@ -380,6 +545,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         };
         let child_ty = child.ty(self.pcg_ctxt()).ty;
         let child_decomp = RustTyDecomposition::from_ty(child_ty, self.def_id);
+        if child_decomp.ty.specifics.is_param() {
+            // `p_Param_ind` in the parent as well
+            return Ok(Vec::new());
+        }
         let child_nodes = self.deps.require_dep::<IndirectNodesEnc>(child_decomp)?;
         let casters = self
             .deps
@@ -400,17 +569,50 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// The current key of the child's (concrete) piece.
     fn child_key(&mut self, cast: &ChildCast<'vir>) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
+        self.child_key_at(cast, None)
+    }
+
+    /// The key of the child's (concrete) piece, of the place at `label`.
+    fn child_key_at(
+        &mut self,
+        cast: &ChildCast<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
         let ty = cast.child.ty(self.pcg_ctxt()).ty;
         let nodes = self
             .deps
             .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
-        let snap = self.encode_place_with_snap(cast.child)?.1;
+        let snap = self.place_snap_at(cast.child, label)?;
         Ok(nodes.key(cast.piece, snap))
     }
 
-    /// Before the place `place` is folded: cast the children of its pending
-    /// expansions back to generic, while they are still concrete.
-    pub(crate) fn nested_before_place_fold(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
+    /// The snapshot of `place` (labelled at `label`): of a reference, the one
+    /// at the label (its key is stable, as for its own piece); otherwise read
+    /// now at its address at the label (the place was just folded).
+    fn place_snap_at(
+        &mut self,
+        place: Place<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
+        if label.is_none() || place.ty(self.pcg_ctxt()).ty.is_ref() {
+            let snap = self.encode_place_with_snap(place)?.1;
+            return Ok(self.vcx.maybe_apply_label(snap, label));
+        }
+        let place_ref = self.encode_place(place)?;
+        let ty = place_ref.ty.ty;
+        let place_ref = self.vcx.maybe_apply_label(place_ref.expr.expect_predicate(), label);
+        let data = self.ty_use_impure(ty);
+        Ok(data.ref_to_snap(place_ref))
+    }
+
+    /// Before the place `place` is folded (labelled at `label`): cast the
+    /// children of its pending expansions back to generic, while they are
+    /// still concrete.
+    pub(crate) fn nested_before_place_fold(
+        &mut self,
+        place: Place<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> EncodeResult<'vir, (), E> {
         let casts = self
             .pending_expansions
             .iter()
@@ -421,7 +623,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let mut casts = casts;
         casts.sort_by_key(|cast| std::cmp::Reverse(cast.piece));
         for cast in casts {
-            let key = self.child_key(&cast)?;
+            let key = self.child_key_at(&cast, label)?;
             self.stmt(
                 (cast.casters.make_generic)(
                     key,
@@ -435,9 +637,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(())
     }
 
-    /// After the place `place` was folded: fold the pieces of its pending
-    /// expansions (enclosing lifetimes first) with their current keys.
-    pub(crate) fn nested_after_place_fold(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
+    /// After the place `place` was folded (labelled at `label`): fold the
+    /// pieces of its pending expansions (enclosing lifetimes first) with
+    /// their current keys.
+    pub(crate) fn nested_after_place_fold(
+        &mut self,
+        place: Place<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> EncodeResult<'vir, (), E> {
         let (pending, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_expansions)
             .into_iter()
             .partition(|p| p.base == place);
@@ -449,9 +656,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let nodes = self
             .deps
             .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+        let snap = self.place_snap_at(place, label)?;
         for idx in nodes.order().to_vec() {
             if pending.iter().any(|p| p.region == idx) {
-                for piece in self.node_pred_apps(place, idx, None)? {
+                for piece in nodes.apps(idx, snap) {
                     self.stmt(self.vcx.mk_fold_stmt(piece));
                 }
             }
@@ -702,6 +910,21 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             }
         }
         Ok(())
+    }
+}
+
+/// The field of `decomp` (the type of `child`'s parent) that `child` is.
+fn child_field(decomp: RustTyDecomposition<'_>, child: Place<'_>) -> Option<usize> {
+    match child.last_projection()?.1 {
+        mir::ProjectionElem::Field(f, _) => Some(f.as_usize()),
+        mir::ProjectionElem::Deref => match &decomp.ty.specifics {
+            TySpecifics::MutRef(_) => Some(0),
+            TySpecifics::StructLike(data) if decomp.ty.special == RustTySpecial::Box => {
+                data.fields.len().checked_sub(1)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 

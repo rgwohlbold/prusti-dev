@@ -4,7 +4,7 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition,
         generics::{GArgs, GArgsTyEnc, GParams, GenericParamsEnc, ind_casters::IndCastersEnc},
-        indirect_node::{IndirectNodes, IndirectNodesEnc, NodeId, node_for_generalized_idx},
+        indirect_node::{IndirectNodes, IndirectNodesEnc, RegionIdx, node_for_generalized_idx},
     },
 };
 use pcg::borrow_pcg::{
@@ -29,7 +29,7 @@ pub struct WandEnc;
 pub(crate) struct GenericNode<'vir> {
     /// The argument (or the result) the node belongs to.
     pub local: mir::Local,
-    pub node: NodeId,
+    pub node: RegionIdx,
     /// The callee's view of the local's type, with the caller's type arguments.
     pub nodes: IndirectNodes<'vir>,
     /// For an argument: whether the result blocks it (its pieces come back
@@ -66,7 +66,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             };
             let mut package_script = Vec::new();
             // each package starts from the state at the end of the body
-            let pending_regions_in = self.pending_regions_in.clone();
+            let pending_expansions = self.pending_expansions.clone();
             let mut locals = wand_data.rhs.iter().map(|g| g.mir_local()).collect::<Vec<_>>();
             locals.dedup();
             for local in locals {
@@ -81,7 +81,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 })?;
                 package_script.extend(unblock);
             }
-            self.pending_regions_in = pending_regions_in;
+            self.pending_expansions = pending_expansions;
 
             if !wand_data.pledges.is_empty() {
                 // Statements in the package script only see resources already
@@ -206,7 +206,7 @@ impl<'vir> WandEncOutput<'vir> {
         deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
         g: FunctionShapeNode<Generalized>,
         call_ctx: WandCallContext<'vir>,
-    ) -> Result<Option<(IndirectNodes<'vir>, NodeId)>, String> {
+    ) -> Result<Option<(IndirectNodes<'vir>, RegionIdx)>, String> {
         let arg_ty = g.ty(self.fn_sig(vcx, None));
         let decomp = RustTyDecomposition::from_ty(arg_ty, self.g_params(vcx, None));
         let Some(node) = node_for_generalized_idx(arg_ty, g.region_idx(), decomp, vcx.tcx()) else {
@@ -265,7 +265,7 @@ impl<'vir> WandEncOutput<'vir> {
         // Unsupported nodes were rejected when encoding the wands.
         self.function_shape_node(vcx, deps, g, call_ctx)
             .unwrap()
-            .is_some_and(|(nodes, node)| !nodes.pieces_of_node(node).is_empty())
+            .is_some_and(|(nodes, node)| nodes.holds(node))
     }
 
     /// The position of the given node among those of its base: enclosing
@@ -277,7 +277,7 @@ impl<'vir> WandEncOutput<'vir> {
         g: FunctionShapeNode<Generalized>,
     ) -> (mir::Local, usize) {
         let position = self.function_shape_node(vcx, deps, g, None).unwrap().map_or(0, |(nodes, node)| {
-            nodes.pieces_of_node(node).first().copied().unwrap_or(0)
+            nodes.pieces_of(node).first().copied().unwrap_or(0)
         });
         (g.mir_local(), position)
     }
@@ -293,7 +293,7 @@ impl<'vir> WandEncOutput<'vir> {
         let g = g.into();
         let (nodes, node) = self.function_shape_node(vcx, deps, g, call_ctx).unwrap()?;
         let snap = self.callee_snap(vcx, deps, g, call_ctx, snap(g.mir_local()));
-        nodes.pred_of_node(node, snap)
+        nodes.pred(node, snap)
     }
 
     pub fn indirect_pres<'a, E: TaskEncoder>(
@@ -661,7 +661,7 @@ impl<'vir> WandEncOutput<'vir> {
             return false;
         };
         nodes
-            .pieces_of_node(nb)
+            .pieces_of(nb)
             .into_iter()
             .any(|p| nodes.parents(p).iter().any(|q| nodes.piece(*q).node == na))
     }
@@ -673,7 +673,7 @@ impl<'vir> WandEncOutput<'vir> {
         deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
         g: FunctionShapeNode<Generalized>,
     ) -> bool {
-        matches!(self.function_shape_node(vcx, deps, g, None), Ok(Some((_, NodeId::RegionsIn(_)))))
+        matches!(self.function_shape_node(vcx, deps, g, None), Ok(Some((nodes, node))) if nodes.is_regions_in(node))
     }
 
     /// One wand per group of targets enclosing each other: an enclosed
@@ -741,8 +741,8 @@ impl<'vir> WandEncOutput<'vir> {
         g: FunctionShapeNode<Generalized>,
     ) -> bool {
         match self.function_shape_node(vcx, deps, g, None) {
-            Ok(Some((nodes, node @ NodeId::RegionsIn(_)))) => nodes
-                .pieces_of_node(node)
+            Ok(Some((nodes, node))) if nodes.is_regions_in(node) => nodes
+                .pieces_of(node)
                 .into_iter()
                 .all(|p| nodes.parents(p).is_empty()),
             _ => false,
@@ -885,7 +885,7 @@ impl<'vir> WandEncOutput<'vir> {
             .chain(outputs)
             .filter_map(|(g, blocked)| {
                 let (nodes, node) = self.function_shape_node(vcx, deps, g, Some(call_ctx)).ok()??;
-                matches!(node, NodeId::RegionsIn(_)).then(|| GenericNode {
+                nodes.is_regions_in(node).then(|| GenericNode {
                     local: g.mir_local(),
                     node,
                     nodes,
@@ -901,14 +901,14 @@ impl<'vir> WandEncOutput<'vir> {
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
-    ) -> Vec<(mir::Local, NodeId)> {
+    ) -> Vec<(mir::Local, RegionIdx)> {
         let blocked = self.blocked_inputs();
         self.inputs()
             .filter(|i| !blocked.contains(i))
             .filter_map(|i| {
                 let g = FunctionShapeNode::from(i);
-                let (_, node) = self.function_shape_node(vcx, deps, g, None).ok()??;
-                matches!(node, NodeId::RegionsIn(_)).then(|| (g.mir_local(), node))
+                let (nodes, node) = self.function_shape_node(vcx, deps, g, None).ok()??;
+                nodes.is_regions_in(node).then(|| (g.mir_local(), node))
             })
             .collect()
     }
