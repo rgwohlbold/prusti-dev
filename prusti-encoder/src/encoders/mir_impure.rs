@@ -186,8 +186,9 @@ where
     pub labelled_phase: Option<(mir::Location, EvalStmtPhase)>,
     /// The lifetime projections unfolded at a PCG expansion and not folded yet.
     pub pending_expansions: Vec<crate::encoders::impure::nested::PendingExpansion<'vir>>,
-    /// The unfolded `RegionsIn(T)` pieces of places (see `impure::regions_in`).
-    pub pending_regions_in: Vec<crate::encoders::impure::regions_in::PendingRegionsIn<'vir>>,
+    /// The `RegionsIn(T)` nodes unfolded at an expansion whose children's
+    /// pieces are not made yet (see `impure::nested`).
+    pub opened_regions_in: Vec<crate::encoders::impure::nested::OpenedRegionsIn<'vir>>,
     /// The calls whose wands were applied on the current path (a call's
     /// wands are applied at the removal of its first coupled edge).
     pub applied_wands: Vec<mir::BasicBlock>,
@@ -617,14 +618,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             .and_then(|expansion| expansion.guide())
             .and_then(|guide| self.expansion_index(guide));
 
-        // The nested pieces of a place folded in the current state (see
-        // `impure::nested`).
-        let nested = matches!(fold_or_unfold, FoldOrUnfold::Fold) && label.is_none();
+        // The nested pieces of a folded place (see `impure::nested`).
+        let nested = matches!(fold_or_unfold, FoldOrUnfold::Fold);
         if nested {
-            self.nested_before_place_fold(place)?;
-        }
-        if matches!(fold_or_unfold, FoldOrUnfold::Fold) {
-            self.regions_in_before_fold(place, label)?;
+            self.nested_before_place_fold(place, label)?;
         }
         let (stmts, frame) = match fold_or_unfold {
             FoldOrUnfold::Unfold => (
@@ -642,10 +639,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         };
         self.stmts(stmts);
         if nested {
-            self.nested_after_place_fold(place)?;
-        }
-        if matches!(fold_or_unfold, FoldOrUnfold::Fold) {
-            self.regions_in_after_fold(place, label)?;
+            self.nested_after_place_fold(place, label)?;
         }
         Ok(Some(frame))
     }
@@ -1127,8 +1121,6 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             // unfolded in the same phase: its key reads the place's predicate
             // and own piece (see `impure::nested`).
             if let Some(place) = Self::place_unfolded_by(action) {
-                let children = self.children_unfolded_by(action);
-                self.regions_in_unfold(place, children)?;
                 let mut early = Vec::new();
                 for later in &actions[i + 1..] {
                     if let PcgAction::Borrow(later) = later
@@ -1174,34 +1166,6 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             PcgAction::Owned(action) => match action.kind() {
                 RepackOp::Expand(expand) => Some(expand.from()),
                 _ => None,
-            },
-        }
-    }
-
-    /// The places that `action` unfolds a place into (see
-    /// [Self::place_unfolded_by]).
-    fn children_unfolded_by(&self, action: &PcgAction<'vir>) -> Vec<Place<'vir>> {
-        match action {
-            PcgAction::Borrow(action) => match action.kind() {
-                BorrowPcgActionKind::AddEdge { edge } => match edge.kind() {
-                    BorrowPcgEdgeKind::Deref(deref) => vec![deref.deref_place().place()],
-                    BorrowPcgEdgeKind::BorrowPcgExpansion(expansion) => expansion
-                        .expansion()
-                        .into_iter()
-                        .filter_map(|node| match node {
-                            PcgNode::Place(place) => Some(place.place()),
-                            PcgNode::LifetimeProjection(_) => None,
-                        })
-                        .collect(),
-                    _ => Vec::new(),
-                },
-                _ => Vec::new(),
-            },
-            PcgAction::Owned(action) => match action.kind() {
-                RepackOp::Expand(expand) if !matches!(expand.capability(), CapabilityKind::Write) => {
-                    expand.target_places(self.pcg_ctxt())
-                }
-                _ => Vec::new(),
             },
         }
     }
@@ -1305,7 +1269,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     if !matches!(repack_op, RepackOp::Collapse(..)) {
                         comment!(self, "expected RepackOp::Collapse but got {repack_op:?}");
                     } else {
-                        self.regions_in_drop(place);
+                        self.nested_drop(place)?;
                     }
                     return Ok(());
                 }
@@ -1324,10 +1288,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     self.stmts(data.unfold(place_ty.variant_index, place_enc, index, None, None));
                 } else if matches!(repack_op, pcg::free_pcs::RepackOp::Collapse(..)) {
                     // the nested pieces are folded at the `Aggregate` edges
-                    self.nested_before_place_fold(place)?;
-                    self.regions_in_before_fold(place, None)?;
+                    self.nested_before_place_fold(place, None)?;
                     self.stmts(data.fold(place_ty.variant_index, place_enc, index, None, None));
-                    self.regions_in_after_fold(place, None)?;
                 } else {
                     unreachable!()
                 }
@@ -2445,11 +2407,6 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                                     self.aggregate_variants.push((dest_place, *variant));
                                 }
                                 self.nested_aggregate_assigned(Place::from(*dest))?;
-                                let vid = match kind {
-                                    mir::AggregateKind::Adt(_, variant, ..) => Some(*variant),
-                                    _ => None,
-                                };
-                                self.regions_in_aggregate(dest_place, vid)?;
                             }
                         }
                         Err(_) => {
@@ -2601,7 +2558,6 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     [EvalStmtPhase::PostMain]
                     .borrow_pcg();
                 self.nested_fold_at_return()?;
-                self.regions_in_fold_at_return()?;
                 let wand_packages = self.package_wands(borrows)?;
                 self.current_fpcs = Some(current_fpcs);
                 self.stmts(wand_packages);
