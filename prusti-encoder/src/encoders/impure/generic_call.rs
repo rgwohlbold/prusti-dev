@@ -21,7 +21,7 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition,
         generics::{GArgsTyEnc, ind_casters::IndCastersEnc},
-        indirect_node::{IndirectNodes, IndirectNodesEnc, NodeId},
+        indirect_node::{IndirectNodes, IndirectNodesEnc},
         indirect_pred::TyIndirectEnc,
         lifetime_query::{LifetimeQueryEnc, LifetimeQueryFns},
         occurrences::{End, Step, occurrence_query, occurrences, param_position},
@@ -122,12 +122,12 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     ) -> EncodeResult<'vir, (), E> {
         let decomp = RustTyDecomposition::from_ty(ty, self.def_id);
         let caller = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
-        for g in node.nodes.pieces_of_node(node.node) {
+        for g in node.nodes.pieces_of(node.node) {
             let path = node.nodes.piece(g).path.clone();
             // generic in the caller as well: the same piece
             if caller
                 .find(&path)
-                .is_some_and(|c| matches!(caller.piece(c).node, NodeId::RegionsIn(_)))
+                .is_some_and(|c| caller.piece(c).all)
             {
                 continue;
             }
@@ -192,7 +192,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .map(|c| LevelPiece {
                 key: self.bind(caller.key(c, snap)),
                 path: caller.piece(c).path.clone(),
-                all: matches!(caller.piece(c).node, NodeId::RegionsIn(_)),
+                all: caller.piece(c).all,
             })
             .collect()
     }
