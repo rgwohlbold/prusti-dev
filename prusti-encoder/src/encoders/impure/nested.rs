@@ -72,7 +72,6 @@ pub struct OpenedRegionsIn<'vir> {
 pub struct NestedPathState<'vir> {
     pending_expansions: Vec<PendingExpansion<'vir>>,
     early_expansions: Vec<BorrowPcgExpansion<'vir>>,
-    expired_aggregates: Vec<(Place<'vir>, usize)>,
     opened_regions_in: Vec<OpenedRegionsIn<'vir>>,
     applied_wands: Vec<mir::BasicBlock>,
 }
@@ -110,7 +109,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .unwrap_or_default();
         self.pending_expansions = state.pending_expansions;
         self.early_expansions = state.early_expansions;
-        self.expired_aggregates = state.expired_aggregates;
         self.opened_regions_in = state.opened_regions_in;
         self.applied_wands = state.applied_wands;
     }
@@ -120,7 +118,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let state = NestedPathState {
             pending_expansions: self.pending_expansions.clone(),
             early_expansions: self.early_expansions.clone(),
-            expired_aggregates: self.expired_aggregates.clone(),
             opened_regions_in: self.opened_regions_in.clone(),
             applied_wands: self.applied_wands.clone(),
         };
@@ -667,44 +664,41 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(())
     }
 
-    /// An `Aggregate` borrow-flow edge was removed. Removing an edge that
-    /// built a value from parts means that the loans the parts held expire:
-    /// their pieces go back to the lenders. If the value's piece is folded, it
-    /// is unfolded (once), and a part at a generic field position is cast back
-    /// to its concrete pieces; the value's piece is not refolded when it is
-    /// collapsed.
+    /// An `Aggregate` borrow-flow edge was removed: the loans the parts held
+    /// expired, so the value's piece is unfolded (once per phase), and a part
+    /// at a generic field position is cast back to its concrete pieces. If
+    /// the target node is labelled (the value was expanded since), its fields
+    /// hold the pieces already.
     pub(crate) fn nested_aggregate_removed(
         &mut self,
         source: MaybeLabelledPlace<'vir>,
         source_idx: RegionIdx,
         target: MaybeLabelledPlace<'vir>,
         target_idx: usize,
+        target_labelled: bool,
         kind: &BorrowFlowEdgeKind<'vir>,
     ) -> EncodeResult<'vir, (), E> {
         let target_place = target.place();
         if source.place().is_prefix_of(target_place) || target_place.is_prefix_of(source.place()) {
             return Ok(());
         }
-        let open = self
-            .pending_expansions
-            .iter()
-            .any(|p| p.base == target_place && p.region.index() == target_idx);
-        if !self.expired_aggregates.contains(&(target_place, target_idx)) {
-            self.expired_aggregates.push((target_place, target_idx));
-            if !open {
-                let idx = RegionIdx::from(target_idx);
-                let key_label = match target {
-                    MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
-                    MaybeLabelledPlace::Current(_) => None,
-                };
-                for piece in self.node_pred_apps(target_place, idx, key_label)?.into_iter().rev() {
-                    self.stmt(self.vcx.mk_unfold_stmt(piece));
-                }
-                self.released_aggregates.push((target_place, target_idx));
-            }
+        if target_labelled {
+            // the value is dead: its expansion is not folded again
+            self.pending_expansions
+                .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
+            return Ok(());
         }
-        self.pending_expansions
-            .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
+        if !self.released_aggregates.contains(&(target_place, target_idx)) {
+            let idx = RegionIdx::from(target_idx);
+            let key_label = match target {
+                MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
+                MaybeLabelledPlace::Current(_) => None,
+            };
+            for piece in self.node_pred_apps(target_place, idx, key_label)?.into_iter().rev() {
+                self.stmt(self.vcx.mk_unfold_stmt(piece));
+            }
+            self.released_aggregates.push((target_place, target_idx));
+        }
 
         // the part at a generic field position: back to its concrete pieces
         let BorrowFlowEdgeKind::Aggregate { field_idx, .. } = kind else {
@@ -778,10 +772,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 .any(|p| p.base == target_place && p.region.index() == target_idx);
             self.pending_expansions
                 .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
-            if was_expanded
-                && !self.expired_aggregates.contains(&(target_place, target_idx))
-                && !self.pending_aggregates.contains(&(target, target_idx))
-            {
+            if was_expanded && !self.pending_aggregates.contains(&(target, target_idx)) {
                 self.pending_aggregates.push((target, target_idx));
             }
             return Ok(());
@@ -806,9 +797,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 });
             }
         }
-        // a new value: its loans are alive
-        self.expired_aggregates
-            .retain(|e| *e != (target_place, target_idx));
         if !self.pending_aggregates.contains(&(target, target_idx)) {
             self.pending_aggregates.push((target, target_idx));
         }
@@ -825,7 +813,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
         let target = MaybeLabelledPlace::Current(place);
         for idx in nodes.order().to_vec() {
-            self.expired_aggregates.retain(|e| *e != (place, idx.index()));
             if nodes.holds(idx) && !self.pending_aggregates.contains(&(target, idx.index())) {
                 self.pending_aggregates.push((target, idx.index()));
             }
@@ -862,6 +849,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// At the end of a phase: cast the parts at generic field positions, then
     /// fold the pieces of the values built from them.
     pub(crate) fn nested_fold_aggregates(&mut self) -> EncodeResult<'vir, (), E> {
+        self.released_aggregates.clear();
+        self.released_parts.clear();
         for cast in std::mem::take(&mut self.pending_aggregate_casts) {
             let label = match cast.source {
                 MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
