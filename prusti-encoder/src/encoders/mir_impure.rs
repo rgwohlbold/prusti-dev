@@ -197,8 +197,6 @@ where
     pub pending_aggregates: Vec<(MaybeLabelledPlace<'vir>, usize)>,
     /// Expansions whose piece was already unfolded (before their place was).
     pub early_expansions: Vec<BorrowPcgExpansion<'vir>>,
-    /// Lifetime projections of values built from parts whose loans expired.
-    pub expired_aggregates: Vec<(Place<'vir>, usize)>,
     /// Casts of the parts of values built from parts, done at the end of the
     /// current phase.
     pub pending_aggregate_casts: Vec<crate::encoders::impure::nested::AggregateCast<'vir>>,
@@ -208,8 +206,8 @@ where
     /// The enum places assigned an aggregate and their variants (the PCG
     /// `Aggregate` edges do not name it).
     pub aggregate_variants: Vec<(Place<'vir>, prusti_rustc_interface::abi::VariantIdx)>,
-    /// Values built from parts whose piece was unfolded when their loans
-    /// expired, and the parts cast back to concrete.
+    /// Values built from parts whose piece was unfolded in the current phase
+    /// because their loans expired, and the parts cast back to concrete.
     pub released_aggregates: Vec<(Place<'vir>, usize)>,
     pub released_parts: Vec<(MaybeLabelledPlace<'vir>, crate::encoders::ty::indirect_node::RegionIdx)>,
     pub current_block_succs: Option<FxHashMap<mir::BasicBlock, vir::CfgBlockLabel<'vir>>>,
@@ -827,6 +825,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                             borrow_flow.long().region_idx(),
                             borrow_flow.short().base(),
                             borrow_flow.short().region_idx().index(),
+                            borrow_flow.short().label().is_some(),
                             &borrow_flow.kind(),
                         )?;
                     }

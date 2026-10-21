@@ -367,7 +367,6 @@ impl TaskEncoder for MethodEnc {
                     opened_regions_in: Vec::new(),
                     applied_wands: Vec::new(),
                     pending_aggregates: Vec::new(),
-                    expired_aggregates: Vec::new(),
                     aggregate_variants: Vec::new(),
                     released_aggregates: Vec::new(),
                     released_parts: Vec::new(),
