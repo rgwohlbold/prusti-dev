@@ -58,11 +58,11 @@ pub fn occurrence_query<'vir>(
     rest: Option<vir::ExprLifetimeQuery<'vir>>,
 ) -> vir::ExprLifetimeQuery<'vir> {
     let (init, last) = match path.last() {
-        Some(Step::Here(i)) => (&path[..path.len() - 1], fns.here(*i)),
+        Some(Step::Here(i)) => (&path[..path.len() - 1], fns.one(*i)),
         _ => (path, rest.expect("a type parameter occurrence needs the rest of its query")),
     };
     init.iter().rev().fold(last, |q, step| match step {
-        Step::In(j) => fns.in_arg(*j, q),
+        Step::In(j) => fns.arg(*j, q),
         Step::Here(_) => unreachable!("`Here` ends a path"),
     })
 }

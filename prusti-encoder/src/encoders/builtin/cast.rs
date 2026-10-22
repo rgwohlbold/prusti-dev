@@ -461,7 +461,7 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         );
                         // the pieces hold the referents
                         let query = deps.require_dep::<LifetimeQueryEnc>(())?;
-                        let own_selected = query.is_here(q, 0);
+                        let own_selected = query.is_one(q, 0);
 
                         // `unsize`: operand referent `U` -> result referent `V`; the
                         // new `V` value is `value_cast(old(U), U, V)`. `undo` is the

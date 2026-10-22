@@ -60,13 +60,13 @@ pub(crate) type Agree<'vir> =
 pub struct TyIndirectDep<'vir> {
     /// `None` if `ext_X` requires no agreement.
     pub(crate) agree: Option<Agree<'vir>>,
-    /// Per type parameter `T_j`: the parts of the body for `q_in(j, rest)`,
+    /// Per type parameter `T_j`: the parts of the body for `q_arg(j, sub)`,
     /// i.e. where `T_j` occurs in the fields.
     pub(crate) ty_param_parts: Vec<Vec<TyParamPart<'vir>>>,
 }
 
 /// An occurrence of a type parameter `T_j` in a field: the body for
-/// `q_in(j, rest)` holds `p_F_ind(read(key), .., path ++ rest)` (for an enum
+/// `q_arg(j, sub)` holds `p_F_ind(read(key), .., path ++ sub)` (for an enum
 /// only in `variant`), or `p_Param_ind(read(key), T_j, rest)` if the field is
 /// `T_j` itself (`path` empty).
 #[derive(Clone, Debug)]
@@ -184,20 +184,20 @@ impl TaskEncoder for TyIndirectEnc {
                     let referent = rust.referent.decompose(ty.params);
                     let referent_impure = builder.deps.require_dep::<TyUseImpureEnc>(referent)?;
                     let addr = pure.deref_access.call()(key);
-                    // `q_here(0)`: the reference itself, which owns the referent;
-                    // `q_in(0, rest)`: inside the referent, keyed by the (filled)
+                    // `q_one(0)`: the reference itself, which owns the referent;
+                    // `q_arg(0, sub)`: inside the referent, keyed by the (filled)
                     // value slot.
                     let slot_key: vir::ExprSnap<'vir> = pure.value_access.call()(key).upcast_ty();
-                    let inner = builder.apply(referent, slot_key, builder.query.rest(builder.q))?;
+                    let inner = builder.apply(referent, slot_key, builder.query.sub(builder.q))?;
                     Some(vcx.mk_conj(&[
                         mk_implies(
                             vcx,
-                            builder.query.is_here(builder.q, 0),
+                            builder.query.is_one(builder.q, 0),
                             referent_impure.ref_to_pred(vcx, addr, None),
                         ),
                         mk_implies(
                             vcx,
-                            vcx.mk_conj(&[builder.query.is_in(builder.q, 0), builder.has_ind(0)]),
+                            vcx.mk_conj(&[builder.query.is_arg(builder.q, 0), builder.has_ind(0)]),
                             inner,
                         ),
                     ]))
@@ -279,13 +279,13 @@ impl TaskEncoder for TyIndirectEnc {
                         referent,
                         slot,
                         pure.value_access.call()(kp).upcast_ty(),
-                        builder.query.rest(builder.q),
+                        builder.query.sub(builder.q),
                     )?;
                     let value = vcx.mk_ternary_expr(
-                        builder.query.is_here(builder.q, 0),
+                        builder.query.is_one(builder.q, 0),
                         owned,
                         vcx.mk_ternary_expr(
-                            vcx.mk_conj(&[builder.query.is_in(builder.q, 0), builder.has_ind(0)]),
+                            vcx.mk_conj(&[builder.query.is_arg(builder.q, 0), builder.has_ind(0)]),
                             slot_ext,
                             slot,
                         ),
@@ -745,8 +745,8 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
     /// Does `q` select `param`?
     fn guard(&self, param: Param) -> vir::ExprBool<'vir> {
         match param {
-            Param::Lifetime(i) => self.query.is_here(self.q, i),
-            Param::Ty(j) => self.vcx.mk_conj(&[self.query.is_in(self.q, j), self.has_ind(j)]),
+            Param::Lifetime(i) => self.query.is_one(self.q, i),
+            Param::Ty(j) => self.vcx.mk_conj(&[self.query.is_arg(self.q, j), self.has_ind(j)]),
         }
     }
 
@@ -762,7 +762,7 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
         occurrence_query(
             &self.query,
             &field.occurrences[idx].path,
-            Some(self.query.rest(self.q)),
+            Some(self.query.sub(self.q)),
         )
     }
 

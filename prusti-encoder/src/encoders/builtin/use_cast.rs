@@ -166,8 +166,8 @@ impl TaskEncoder for MirBuiltinUseCastEnc {
                         &[],
                     )
                 });
-                // the operand's own piece, `q_here(0)`
-                let query = deps.require_dep::<LifetimeQueryEnc>(())?.here(0);
+                // the operand's own piece, `q_one(0)`
+                let query = deps.require_dep::<LifetimeQueryEnc>(())?.one(0);
                 let unsize = MirBuiltinUnsize {
                     cast,
                     unsize,
