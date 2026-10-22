@@ -66,7 +66,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             };
             let mut package_script = Vec::new();
             // each package starts from the state at the end of the body
-            let pending_expansions = self.pending_expansions.clone();
             let mut locals = wand_data.rhs.iter().map(|g| g.mir_local()).collect::<Vec<_>>();
             locals.dedup();
             for local in locals {
@@ -81,7 +80,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 })?;
                 package_script.extend(unblock);
             }
-            self.pending_expansions = pending_expansions;
 
             if !wand_data.pledges.is_empty() {
                 // Statements in the package script only see resources already

@@ -24,7 +24,7 @@ use pcg::{
         edge::{borrow_flow::BorrowFlowEdgeKind, kind::BorrowPcgEdgeKind},
         state::BorrowsState,
     },
-    pcg::PcgNode,
+    pcg::{Pcg, PcgNode},
     utils::{HasPlace, Place, PrefixRelation, maybe_old::MaybeLabelledPlace},
 };
 use prusti_rustc_interface::{
@@ -50,15 +50,6 @@ use crate::encoders::{
     },
 };
 
-/// A lifetime projection unfolded at an expansion, to be folded when its
-/// place is folded again.
-#[derive(Clone)]
-pub struct PendingExpansion<'vir> {
-    base: Place<'vir>,
-    region: RegionIdx,
-    casts: Vec<ChildCast<'vir>>,
-}
-
 /// A `RegionsIn(T)` node unfolded at `expansion`, with the keys its pieces
 /// were unfolded with (the children's pieces are made from them).
 #[derive(Clone)]
@@ -72,8 +63,6 @@ pub struct OpenedRegionsIn<'vir> {
 /// of a predecessor, not of the block encoded last).
 #[derive(Clone, Default)]
 pub struct NestedPathState<'vir> {
-    pending_expansions: Vec<PendingExpansion<'vir>>,
-    early_expansions: Vec<BorrowPcgExpansion<'vir>>,
     opened_regions_in: Vec<OpenedRegionsIn<'vir>>,
     applied_wands: Vec<mir::BasicBlock>,
 }
@@ -109,8 +98,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .find_map(|pred| self.nested_at_exit.get(pred))
             .cloned()
             .unwrap_or_default();
-        self.pending_expansions = state.pending_expansions;
-        self.early_expansions = state.early_expansions;
         self.opened_regions_in = state.opened_regions_in;
         self.applied_wands = state.applied_wands;
     }
@@ -118,8 +105,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// At the end of `block`: save the state for its successors.
     pub(crate) fn nested_exit_block(&mut self, block: mir::BasicBlock) {
         let state = NestedPathState {
-            pending_expansions: self.pending_expansions.clone(),
-            early_expansions: self.early_expansions.clone(),
             opened_regions_in: self.opened_regions_in.clone(),
             applied_wands: self.applied_wands.clone(),
         };
@@ -340,7 +325,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         expansion: &BorrowPcgExpansion<'vir>,
         unfolded: bool,
     ) -> EncodeResult<'vir, (), E> {
-        let Some((base_place, region, children)) = Self::lp_expansion(expansion) else {
+        let Some((base_place, _, children)) = Self::lp_expansion(expansion) else {
             return Ok(());
         };
         if !unfolded {
@@ -375,98 +360,151 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 .alloc(),
             );
         }
-        self.pending_expansions.push(PendingExpansion {
-            base: strip_downcasts(base_place),
-            region,
-            casts,
-        });
         Ok(())
     }
 
-    /// At `return`: fold the pending pieces of the arguments (owned values
-    /// whose expansions the PCG does not collapse at the end), keyed by their
-    /// pre-state snapshots as in the postcondition. Of `RegionsIn(T)` nodes,
-    /// only those the postcondition gives back unblocked (the others moved
-    /// with the values), including expansions inside the argument (deepest
-    /// first); the others stay pending for the wand packages.
-    pub(crate) fn nested_fold_at_return(&mut self) -> EncodeResult<'vir, (), E> {
-        let pending = std::mem::take(&mut self.pending_expansions);
+    /// The places of by-value arguments that are expanded in the owned PCG
+    /// of `pcg` (deepest first), with their children.
+    pub(crate) fn owed_expansions(&self, pcg: &Pcg<'_, 'vir>) -> Vec<(Place<'vir>, Vec<Place<'vir>>)> {
+        use pcg::pcg::CapabilityKind;
+        let with_capability = [
+            CapabilityKind::Read,
+            CapabilityKind::Write,
+            CapabilityKind::Exclusive,
+            CapabilityKind::ShallowExclusive,
+        ]
+        .into_iter()
+        .flat_map(|cap| pcg.places_with_capapability(cap))
+        .filter(|place| self.is_by_value_arg(place.local))
+        .collect::<Vec<_>>();
+        // proper prefixes of places with a capability, not through a dereference
+        let mut expanded: Vec<Place<'vir>> = Vec::new();
+        for leaf in &with_capability {
+            let mut place = *leaf;
+            while let Some((parent, _)) = place.last_projection() {
+                if !expanded.contains(&parent) {
+                    expanded.push(parent);
+                }
+                place = parent;
+            }
+        }
+        expanded.retain(|place| {
+            !place.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref))
+        });
+        expanded.sort_by_key(|place| std::cmp::Reverse(place.projection().len()));
+        expanded
+            .iter()
+            .map(|base| {
+                let children = with_capability
+                    .iter()
+                    .chain(expanded.iter())
+                    .filter(|c| c.last_projection().is_some_and(|(parent, _)| parent == *base))
+                    .copied()
+                    .collect();
+                (*base, children)
+            })
+            .collect()
+    }
+
+    /// Fold all owed pieces of the expanded places `expansions`.
+    fn fold_owed_expansions(
+        &mut self,
+        expansions: Vec<(Place<'vir>, Vec<Place<'vir>>)>,
+    ) -> EncodeResult<'vir, (), E> {
+        for (base, children) in expansions {
+            let regions = base.regions(self.pcg_ctxt());
+            for (idx, region) in regions.iter_enumerated() {
+                let children = children
+                    .iter()
+                    .filter_map(|c| {
+                        let i = c.regions(self.pcg_ctxt()).iter().position(|r| r == region)?;
+                        Some((*c, RegionIdx::from(i)))
+                    })
+                    .collect::<Vec<_>>();
+                self.fold_owed(base, idx, &children)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// At `return`: fold the pieces of the by-value arguments that are still
+    /// expanded (the PCG does not collapse them at the end, and may have
+    /// removed their lifetime projection expansions as dead).
+    pub(crate) fn nested_fold_at_return(&mut self, pcg: &Pcg<'_, 'vir>) -> EncodeResult<'vir, (), E> {
+        let owed = self.owed_expansions(pcg);
+        self.fold_owed_expansions(owed)
+    }
+
+    /// A by-value argument (or a part of it) is collapsed for a drop: its
+    /// pieces are still owed to the caller, so fold those of its expanded
+    /// places (in the state before the phase) now, as at `return`.
+    pub(crate) fn nested_drop(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
+        let (owed, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.owed_expansions)
+            .into_iter()
+            .partition(|(base, _)| place.is_prefix_of(*base));
+        self.owed_expansions = rest;
+        self.fold_owed_expansions(owed)
+    }
+
+    fn is_by_value_arg(&self, local: mir::Local) -> bool {
+        self.body.local_kind(local) == mir::LocalKind::Arg && !self.body.local_decls[local].ty.is_ref()
+    }
+
+    /// Fold the pieces of `base↓region` of a by-value argument that the
+    /// postcondition takes, keyed by the pre-state snapshot: of a lifetime of
+    /// the argument itself (`base` the argument), or of a `RegionsIn(T)` node
+    /// the postcondition gives back unblocked (casting `children` at generic
+    /// positions back first).
+    fn fold_owed(
+        &mut self,
+        base: Place<'vir>,
+        region: RegionIdx,
+        children: &[(Place<'vir>, RegionIdx)],
+    ) -> EncodeResult<'vir, (), E> {
+        let place = strip_downcasts(base);
+        if place.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref)) {
+            return Ok(());
+        }
+        let ty = place.ty(self.pcg_ctxt()).ty;
+        let nodes = self
+            .deps
+            .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
+        if !nodes.is_regions_in(region) {
+            if place.projection().is_empty() {
+                let snap = self.vcx.mk_old_expr(self.encode_place_with_snap(place)?.1);
+                for piece in nodes.apps(region, snap) {
+                    self.stmt(self.vcx.mk_fold_stmt(piece));
+                }
+            }
+            return Ok(());
+        }
+        let pcg_region = place.regions(self.pcg_ctxt())[region];
         let unblocked = self
             .wands
             .unblocked_regions_in(self.vcx, self.deps)
             .into_iter()
-            .map(|(local, idx)| (local, Place::from(local).regions(self.pcg_ctxt())[idx]))
-            .collect::<Vec<_>>();
-        let mut regions_in = Vec::new();
-        for p in pending.iter().rev() {
-            let ty = p.base.ty(self.pcg_ctxt()).ty;
-            let nodes = self
-                .deps
-                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
-            if nodes.is_regions_in(p.region) {
-                regions_in.push(p.clone());
-            } else if p.base.projection().is_empty()
-                && self.body.local_kind(p.base.local) == mir::LocalKind::Arg
-            {
-                let snap = self.vcx.mk_old_expr(self.encode_place_with_snap(p.base)?.1);
-                for piece in nodes.apps(p.region, snap) {
-                    self.stmt(self.vcx.mk_fold_stmt(piece));
-                }
-            }
+            .any(|(local, idx)| {
+                local == place.local && Place::from(local).regions(self.pcg_ctxt())[idx] == pcg_region
+            });
+        if !unblocked {
+            return Ok(());
         }
-        // deepest first
-        regions_in.sort_by_key(|p| std::cmp::Reverse(p.base.projection().len()));
-        let mut keep = Vec::new();
-        for p in regions_in {
-            let local = p.base.local;
-            let region = p.base.regions(self.pcg_ctxt())[p.region];
-            if self.body.local_kind(local) != mir::LocalKind::Arg
-                || self.body.local_decls[local].ty.is_ref()
-                || p.base.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref))
-                || !unblocked.contains(&(local, region))
-            {
-                keep.push(p);
-                continue;
-            }
-            let mut casts = p.casts.clone();
-            casts.sort_by_key(|cast| std::cmp::Reverse(cast.piece));
-            for cast in casts {
-                let key = self.child_key(&cast)?;
-                self.stmt(
-                    (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.query)
-                        .alloc(),
-                );
-            }
-            let ty = p.base.ty(self.pcg_ctxt()).ty;
-            let nodes = self
-                .deps
-                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
-            let snap = self.vcx.mk_old_expr(self.path_snap(p.base)?);
-            for piece in nodes.apps(p.region, snap) {
-                self.stmt(self.vcx.mk_fold_stmt(piece));
-            }
+        let mut casts = Vec::new();
+        for (child, child_idx) in children {
+            casts.extend(self.child_casts(base, *child, *child_idx)?);
         }
-        self.pending_expansions = keep;
-        Ok(())
-    }
-
-    /// A place was collapsed without capability (moved out or dropped): the
-    /// pieces of its open `RegionsIn(T)` expansions went with the moved
-    /// values. Those of a by-value argument stay for the fold at `return`.
-    pub(crate) fn nested_drop(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
-        let mut keep = Vec::new();
-        for p in std::mem::take(&mut self.pending_expansions) {
-            let ty = p.base.ty(self.pcg_ctxt()).ty;
-            let nodes = self
-                .deps
-                .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
-            let by_value_arg = self.body.local_kind(p.base.local) == mir::LocalKind::Arg
-                && !self.body.local_decls[p.base.local].ty.is_ref();
-            if !nodes.is_regions_in(p.region) || !place.is_prefix_of(p.base) || by_value_arg {
-                keep.push(p);
-            }
+        casts.sort_by_key(|cast| std::cmp::Reverse(cast.piece));
+        for cast in casts {
+            let key = self.child_key(&cast)?;
+            self.stmt(
+                (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.query)
+                    .alloc(),
+            );
         }
-        self.pending_expansions = keep;
+        let snap = self.vcx.mk_old_expr(self.path_snap(place)?);
+        for piece in nodes.apps(region, snap) {
+            self.stmt(self.vcx.mk_fold_stmt(piece));
+        }
         Ok(())
     }
 
@@ -630,9 +668,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// The expansions of lifetime projections that are open in `state` (the
     /// state before the current phase, or the one a package unblocks): those
-    /// whose place is still expanded by a Deref or Expansion edge, or whose
-    /// children's places are current (owned places, expanded by repacks).
-    pub(crate) fn nested_set_open_expansions(&mut self, state: &BorrowsState<'_, 'vir>) {
+    /// whose place is still expanded by a Deref or Expansion edge or, for an
+    /// owned place (expanded by repacks), that has no capability of its own in
+    /// `pcg` (without it: whose children's places are current).
+    pub(crate) fn nested_set_open_expansions(
+        &mut self,
+        state: &BorrowsState<'_, 'vir>,
+        pcg: Option<&Pcg<'_, 'vir>>,
+    ) {
         let mut place_edges: Vec<(Place<'vir>, Vec<Place<'vir>>)> = Vec::new();
         let mut lp_expansions = Vec::new();
         for edge in state.graph().edges() {
@@ -660,6 +703,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 _ => {}
             }
         }
+        self.owed_expansions = pcg.map(|pcg| self.owed_expansions(pcg)).unwrap_or_default();
         self.open_expansions = lp_expansions
             .into_iter()
             .filter(|expansion| {
@@ -671,17 +715,32 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                         PcgNode::Place(_) => None,
                     })
                     .collect::<Vec<_>>();
-                let children_current =
-                    children.iter().all(|c| matches!(c, MaybeLabelledPlace::Current(_)));
                 let Some((base, _, _)) = Self::lp_expansion_any(expansion) else {
                     return false;
+                };
+                let owned = !base.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref));
+                let owned_expanded = match pcg {
+                    Some(pcg) => owned && pcg.place_capability(base, self.pcg_ctxt()).is_none(),
+                    None => children.iter().all(|c| matches!(c, MaybeLabelledPlace::Current(_))),
                 };
                 let place_expanded = place_edges.iter().any(|(blocked, targets)| {
                     *blocked == base && children.iter().all(|c| targets.contains(&c.place()))
                 });
-                children_current || place_expanded
+                owned_expanded || place_expanded
             })
             .collect();
+    }
+
+    /// Drop the open expansion of `place↓idx` (for the rest of the phase);
+    /// whether there was one.
+    fn forget_open_expansion(&mut self, place: Place<'vir>, idx: usize) -> bool {
+        let before = self.open_expansions.len();
+        self.open_expansions.retain(|e| {
+            !Self::lp_expansion_any(e).is_some_and(|(base, region, _)| {
+                strip_downcasts(base) == place && region.index() == idx
+            })
+        });
+        self.open_expansions.len() != before
     }
 
     /// The open expansions of lifetime projections of `place`.
@@ -744,7 +803,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         self.open_expansions.retain(|e| {
             !Self::lp_expansion_any(e).is_some_and(|(base, ..)| strip_downcasts(base) == place)
         });
-        self.pending_expansions.retain(|p| p.base != place);
         let regions = open
             .iter()
             .filter_map(|e| Self::lp_expansion_any(e).map(|(_, region, _)| region))
@@ -787,8 +845,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         }
         if target_labelled {
             // the value is dead: its expansion is not folded again
-            self.pending_expansions
-                .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
+            self.forget_open_expansion(target_place, target_idx);
             return Ok(());
         }
         if !self.released_aggregates.contains(&(target_place, target_idx)) {
@@ -869,12 +926,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         if source.place().is_prefix_of(target_place) || target_place.is_prefix_of(source.place()) {
             // collapse of an owned place: its expansion was cast back when the
             // place was folded
-            let was_expanded = self
-                .pending_expansions
-                .iter()
-                .any(|p| p.base == target_place && p.region.index() == target_idx);
-            self.pending_expansions
-                .retain(|p| !(p.base == target_place && p.region.index() == target_idx));
+            let was_expanded = self.forget_open_expansion(target_place, target_idx);
             if was_expanded && !self.pending_aggregates.contains(&(target, target_idx)) {
                 self.pending_aggregates.push((target, target_idx));
             }

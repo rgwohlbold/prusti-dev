@@ -321,7 +321,7 @@ impl TaskEncoder for MethodEnc {
                     current_phase: None,
                     labelled_phase: None,
                     open_expansions: Vec::new(),
-                    pending_expansions: Vec::new(),
+                    owed_expansions: Vec::new(),
                     opened_regions_in: Vec::new(),
                     applied_wands: Vec::new(),
                     pending_aggregates: Vec::new(),
