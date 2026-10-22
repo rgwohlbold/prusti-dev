@@ -64,7 +64,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 continue;
             };
             // each package starts from the state at the end of the body
-            let pending_expansions = self.pending_expansions.clone();
             let mut rhs: Vec<(mir::Place<'vir>, Vec<vir::ExprBool<'vir>>)> = Vec::new();
             for g in wand_data.rhs.iter() {
                 let resources = self.wands.encode_predicates_for_function_shape_node(
@@ -83,7 +82,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 }
             }
             let mut package_script = self.pcs_package_script(final_borrow_state, rhs, label)?;
-            self.pending_expansions = pending_expansions;
 
             for EncodedPledge {
                 expiry_postcondition,

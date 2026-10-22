@@ -187,8 +187,9 @@ where
     /// The expansions of lifetime projections open before the current phase,
     /// read from the PCG (see `impure::nested`).
     pub open_expansions: Vec<BorrowPcgExpansion<'vir>>,
-    /// The lifetime projections unfolded at a PCG expansion and not folded yet.
-    pub pending_expansions: Vec<crate::encoders::impure::nested::PendingExpansion<'vir>>,
+    /// The expanded places of by-value arguments before the current phase,
+    /// whose pieces are owed to the caller (see `impure::nested`).
+    pub owed_expansions: Vec<(Place<'vir>, Vec<Place<'vir>>)>,
     /// The `RegionsIn(T)` nodes unfolded at an expansion whose children's
     /// pieces are not made yet (see `impure::nested`).
     pub opened_regions_in: Vec<crate::encoders::impure::nested::OpenedRegionsIn<'vir>>,
@@ -198,7 +199,8 @@ where
     /// The lifetime projections to fold at the end of the current phase
     /// (targets of `Aggregate` edges of a constructed value).
     pub pending_aggregates: Vec<(MaybeLabelledPlace<'vir>, usize)>,
-    /// Expansions whose piece was already unfolded (before their place was).
+    /// Expansions of the current phase whose piece was already unfolded
+    /// (before their place was).
     pub early_expansions: Vec<BorrowPcgExpansion<'vir>>,
     /// Casts of the parts of values built from parts, done at the end of the
     /// current phase.
@@ -991,7 +993,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         let mut to_skip = Vec::new();
         let actions = footprint.actions;
         let open_expansions = self.open_expansions.clone();
-        self.nested_set_open_expansions(borrows_state);
+        self.nested_set_open_expansions(borrows_state, None);
         for action in actions {
             self.pcs_handle_edge(
                 borrows_state,
@@ -1195,7 +1197,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             EvalStmtPhase::PreMain => &cfpcs.states[EvalStmtPhase::PostOperands],
             EvalStmtPhase::PostMain => &cfpcs.states[EvalStmtPhase::PreMain],
         };
-        self.nested_set_open_expansions(before.borrow_pcg());
+        self.nested_set_open_expansions(before.borrow_pcg(), Some(before));
+        self.early_expansions.clear();
         self.pcg_actions(&cfpcs.states[phase], &cfpcs.actions(phase), false)?;
         self.current_fpcs = Some(current_fpcs);
         self.nested_fold_aggregates()?;
@@ -1381,7 +1384,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     ) -> EncodeResult<'vir, (), E> {
         let post_main = &cfpcs.states[EvalStmtPhase::PostMain];
         let edge_to_loop = self.loop_head_of(succ.block()).is_some();
-        self.nested_set_open_expansions(post_main.borrow_pcg());
+        self.nested_set_open_expansions(post_main.borrow_pcg(), Some(post_main));
         self.pcg_actions(post_main, succ.actions(), edge_to_loop)
     }
 
@@ -2567,10 +2570,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
             mir::TerminatorKind::Return => {
                 let current_fpcs = self.current_fpcs.take().unwrap();
-                let borrows = current_fpcs.statements.last().unwrap().states
-                    [EvalStmtPhase::PostMain]
-                    .borrow_pcg();
-                self.nested_fold_at_return()?;
+                let post_main = &current_fpcs.statements.last().unwrap().states[EvalStmtPhase::PostMain];
+                let borrows = post_main.borrow_pcg();
+                self.nested_fold_at_return(post_main)?;
                 let wand_packages = self.package_wands(borrows)?;
                 self.current_fpcs = Some(current_fpcs);
                 self.stmts(wand_packages);
