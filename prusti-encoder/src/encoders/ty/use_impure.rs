@@ -957,7 +957,7 @@ impl<'vir> TyUseImpureMutRef<'vir> {
     }
 
     /// The indirect piece of the reference's own lifetime itself, which
-    /// holds the referent: `p_Ref_mutable_ind(S, U, q_here(0))` for the
+    /// holds the referent: `p_Ref_mutable_ind(S, U, q_one(0))` for the
     /// snapshot `S` of the reference (its key, as nothing encloses it).
     fn own_piece(
         &self,

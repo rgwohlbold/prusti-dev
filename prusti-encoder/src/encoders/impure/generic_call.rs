@@ -6,7 +6,7 @@
 //! the callee returned).
 //!
 //! Both follow the constructors on the path to the position: the caller's
-//! pieces are unfolded (`q_in(j, ..)` holds the parts where `T_j` occurs in
+//! pieces are unfolded (`q_arg(j, ..)` holds the parts where `T_j` occurs in
 //! the fields, see `TyParamPart`), cast to the concrete instantiation where a
 //! field is `T_j` itself, regrouped there (`q_all()` of a concrete type is the
 //! conjunction of the pieces of its own parameters), cast back and folded.
@@ -274,7 +274,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(())
     }
 
-    /// The parts of `X`'s body for `q_in(j, ..)`: per field where `T_j`
+    /// The parts of `X`'s body for `q_arg(j, ..)`: per field where `T_j`
     /// occurs, convert the field's pieces one level down.
     fn parts(
         &mut self,
