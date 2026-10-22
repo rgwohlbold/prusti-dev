@@ -181,6 +181,9 @@ where
     pub current_phase: Option<(mir::Location, EvalStmtPhase)>,
     /// The location and phase whose label was emitted last.
     pub labelled_phase: Option<(mir::Location, EvalStmtPhase)>,
+    /// The expansions of lifetime projections open before the current phase,
+    /// read from the PCG (see `impure::nested`).
+    pub open_expansions: Vec<BorrowPcgExpansion<'vir>>,
     /// The lifetime projections unfolded at a PCG expansion and not folded yet.
     pub pending_expansions: Vec<crate::encoders::impure::nested::PendingExpansion<'vir>>,
     /// The `RegionsIn(T)` nodes unfolded at an expansion whose children's
@@ -942,6 +945,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         label: Option<&'vir str>,
     ) -> EncodeResult<'vir, (), E> {
         let mut to_skip = Vec::new();
+        let open_expansions = self.open_expansions.clone();
+        self.nested_set_open_expansions(borrows_state);
         for action in actions {
             self.pcs_handle_edge(
                 borrows_state,
@@ -952,6 +957,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 &mut to_skip,
             )?;
         }
+        self.open_expansions = open_expansions;
         Ok(())
     }
 
@@ -1030,6 +1036,13 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         self.current_phase = Some((location, phase));
         let current_fpcs = self.current_fpcs.take().unwrap();
         let cfpcs = &current_fpcs.statements[location.statement_index];
+        let before = match phase {
+            EvalStmtPhase::PreOperands => &cfpcs.entry_state,
+            EvalStmtPhase::PostOperands => &cfpcs.states[EvalStmtPhase::PreOperands],
+            EvalStmtPhase::PreMain => &cfpcs.states[EvalStmtPhase::PostOperands],
+            EvalStmtPhase::PostMain => &cfpcs.states[EvalStmtPhase::PreMain],
+        };
+        self.nested_set_open_expansions(before.borrow_pcg());
         self.pcg_actions(&cfpcs.states[phase], &cfpcs.actions(phase), false)?;
         self.current_fpcs = Some(current_fpcs);
         self.nested_fold_aggregates()?;
@@ -1215,6 +1228,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     ) -> EncodeResult<'vir, (), E> {
         let post_main = &cfpcs.states[EvalStmtPhase::PostMain];
         let edge_to_loop = self.loop_head_of(succ.block()).is_some();
+        self.nested_set_open_expansions(post_main.borrow_pcg());
         self.pcg_actions(post_main, succ.actions(), edge_to_loop)
     }
 

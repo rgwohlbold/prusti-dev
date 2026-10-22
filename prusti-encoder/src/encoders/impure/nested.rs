@@ -20,7 +20,9 @@
 
 use pcg::{
     borrow_pcg::{
-        borrow_pcg_expansion::BorrowPcgExpansion, edge::borrow_flow::BorrowFlowEdgeKind,
+        borrow_pcg_expansion::BorrowPcgExpansion,
+        edge::{borrow_flow::BorrowFlowEdgeKind, kind::BorrowPcgEdgeKind},
+        state::BorrowsState,
     },
     pcg::PcgNode,
     utils::{HasPlace, Place, PrefixRelation, maybe_old::MaybeLabelledPlace},
@@ -234,6 +236,30 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             return None;
         }
         Some((base_place, base.region_idx(), children))
+    }
+
+    /// As [Self::lp_expansion], but also for labelled places (an open
+    /// expansion whose places were labelled since, e.g. at `StorageDead`).
+    fn lp_expansion_any(
+        expansion: &BorrowPcgExpansion<'vir>,
+    ) -> Option<(Place<'vir>, RegionIdx, Vec<(Place<'vir>, RegionIdx)>)> {
+        let PcgNode::LifetimeProjection(base) = expansion.base() else {
+            return None;
+        };
+        let children = expansion
+            .expansion()
+            .into_iter()
+            .filter_map(|child| match child {
+                PcgNode::LifetimeProjection(lp) => Some((lp.base().place(), lp.region_idx())),
+                PcgNode::Place(_) => None,
+            })
+            .collect::<Vec<_>>();
+        if children.iter().any(|(child, _)| {
+            matches!(child.last_projection(), Some((_, mir::ProjectionElem::Downcast(..))))
+        }) {
+            return None;
+        }
+        Some((base.base().place(), base.region_idx(), children))
     }
 
     /// The place whose piece `expansion` opens, without downcasts (a variant
@@ -602,23 +628,95 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(data.ref_to_snap(place_ref))
     }
 
+    /// The expansions of lifetime projections that are open in `state` (the
+    /// state before the current phase, or the one a package unblocks): those
+    /// whose place is still expanded by a Deref or Expansion edge, or whose
+    /// children's places are current (owned places, expanded by repacks).
+    pub(crate) fn nested_set_open_expansions(&mut self, state: &BorrowsState<'_, 'vir>) {
+        let mut place_edges: Vec<(Place<'vir>, Vec<Place<'vir>>)> = Vec::new();
+        let mut lp_expansions = Vec::new();
+        for edge in state.graph().edges() {
+            match edge.kind() {
+                BorrowPcgEdgeKind::Deref(deref) => place_edges
+                    .push((deref.blocked_place().place(), vec![deref.deref_place().place()])),
+                BorrowPcgEdgeKind::BorrowPcgExpansion(expansion) => match expansion.base() {
+                    PcgNode::Place(base) => place_edges.push((
+                        base.place(),
+                        expansion
+                            .expansion()
+                            .iter()
+                            .filter_map(|child| match child {
+                                PcgNode::Place(child) => Some(child.place()),
+                                PcgNode::LifetimeProjection(_) => None,
+                            })
+                            .collect(),
+                    )),
+                    PcgNode::LifetimeProjection(_) => {
+                        if Self::lp_expansion_any(expansion).is_some() {
+                            lp_expansions.push(expansion.clone());
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+        self.open_expansions = lp_expansions
+            .into_iter()
+            .filter(|expansion| {
+                let children = expansion
+                    .expansion()
+                    .iter()
+                    .filter_map(|child| match child {
+                        PcgNode::LifetimeProjection(lp) => Some(lp.base()),
+                        PcgNode::Place(_) => None,
+                    })
+                    .collect::<Vec<_>>();
+                let children_current =
+                    children.iter().all(|c| matches!(c, MaybeLabelledPlace::Current(_)));
+                let Some((base, _, _)) = Self::lp_expansion_any(expansion) else {
+                    return false;
+                };
+                let place_expanded = place_edges.iter().any(|(blocked, targets)| {
+                    *blocked == base && children.iter().all(|c| targets.contains(&c.place()))
+                });
+                children_current || place_expanded
+            })
+            .collect();
+    }
+
+    /// The open expansions of lifetime projections of `place`.
+    fn open_expansions_of(&self, place: Place<'vir>) -> Vec<BorrowPcgExpansion<'vir>> {
+        self.open_expansions
+            .iter()
+            .filter(|e| {
+                Self::lp_expansion_any(e).is_some_and(|(base, ..)| strip_downcasts(base) == place)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Before the place `place` is folded (labelled at `label`): cast the
-    /// children of its pending expansions back to generic, while they are
-    /// still concrete.
+    /// children of its open expansions back to generic, while they are still
+    /// concrete.
     pub(crate) fn nested_before_place_fold(
         &mut self,
         place: Place<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> EncodeResult<'vir, (), E> {
-        let casts = self
-            .pending_expansions
-            .iter()
-            .flat_map(|p| p.casts.clone())
-            .filter(|c| c.child.last_projection().is_some_and(|(parent, _)| parent == place))
-            .collect::<Vec<_>>();
+        let mut casts = Vec::new();
+        for expansion in self.open_expansions.clone() {
+            let Some((base, _, children)) = Self::lp_expansion_any(&expansion) else {
+                continue;
+            };
+            for (child, idx) in children {
+                if child.last_projection().is_some_and(|(parent, _)| parent == place) {
+                    casts.extend(self.child_casts(base, child, idx)?);
+                }
+            }
+        }
         // enclosed pieces first: their keys read the enclosing pieces
-        let mut casts = casts;
         casts.sort_by_key(|cast| std::cmp::Reverse(cast.piece));
+        casts.dedup_by(|a, b| a.child == b.child && a.piece == b.piece);
         for cast in casts {
             let key = self.child_key_at(&cast, label)?;
             self.stmt(
@@ -635,18 +733,23 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     }
 
     /// After the place `place` was folded (labelled at `label`): fold the
-    /// pieces of its pending expansions (enclosing lifetimes first) with
-    /// their current keys.
+    /// lifetime projections of `place` that the PCG expanded together with it
+    /// (enclosing lifetimes first), with their current keys.
     pub(crate) fn nested_after_place_fold(
         &mut self,
         place: Place<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> EncodeResult<'vir, (), E> {
-        let (pending, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_expansions)
-            .into_iter()
-            .partition(|p| p.base == place);
-        self.pending_expansions = rest;
-        if pending.is_empty() {
+        let open = self.open_expansions_of(place);
+        self.open_expansions.retain(|e| {
+            !Self::lp_expansion_any(e).is_some_and(|(base, ..)| strip_downcasts(base) == place)
+        });
+        self.pending_expansions.retain(|p| p.base != place);
+        let regions = open
+            .iter()
+            .filter_map(|e| Self::lp_expansion_any(e).map(|(_, region, _)| region))
+            .collect::<Vec<_>>();
+        if regions.is_empty() {
             return Ok(());
         }
         let ty = place.ty(self.pcg_ctxt()).ty;
@@ -655,7 +758,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
         let snap = self.place_snap_at(place, label)?;
         for idx in nodes.order().to_vec() {
-            if pending.iter().any(|p| p.region == idx) {
+            if regions.contains(&idx) {
                 for piece in nodes.apps(idx, snap) {
                     self.stmt(self.vcx.mk_fold_stmt(piece));
                 }
