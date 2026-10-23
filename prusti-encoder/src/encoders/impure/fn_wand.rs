@@ -548,6 +548,18 @@ impl TaskEncoder for WandEnc {
 
             let coupled_edges = shape.coupled_edges();
             let edges: FxHashSet<_> = shape.edges().map(|e| (e.input(), e.output())).collect();
+            // An input that flows into the post-state of another argument is
+            // moved there: the caller gets its pieces back through that
+            // argument, not on its own.
+            let mut moved = edges
+                .iter()
+                .filter(|(input, output)| {
+                    output.mir_local() != mir::RETURN_PLACE && output.mir_local() != input.mir_local()
+                })
+                .map(|(input, _)| *input)
+                .collect::<Vec<_>>();
+            moved.sort();
+            moved.dedup();
 
             let (inputs, outputs) = shape.take_inputs_and_outputs();
             let nodes_output = WandEncOutput {
@@ -576,7 +588,7 @@ impl TaskEncoder for WandEnc {
                         inputs,
                         outputs,
                         wands: vec![],
-                        consumed: Vec::new(),
+                        consumed: moved,
                     },
                 ));
             }
@@ -608,7 +620,7 @@ impl TaskEncoder for WandEnc {
                 inputs,
                 outputs,
                 wands: Vec::new(),
-                consumed: Vec::new(),
+                consumed: moved,
             };
             let wands = output.merge_enclosed(wands, vcx, deps);
             let wands = output.drop_owned_transfers(wands, !pledges.is_empty(), vcx, deps);

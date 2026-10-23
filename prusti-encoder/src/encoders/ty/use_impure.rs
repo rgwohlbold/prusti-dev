@@ -490,7 +490,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                             ty.box_alloc_ty().decompose_normalize(self.args),
                         )?,
                     }),
-                    RustTySpecial::None => None,
+                    RustTySpecial::None | RustTySpecial::Trusted => None,
                 };
                 TySpecifics::StructLike(self.encode_structlike(
                     data,
