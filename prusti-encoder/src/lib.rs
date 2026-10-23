@@ -113,6 +113,9 @@ pub fn test_entrypoint<'tcx>(
     program.header("impure generic casts");
     GArgsCastEnc::<Impure>::emit_outputs(&mut program);
 
+    program.header("regrouping at generic calls");
+    crate::encoders::ty::generics::regroup::RegroupEnc::emit_outputs(&mut program);
+
     program.header("snapshots");
     crate::encoders::TyUsePureEnc::emit_outputs(&mut program);
     BitVecEnc::emit_outputs(&mut program);
