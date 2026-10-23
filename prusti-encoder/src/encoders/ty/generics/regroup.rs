@@ -16,8 +16,6 @@
 //! back. Recursive types thus give (mutually) recursive methods. A position
 //! without occurrences holds nothing; its methods have no body.
 
-use std::hash::{Hash, Hasher};
-
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, MethodIdn};
 
@@ -145,13 +143,59 @@ impl TaskEncoder for RegroupEnc {
     }
 }
 
-/// A unique name per task (the hash distinguishes instantiations and
-/// contexts; `DefaultHasher::new` is deterministic).
+thread_local! {
+    /// The method names given out (tasks that differ only in regions or
+    /// context get the same readable name).
+    static NAMES: std::cell::RefCell<std::collections::HashSet<String>> =
+        Default::default();
+}
+
+/// A readable, unique name per task, e.g. `regroup_ind_List_Pair_at_0` for
+/// `q_arg(0, ..)` of `List<Pair>`; `__2`, `__3`, .. is appended on a clash.
 fn method_name(x: &RustTyDecomposition<'_>, rest: &[Step], into: bool) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    format!("{x:?} {rest:?}").hash(&mut hasher);
     let dir = if into { "regroup" } else { "split" };
-    format!("{dir}_ind_{}_{:016x}", x.ty.name(), hasher.finish())
+    let position = if rest.is_empty() {
+        "all".to_string()
+    } else {
+        let steps = rest.iter().map(|step| match step {
+            Step::In(j) => j.to_string(),
+            Step::Here(i) => format!("l{i}"),
+        });
+        format!("at_{}", steps.collect::<Vec<_>>().join("_"))
+    };
+    let name = format!("{dir}_ind_{}_{position}", readable(*x));
+    NAMES.with(|names| {
+        let mut names = names.borrow_mut();
+        let mut candidate = name.clone();
+        let mut n = 1;
+        while names.contains(&candidate) {
+            n += 1;
+            candidate = format!("{name}__{n}");
+        }
+        names.insert(candidate.clone());
+        candidate
+    })
+}
+
+/// The type with its type arguments, by the last segments of their paths
+/// (type parameters by name), e.g. `Option_Box_List_Pair_Global`.
+fn readable(x: RustTyDecomposition<'_>) -> String {
+    if x.ty.specifics.is_param()
+        && let Some(prusti_rustc_interface::middle::ty::TyKind::Param(param)) =
+            x.args.args().first().and_then(|a| a.as_type()).map(|t| t.kind())
+    {
+        return param.name.to_string();
+    }
+    // (`name` may already be escaped: `std$col$$col$option$col$$col$Option`)
+    let base = x.ty.name().rsplit("::").next().unwrap_or_default();
+    let base = base.rsplit("$col$$col$").next().unwrap_or_default().to_string();
+    let args = x
+        .args
+        .args()
+        .iter()
+        .filter_map(|a| a.as_type())
+        .map(|arg| readable(RustTyDecomposition::from_ty(arg, x.args.context())));
+    std::iter::once(base).chain(args).collect::<Vec<_>>().join("_")
 }
 
 /// A piece of the level's type: its key and its path in the type.
