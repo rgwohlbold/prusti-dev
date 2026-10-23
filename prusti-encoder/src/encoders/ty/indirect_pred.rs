@@ -7,7 +7,7 @@ use crate::encoders::TyUseImpureEnc;
 use super::has_ind::TyHasIndEnc;
 
 use super::{
-    LazyRustTy, RustTy, RustTyDecomposition, TySpecifics,
+    LazyRustTy, RustTy, RustTyDecomposition, RustTySpecial, TySpecifics,
     data::StructData,
     generics::{GArgsTyEnc, GParams, GenericParamsEnc},
     lifetime_query::{LifetimeQueryEnc, LifetimeQueryFns},
@@ -222,14 +222,18 @@ impl TaskEncoder for TyIndirectEnc {
                     }
                     Some(vcx.mk_conj(&variants))
                 }
-                // Nothing behind these. TODO: shared references and the
-                // elements of arrays/slices (see `occurrences`).
+                // Nothing behind these (an opaque type that is not trusted is
+                // e.g. a function item or `str`). TODO: shared references and
+                // the elements of arrays/slices (see `occurrences`).
                 TySpecifics::Primitive(_)
                 | TySpecifics::Raw(_)
                 | TySpecifics::Builtin(_)
                 | TySpecifics::ImmRef(_)
                 | TySpecifics::ArrayLike(_) => Some(vcx.mk_bool::<true>()),
-                // Abstract: the instantiation is unknown.
+                TySpecifics::Opaque(_) if ty.special != RustTySpecial::Trusted => {
+                    Some(vcx.mk_bool::<true>())
+                }
+                // Abstract: the instantiation (or the trusted type) is unknown.
                 TySpecifics::Param(_) | TySpecifics::Opaque(_) => None,
             };
             // `q_all()`: the pieces of the constructor's own parameters
@@ -371,6 +375,7 @@ impl TaskEncoder for TyIndirectEnc {
                 | TySpecifics::Builtin(_)
                 | TySpecifics::ImmRef(_)
                 | TySpecifics::ArrayLike(_) => (Some(k), None),
+                TySpecifics::Opaque(_) if ty.special != RustTySpecial::Trusted => (Some(k), None),
                 TySpecifics::Param(_) | TySpecifics::Opaque(_) => (None, None),
             };
             // `q_all()`: extend through the pieces of the own parameters in order

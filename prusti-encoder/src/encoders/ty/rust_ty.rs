@@ -321,6 +321,9 @@ pub enum RustTySpecial {
     /// `alloc::boxed::Box`: its snapshot also carries the value of the boxed
     /// `T` and its predicate permission to it (see the structlike encoder).
     Box,
+    /// A type marked `#[trusted]`: opaque, its contents (and the references
+    /// in them) are unknown.
+    Trusted,
 }
 
 impl<'tcx> RustTyData<'tcx> {
@@ -610,6 +613,7 @@ impl RustTySpecial {
     fn from_ty(ty: ty::Ty<'_>) -> Self {
         match ty.kind() {
             ty::TyKind::Adt(adt, _) if adt.is_box() => RustTySpecial::Box,
+            _ if crate::encoders::is_type_trusted(ty) => RustTySpecial::Trusted,
             _ => RustTySpecial::None,
         }
     }
