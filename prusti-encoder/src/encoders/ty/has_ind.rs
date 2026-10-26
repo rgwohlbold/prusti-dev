@@ -77,7 +77,7 @@ impl TaskEncoder for TyHasIndEnc {
             );
             let lhs = output_ref.apply(args);
             let rhs = has_ind_rhs(*task_key, task_key.params, params.ty_exprs());
-            let body = vcx.mk_eq_expr(lhs, rhs);
+            let body = vir::expr! { vcx; ([lhs]) == ([rhs]) };
             let axiom_expr = if params.ty_decls().is_empty() && params.const_decls().is_empty() {
                 body
             } else {

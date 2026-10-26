@@ -189,18 +189,10 @@ impl TaskEncoder for TyIndirectEnc {
                     // value slot.
                     let slot_key: vir::ExprSnap<'vir> = pure.value_access.call()(key).upcast_ty();
                     let inner = builder.apply(referent, slot_key, builder.query.sub(builder.q))?;
-                    Some(vcx.mk_conj(&[
-                        mk_implies(
-                            vcx,
-                            builder.query.is_one(builder.q, 0),
-                            referent_impure.ref_to_pred(vcx, addr, None),
-                        ),
-                        mk_implies(
-                            vcx,
-                            vcx.mk_conj(&[builder.query.is_arg(builder.q, 0), builder.has_ind(0)]),
-                            inner,
-                        ),
-                    ]))
+                    let own = referent_impure.ref_to_pred(vcx, addr, None);
+                    let is_one = builder.query.is_one(builder.q, 0);
+                    let is_arg = builder.guard(Param::Ty(0));
+                    Some(vir::expr! { vcx; (([is_one]) ==> ([own])) && (([is_arg]) ==> ([inner])) })
                 }
                 TySpecifics::StructLike(data) => {
                     let fields = builder.fields(key.downcast_ty::<vir::CSnap>(), data)?;
@@ -213,11 +205,10 @@ impl TaskEncoder for TyIndirectEnc {
                     for variant in &data.variants {
                         let fields = builder.fields(key, &variant.inner)?;
                         if !fields.is_empty() {
-                            variants.push(mk_implies(
-                                vcx,
-                                vcx.mk_eq_expr(discr, variant.data.1.discr),
-                                vcx.mk_conj(&fields),
-                            ));
+                            let fields = vcx.mk_conj(&fields);
+                            variants.push(vir::expr! { vcx;
+                                (([discr]) == ([variant.data.1.discr])) ==> ([fields])
+                            });
                         }
                     }
                     Some(vcx.mk_conj(&variants))
@@ -240,11 +231,9 @@ impl TaskEncoder for TyIndirectEnc {
             let all = builder.all_occurrences(ty);
             let body = match body {
                 Some(body) if !all.is_empty() => {
-                    let pieces = builder.all_pieces(ty, &all, key)?;
-                    Some(vcx.mk_conj(&[
-                        body,
-                        mk_implies(vcx, builder.query.is_all(builder.q), vcx.mk_conj(&pieces)),
-                    ]))
+                    let pieces = vcx.mk_conj(&builder.all_pieces(ty, &all, key)?);
+                    let is_all = builder.query.is_all(builder.q);
+                    Some(vir::expr! { vcx; ([body]) && (([is_all]) ==> ([pieces])) })
                 }
                 body => body,
             };
@@ -285,15 +274,11 @@ impl TaskEncoder for TyIndirectEnc {
                         pure.value_access.call()(kp).upcast_ty(),
                         builder.query.sub(builder.q),
                     )?;
-                    let value = vcx.mk_ternary_expr(
-                        builder.query.is_one(builder.q, 0),
-                        owned,
-                        vcx.mk_ternary_expr(
-                            vcx.mk_conj(&[builder.query.is_arg(builder.q, 0), builder.has_ind(0)]),
-                            slot_ext,
-                            slot,
-                        ),
-                    );
+                    let is_one = builder.query.is_one(builder.q, 0);
+                    let is_arg = builder.guard(Param::Ty(0));
+                    let value = vir::expr! { vcx;
+                        ([is_one]) ? ([owned]) : (([is_arg]) ? ([slot_ext]) : ([slot]))
+                    };
                     let cons = (pure.prim_to_snap)(
                         pure.deref_access.call()(k),
                         pure.metadata_access.call()(k),
@@ -333,12 +318,10 @@ impl TaskEncoder for TyIndirectEnc {
                         let Some(fields) = builder.ext_fields(k, kp, &variant.inner)? else {
                             continue;
                         };
-                        let cons = (variant.inner.data.1.field_snaps_to_snap)(fields.as_slice());
-                        body = vcx.mk_ternary_expr(
-                            vcx.mk_eq_expr(discr, variant.data.1.discr),
-                            cons.upcast_ty(),
-                            body,
-                        );
+                        let cons = (variant.inner.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty();
+                        body = vir::expr! { vcx;
+                            (([discr]) == ([variant.data.1.discr])) ? ([cons]) : ([body])
+                        };
                         variants.push((
                             variant.data.1.discr,
                             builder.agree_fields(&variant.inner)?,
@@ -353,14 +336,13 @@ impl TaskEncoder for TyIndirectEnc {
                             Box::new(move |vcx, (k, kp): (vir::ExprSnap<'vir>, vir::ExprSnap<'vir>)| {
                                 let k_discr = snap_to_discr.call()(k.downcast_ty());
                                 let kp_discr = snap_to_discr.call()(kp.downcast_ty());
-                                let mut conjuncts = vec![vcx.mk_eq_expr(k_discr, kp_discr)];
+                                let mut conjuncts = vec![vir::expr! { vcx; ([k_discr]) == ([kp_discr]) }];
                                 for (discr, fields) in &variants {
                                     if !fields.is_empty() {
-                                        conjuncts.push(mk_implies(
-                                            vcx,
-                                            vcx.mk_eq_expr(k_discr, *discr),
-                                            agree_fields(vcx, fields, k, kp),
-                                        ));
+                                        let fields = agree_fields(vcx, fields, k, kp);
+                                        conjuncts.push(vir::expr! { vcx;
+                                            (([k_discr]) == ([*discr])) ==> ([fields])
+                                        });
                                     }
                                 }
                                 vcx.mk_conj(&conjuncts).kind
@@ -381,8 +363,9 @@ impl TaskEncoder for TyIndirectEnc {
             // `q_all()`: extend through the pieces of the own parameters in order
             let body = match body {
                 Some(body) if !all.is_empty() => {
-                    let chain = builder.all_ext(ty, &all, k, kp)?;
-                    Some(vcx.mk_ternary_expr(builder.query.is_all(builder.q), unfolding(chain), body))
+                    let chain = unfolding(builder.all_ext(ty, &all, k, kp)?);
+                    let is_all = builder.query.is_all(builder.q);
+                    Some(vir::expr! { vcx; ([is_all]) ? ([chain]) : ([body]) })
                 }
                 body => body,
             };
@@ -426,14 +409,15 @@ impl TaskEncoder for TyIndirectEnc {
             // ind_empty(k, T, q): requires !has_ind(T), ensures p_Param_ind(k, T, q)
             let empty = empty.map(|empty| {
                 let k_decl = vcx.mk_local_decl("k", snap.snapshot);
-                let app = (pred)(vcx.mk_local_ex(k_decl), params.ty_exprs(), params.const_exprs(), vcx.mk_local_ex(q_decl))(None);
                 let has_ind = TyHasIndEnc::has_ind_fn().call()(params.ty_exprs()[0]);
                 vcx.mk_method(
                     empty,
                     (k_decl, params.ty_decls(), params.const_decls(), q_decl),
                     &[],
-                    vcx.alloc_slice(&[vcx.mk_unary_op_expr(vir::UnOpKind::Not, has_ind.upcast_ty()).downcast_ty::<vir::Bool>()]),
-                    vcx.alloc_slice(&[vcx.mk_predicate_app_expr(app)]),
+                    vcx.alloc_slice(&[vir::expr! { vcx; !([has_ind]) }]),
+                    vcx.alloc_slice(&[vir::expr! { vcx;
+                        acc([pred](k_decl, [..[params.ty_exprs()]], [..[params.const_exprs()]], q_decl))
+                    }]),
                     None,
                 )
             });
@@ -512,9 +496,14 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
             }
         }
         by_param.sort_by_key(|(p, _)| *p);
+        let vcx = self.vcx;
         Ok(by_param
             .into_iter()
-            .map(|(param, pieces)| mk_implies(self.vcx, self.guard(param), self.vcx.mk_conj(&pieces)))
+            .map(|(param, pieces)| {
+                let guard = self.guard(param);
+                let pieces = vcx.mk_conj(&pieces);
+                vir::expr! { vcx; ([guard]) ==> ([pieces]) }
+            })
             .collect())
     }
 
@@ -584,7 +573,8 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
                     let query = self.occurrence_query(&field, idx);
                     ext = self.ext(field.ty, ext, parent_key, query)?;
                 }
-                value = self.vcx.mk_ternary_expr(self.guard(param), ext, value);
+                let guard = self.guard(param);
+                value = vir::expr! { ([guard]) ? ([ext]) : ([value]) };
             }
             values.push(value);
         }
@@ -632,8 +622,9 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
     ) -> EncResult<'vir, vir::ExprBool<'vir>> {
         let pred = self.deps.require_ref::<TyIndirectEnc>(ty.ty)?.pred;
         let args = self.deps.require_dep::<GArgsTyEnc>(ty.args)?;
-        let app = pred(key, args.get_ty(), args.get_const(), query)(None);
-        Ok(self.vcx.mk_predicate_app_expr(app))
+        Ok(vir::expr! {
+            acc([pred](key, [..[args.get_ty()]], [..[args.get_const()]], query))
+        })
     }
 
     /// The occurrences of type parameters in the fields (see `TyParamPart`).
@@ -718,7 +709,7 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
                 let query = self.all_query(occurrence);
                 let piece = self.apply(identity, key, query)?;
                 Ok(match self.all_guard(occurrence) {
-                    Some(guard) => mk_implies(self.vcx, guard, piece),
+                    Some(guard) => vir::expr! { ([guard]) ==> ([piece]) },
                     None => piece,
                 })
             })
@@ -740,7 +731,7 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
             let query = self.all_query(occurrence);
             let ext = self.ext(identity, value, key, query)?;
             value = match self.all_guard(occurrence) {
-                Some(guard) => self.vcx.mk_ternary_expr(guard, ext, value),
+                Some(guard) => vir::expr! { ([guard]) ? ([ext]) : ([value]) },
                 None => ext,
             };
         }
@@ -751,7 +742,10 @@ impl<'vir> IndirectBuilder<'_, 'vir> {
     fn guard(&self, param: Param) -> vir::ExprBool<'vir> {
         match param {
             Param::Lifetime(i) => self.query.is_one(self.q, i),
-            Param::Ty(j) => self.vcx.mk_conj(&[self.query.is_arg(self.q, j), self.has_ind(j)]),
+            Param::Ty(j) => {
+                let (is_arg, has_ind) = (self.query.is_arg(self.q, j), self.has_ind(j));
+                vir::expr! { ([is_arg]) && ([has_ind]) }
+            }
         }
     }
 
@@ -818,13 +812,4 @@ fn agree_fields<'vir>(
         })
         .collect::<Vec<_>>();
     vcx.mk_conj(&conjuncts)
-}
-
-fn mk_implies<'vir>(
-    vcx: &'vir vir::VirCtxt<'_>,
-    lhs: vir::ExprBool<'vir>,
-    rhs: vir::ExprBool<'vir>,
-) -> vir::ExprBool<'vir> {
-    vcx.mk_bin_op_expr(vir::BinOpKind::Implies, lhs, rhs)
-        .downcast_ty()
 }

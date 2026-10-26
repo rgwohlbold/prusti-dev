@@ -114,11 +114,12 @@ impl TaskEncoder for IndCastersEnc {
                 |s: vir::ExprSnap<'vir>| (casters.make_generic)(s.downcast_ty(), tys, consts);
             let make_concrete =
                 |p: vir::ExprSnap<'vir>| casters.make_concrete.call()(p.downcast_ty()).upcast_ty();
-            let concrete_pred = |k| {
-                vcx.mk_predicate_app_expr((concrete_ind.pred)(k, tys, consts, q)(None))
+            let concrete_pred = |k: vir::ExprSnap<'vir>| {
+                vir::expr! { vcx; acc([concrete_ind.pred](k, [..[tys]], [..[consts]], q)) }
             };
-            let param_pred = |p| {
-                vcx.mk_predicate_app_expr((param_ind.pred)(p, &[lifted_ty], &[], q)(None))
+            let no_consts: [vir::ExprCSnap<'vir>; 0] = [];
+            let param_pred = |p: vir::ExprSnap<'vir>| {
+                vir::expr! { vcx; acc([param_ind.pred](p, [..[[lifted_ty]]], [..[no_consts]], q)) }
             };
             let concrete_ext = |k, kp| (concrete_ind.ext)(k, tys, consts, kp, q);
             let param_ext = |p, pp| (param_ind.ext)(p, &[lifted_ty], &[], pp, q);
@@ -128,16 +129,10 @@ impl TaskEncoder for IndCastersEnc {
                              agree: Option<vir::ExprBool<'vir>>,
                              body: vir::ExprBool<'vir>| {
                 let body = match agree {
-                    Some(agree) => vcx
-                        .mk_bin_op_expr(vir::BinOpKind::Implies, agree, body)
-                        .downcast_ty(),
+                    Some(agree) => vir::expr! { vcx; ([agree]) ==> ([body]) },
                     None => body,
                 };
-                vcx.mk_forall_expr(
-                    vcx.alloc_slice(&[k_decl]),
-                    vcx.alloc_slice(&[vcx.mk_trigger(&[trigger])]),
-                    body,
-                )
+                vir::expr! { vcx; forall [k_decl] :: {[trigger]} [body] }
             };
 
             // make_generic_ind_X
@@ -146,23 +141,21 @@ impl TaskEncoder for IndCastersEnc {
             let big_k_decl = vcx.mk_local_decl("K", concrete_snap);
             let big_k = vcx.mk_local_ex(big_k_decl);
             let generic_ext = param_ext(make_generic(big_k).upcast_ty(), make_generic(k).upcast_ty());
+            let generic_ext_value = generic_ext.downcast_ty::<vir::PSnap>();
+            let generic_ext_old = make_generic(vir::expr! { vcx; old([concrete_ext(big_k, k)]) });
             let generic_equation = equation(
                 big_k_decl,
                 generic_ext,
                 concrete_dep.agree.map(|agree| agree.reify(vcx, (big_k, k))),
-                vcx.mk_eq_expr(
-                    generic_ext.downcast_ty::<vir::PSnap>(),
-                    make_generic(vcx.mk_old_expr(concrete_ext(big_k, k))),
-                ),
+                vir::expr! { vcx; ([generic_ext_value]) == ([generic_ext_old]) },
             );
             // The instance `K := k` (the piece's own key) of the equation,
             // stated explicitly so that its terms exist after the call (the
             // quantified version needs a trigger term).
             let k_generic = make_generic(k).upcast_ty();
-            let generic_instance = vcx.mk_eq_expr(
-                param_ext(k_generic, k_generic).downcast_ty::<vir::PSnap>(),
-                make_generic(vcx.mk_old_expr(concrete_ext(k, k))),
-            );
+            let instance_value = param_ext(k_generic, k_generic).downcast_ty::<vir::PSnap>();
+            let instance_old = make_generic(vir::expr! { vcx; old([concrete_ext(k, k)]) });
+            let generic_instance = vir::expr! { vcx; ([instance_value]) == ([instance_old]) };
             let make_generic_method = vcx.mk_method(
                 make_generic_ident,
                 (k_decl, generics.ty_decls(), generics.const_decls(), q_decl),
@@ -182,22 +175,21 @@ impl TaskEncoder for IndCastersEnc {
             let big_p_decl = vcx.mk_local_decl("K", vir::TYPE_PSNAP.upcast_ty());
             let big_p = vcx.mk_local_ex(big_p_decl);
             let concrete_ext_app = concrete_ext(make_concrete(big_p), make_concrete(p));
+            let param_ext_old = vir::expr! { vcx; old([param_ext(big_p, p)]) }.downcast_ty::<vir::PSnap>();
+            let concrete_ext_value = make_generic(concrete_ext_app);
             let concrete_equation = equation(
                 big_p_decl,
                 concrete_ext_app,
                 concrete_dep
                     .agree
                     .map(|agree| agree.reify(vcx, (make_concrete(big_p), make_concrete(p)))),
-                vcx.mk_eq_expr(
-                    vcx.mk_old_expr(param_ext(big_p, p)).downcast_ty::<vir::PSnap>(),
-                    make_generic(concrete_ext_app),
-                ),
+                vir::expr! { vcx; ([param_ext_old]) == ([concrete_ext_value]) },
             );
             // the instance `K := p` (see `make_generic_ind_X`)
-            let concrete_instance = vcx.mk_eq_expr(
-                vcx.mk_old_expr(param_ext(p, p)).downcast_ty::<vir::PSnap>(),
-                make_generic(concrete_ext(make_concrete(p), make_concrete(p))),
-            );
+            let instance_old = vir::expr! { vcx; old([param_ext(p, p)]) }.downcast_ty::<vir::PSnap>();
+            let instance_value = make_generic(concrete_ext(make_concrete(p), make_concrete(p)));
+            let concrete_instance = vir::expr! { vcx; ([instance_old]) == ([instance_value]) };
+            let round_trip = make_generic(make_concrete(p));
             let make_concrete_method = vcx.mk_method(
                 make_concrete_ident,
                 (p_decl, generics.ty_decls(), generics.const_decls(), q_decl),
@@ -205,7 +197,7 @@ impl TaskEncoder for IndCastersEnc {
                 vcx.alloc_slice(&[param_pred(p)]),
                 vcx.alloc_slice(&[
                     concrete_pred(make_concrete(p)),
-                    vcx.mk_eq_expr(make_generic(make_concrete(p)), p.downcast_ty()),
+                    vir::expr! { vcx; ([round_trip]) == ([p.downcast_ty::<vir::PSnap>()]) },
                     concrete_equation,
                     concrete_instance,
                 ]),

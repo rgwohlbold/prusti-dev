@@ -548,10 +548,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 };
                 let k = part.read.read(*key);
                 let tau = args.get_ty()[*j];
-                let no_ind = self
-                    .vcx
-                    .mk_unary_op_expr(vir::UnOpKind::Not, TyHasIndEnc::has_ind_fn().call()(tau).upcast_ty())
-                    .downcast_ty::<vir::Bool>();
+                let has_ind = TyHasIndEnc::has_ind_fn().call()(tau);
+                let no_ind = vir::expr! { !([has_ind]) };
                 let empty = if part.path.is_empty() {
                     let query = child_nodes.piece(piece).query;
                     (param_ind.empty.unwrap())(k, &[tau], &[], query).alloc()

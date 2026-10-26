@@ -146,13 +146,8 @@ impl<'vir> ReferentPieces<'vir> {
         let p_generic = self.generic_snap.call()(addr, tys, &[]);
         let Some(casters) = self.casters else {
             // the referent's (generic) piece, if the reference's was empty
-            let no_ind = vir::with_vcx(|vcx| {
-                vcx.mk_unary_op_expr(
-                    vir::UnOpKind::Not,
-                    TyHasIndEnc::has_ind_fn().call()(tys[0]).upcast_ty(),
-                )
-                .downcast_ty::<vir::Bool>()
-            });
+            let has_ind = TyHasIndEnc::has_ind_fn().call()(tys[0]);
+            let no_ind = vir::expr! { !([has_ind]) };
             return self
                 .pairs
                 .iter()
