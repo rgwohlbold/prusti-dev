@@ -2,7 +2,6 @@ mod use_casters;
 mod params;
 mod casters;
 pub(crate) mod ind_casters;
-pub(crate) mod regroup;
 mod param_typ;
 mod args_ty;
 mod args;

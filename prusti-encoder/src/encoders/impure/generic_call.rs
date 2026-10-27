@@ -1,12 +1,14 @@
-//! Calls to generic callees: a callee's contract names one opaque piece per
-//! type parameter position (`RegionsIn(T)`, query `path ++ q_all()`), while
-//! the caller holds one piece per lifetime occurrence of the instantiation.
-//! Before the call the caller's pieces under such a position are regrouped
-//! into the callee's piece, after the call it is split again (with the keys
-//! the callee returned).
-//!
-//! Both call a generated method per position (see `RegroupEnc`), which
-//! converts one level of the type and calls the methods of the levels below.
+//! Calls to generic callees: a callee's contract names one piece per type
+//! parameter occurrence (`RegionsIn(T)`, the positions `lo .. hi` of `T`),
+//! while the caller holds one piece per lifetime occurrence of the
+//! instantiation (its pieces under the occurrence's path, in position order).
+//! Before the call the caller's pieces are merged into the callee's piece:
+//! re-keyed to chain keys (the first piece's key, extended by the previous
+//! pieces), cast to `p_Param_ind` of the argument's type, merged with
+//! `merge_Param` (right to left) and, below the top of the argument, cast
+//! back. After the call they are split again in reverse (`split_Param` left
+//! to right) and re-keyed to their own keys (extended by their enclosing
+//! pieces only).
 
 use prusti_rustc_interface::middle::mir;
 use task_encoder::TaskEncoder;
@@ -17,10 +19,14 @@ use crate::encoders::{
     impure::fn_wand::GenericNode,
     ty::{
         RustTyDecomposition,
-        generics::{GArgsTyEnc, GenericParamsEnc, ind_casters::IndCastersEnc, regroup::RegroupEnc},
-        indirect_node::IndirectNodesEnc,
-        lifetime_query::LifetimeQueryEnc,
-        occurrences::Step,
+        generics::{
+            GArgsTy, GArgsTyEnc,
+            ind_casters::{IndCasters, IndCastersEnc},
+        },
+        indirect_node::{IndirectNodes, IndirectNodesEnc},
+        indirect_pred::{ParamRanges, TyIndirectEnc, TyIndirectExt},
+        lifted::TyConstructorEnc,
+        range::Range,
     },
 };
 
@@ -97,8 +103,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(())
     }
 
-    /// Regroup (`into_callee`) or split the caller's pieces of a value of
-    /// type `ty` (with snapshot `snap`) at the positions of the callee's `node`.
+    /// Merge (`into_callee`) or split the caller's pieces of a value of type
+    /// `ty` (with snapshot `snap`) at the positions of the callee's `node`.
     fn convert_node(
         &mut self,
         ty: prusti_rustc_interface::middle::ty::Ty<'vir>,
@@ -111,70 +117,126 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         for g in node.nodes.pieces_of(node.node) {
             let path = node.nodes.piece(g).path.clone();
             // generic in the caller as well: the same piece
-            if caller
-                .find(&path)
-                .is_some_and(|c| caller.piece(c).all)
-            {
+            if decomp.ty.specifics.is_param() || caller.find(&path).is_some_and(|c| caller.piece(c).all) {
                 continue;
             }
-            if path.is_empty() {
-                // the whole value is generic (`x: T`): through the cast of the
-                // concrete type (as its direct predicate)
-                self.convert_top(decomp, snap, into_callee)?;
+            let group = (0..caller.len())
+                .filter(|c| caller.piece(*c).path.starts_with(&path))
+                .collect::<Vec<_>>();
+            // At the top (`x: T`) the callee's piece is the cast of the
+            // caller's, otherwise of the caller's type (exactly the caller's
+            // piece if there is one).
+            let top = path.is_empty();
+            if group.len() == 1 && !top || group.is_empty() && !into_callee {
                 continue;
             }
-            let key = self.bind(node.nodes.key(g, snap));
-            self.call_regroup(decomp, path, into_callee, key)?;
+            let range = node.nodes.range(g);
+            let c = self.group_casts(decomp)?;
+            if group.is_empty() {
+                // no positions: make the callee's empty piece
+                if top {
+                    let generic = c.generic(snap);
+                    self.stmt((c.param.empty)(generic, &[c.x], &[], range.lo, range.hi).alloc());
+                } else {
+                    let key = node.nodes.key(g, snap);
+                    self.stmt(self.vcx.mk_fold_stmt(caller.app_range(range, key, None)));
+                }
+            } else if into_callee {
+                self.merge_pieces(&c, &caller, &group, snap, range, top);
+            } else {
+                let key = (!top).then(|| self.bind(node.nodes.key(g, snap)));
+                self.split_pieces(&c, &caller, &group, snap, range, key);
+            }
         }
         Ok(())
     }
 
-    /// A whole value at a generic position: `q_all()` of its concrete type,
-    /// cast to `p_Param_ind(make_generic_s(snap), .., q_all())`.
-    fn convert_top(
+    fn group_casts(&mut self, decomp: RustTyDecomposition<'vir>) -> EncodeResult<'vir, GroupCasts<'vir>, E> {
+        let param = RustTyDecomposition::param();
+        let param_ind = self.deps.require_ref::<TyIndirectEnc>(param)?;
+        let constructor = self.deps.require_ref::<TyConstructorEnc>(decomp.ty)?.ty_constructor;
+        let args = self.deps.require_dep::<GArgsTyEnc>(decomp.args)?;
+        Ok(GroupCasts {
+            casters: self.deps.require_ref::<IndCastersEnc>((param, decomp.ty))?,
+            param: param_ind.param.unwrap(),
+            param_ext: param_ind.ext,
+            args,
+            x: constructor(args.get_ty(), args.get_const()),
+        })
+    }
+
+    /// Re-key the caller's piece `c` from `from` to `to` (unfold, fold).
+    fn rekey(&mut self, caller: &IndirectNodes<'vir>, c: usize, from: vir::ExprSnap<'vir>, to: vir::ExprSnap<'vir>) {
+        let range = caller.range(c);
+        self.stmt(self.vcx.mk_unfold_stmt(caller.app_range(range, from, None)));
+        self.stmt(self.vcx.mk_fold_stmt(caller.app_range(range, to, None)));
+    }
+
+    /// Before a call: merge the caller's pieces `group` (of a value with
+    /// snapshot `snap`) into the callee's piece of `range`: of the caller's
+    /// type (keyed by the first piece's key), or at the `top` its cast.
+    fn merge_pieces(
         &mut self,
-        c: RustTyDecomposition<'vir>,
+        c: &GroupCasts<'vir>,
+        caller: &IndirectNodes<'vir>,
+        group: &[usize],
         snap: vir::ExprSnap<'vir>,
-        into_callee: bool,
-    ) -> EncodeResult<'vir, (), E> {
-        if c.ty.specifics.is_param() {
-            return Ok(());
+        range: Range<'vir>,
+        top: bool,
+    ) {
+        // the pieces' own keys, while all are held
+        let own_keys = group.iter().map(|p| self.bind(caller.key(*p, snap))).collect::<Vec<_>>();
+        // re-key to chain keys, in position order
+        let mut chain = vec![own_keys[0]];
+        for (i, p) in group.iter().enumerate().skip(1) {
+            let prev = chain[i - 1];
+            let key = self.bind(caller.ext(prev, prev, caller.range(group[i - 1])));
+            self.rekey(caller, *p, own_keys[i], key);
+            chain.push(key);
         }
-        let casters = self
-            .deps
-            .require_ref::<IndCastersEnc>((RustTyDecomposition::param(), c.ty))?;
-        let args = self.deps.require_dep::<GArgsTyEnc>(c.args)?;
-        let query = self.deps.require_dep::<LifetimeQueryEnc>(())?;
-        let snap = self.bind(snap);
-        if into_callee {
-            self.call_regroup(c, Vec::new(), true, snap)?;
-            self.stmt((casters.make_generic)(snap, args.get_ty(), args.get_const(), query.all()).alloc());
-        } else {
-            let generic = (casters.make_generic_s)(snap.downcast_ty(), args.get_ty(), args.get_const());
-            self.stmt(
-                (casters.make_concrete)(generic.upcast_ty(), args.get_ty(), args.get_const(), query.all())
-                    .alloc(),
-            );
-            self.call_regroup(c, Vec::new(), false, snap)?;
+        for (p, k) in group.iter().zip(&chain) {
+            let r = caller.range(*p);
+            self.stmt(c.make_generic(*k, r));
         }
-        Ok(())
+        // right to left: `[l_i, l_i+1)` with the merged `[l_i+1, hi)`
+        for (p, k) in group.iter().zip(&chain).rev().skip(1) {
+            let r = caller.range(*p);
+            self.stmt((c.param.merge)(c.generic(*k), &[c.x], &[], r.lo, r.hi, range.hi).alloc());
+        }
+        if !top {
+            self.stmt(c.make_concrete(c.generic(chain[0]), range));
+        }
     }
 
-    /// The call of the regroup (`into`) or split method of the position
-    /// `rest` of `x`, on the key `k`.
-    fn call_regroup(
+    /// After a call: split the callee's piece of `range` (keyed by `key`, or
+    /// at the top the cast of the value) into the caller's pieces `group`.
+    fn split_pieces(
         &mut self,
-        x: RustTyDecomposition<'vir>,
-        rest: Vec<Step>,
-        into: bool,
-        k: vir::ExprSnap<'vir>,
-    ) -> EncodeResult<'vir, (), E> {
-        let method = self.deps.require_ref::<RegroupEnc>((x, rest, into))?.method;
-        let generics = self.deps.require_dep::<GenericParamsEnc>(x.args.context())?;
-        let tys = self.vcx.alloc_slice(generics.ty_exprs());
-        let consts = self.vcx.alloc_slice(generics.const_exprs());
-        self.stmt(method(k, tys, consts).alloc());
-        Ok(())
+        c: &GroupCasts<'vir>,
+        caller: &IndirectNodes<'vir>,
+        group: &[usize],
+        snap: vir::ExprSnap<'vir>,
+        range: Range<'vir>,
+        key: Option<vir::ExprSnap<'vir>>,
+    ) {
+        if let Some(key) = key {
+            self.stmt(c.make_generic(key, range));
+        }
+        // left to right: `[l_i, hi)` into `[l_i, l_i+1)` and the rest
+        let mut chain = vec![self.bind(c.generic(key.unwrap_or(snap)))];
+        for p in &group[..group.len() - 1] {
+            let (r, k) = (caller.range(*p), *chain.last().unwrap());
+            self.stmt((c.param.split)(k, &[c.x], &[], r.lo, r.hi, range.hi).alloc());
+            chain.push(self.bind((c.param_ext)(k, &[c.x], &[], k, r.lo, r.hi)));
+        }
+        for (p, k) in group.iter().zip(&chain) {
+            self.stmt(c.make_concrete(*k, caller.range(*p)));
+        }
+        // re-key to the pieces' own keys, enclosing ones first
+        for (p, k) in group.iter().zip(&chain).skip(1) {
+            let own_key = self.bind(caller.key(*p, snap));
+            self.rekey(caller, *p, c.casters.make_concrete_s.call()(k.downcast_ty()).upcast_ty(), own_key);
+        }
     }
 
     /// A fresh variable holding `expr` (a key read before the pieces it reads
@@ -183,5 +245,29 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let tmp = self.new_tmp(expr.ty());
         self.stmt(self.vcx.mk_pure_assign_stmt(tmp, expr));
         tmp
+    }
+}
+
+/// The casts and range methods for a group of pieces of the type `x`.
+struct GroupCasts<'vir> {
+    casters: IndCasters<'vir>,
+    param: ParamRanges<'vir>,
+    param_ext: TyIndirectExt<'vir>,
+    args: GArgsTy<'vir>,
+    x: vir::ExprTyVal<'vir>,
+}
+
+impl<'vir> GroupCasts<'vir> {
+    /// `make_generic_s_X(k, ..)`
+    fn generic(&self, k: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {
+        (self.casters.make_generic_s)(k.downcast_ty(), self.args.get_ty(), self.args.get_const()).upcast_ty()
+    }
+
+    fn make_generic(&self, k: vir::ExprSnap<'vir>, r: Range<'vir>) -> vir::Stmt<'vir> {
+        (self.casters.make_generic)(k, self.args.get_ty(), self.args.get_const(), r.lo, r.hi).alloc()
+    }
+
+    fn make_concrete(&self, p: vir::ExprSnap<'vir>, r: Range<'vir>) -> vir::Stmt<'vir> {
+        (self.casters.make_concrete)(p, self.args.get_ty(), self.args.get_const(), r.lo, r.hi).alloc()
     }
 }

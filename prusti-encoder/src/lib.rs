@@ -113,9 +113,6 @@ pub fn test_entrypoint<'tcx>(
     program.header("impure generic casts");
     GArgsCastEnc::<Impure>::emit_outputs(&mut program);
 
-    program.header("regrouping at generic calls");
-    crate::encoders::ty::generics::regroup::RegroupEnc::emit_outputs(&mut program);
-
     program.header("snapshots");
     crate::encoders::TyUsePureEnc::emit_outputs(&mut program);
     BitVecEnc::emit_outputs(&mut program);
@@ -127,7 +124,7 @@ pub fn test_entrypoint<'tcx>(
     program.header("type constructors");
     TyConstructorEnc::emit_outputs(&mut program);
     crate::encoders::TyInhabitedEnc::emit_outputs(&mut program);
-    crate::encoders::ty::has_ind::TyHasIndEnc::emit_outputs(&mut program);
+    crate::encoders::ty::arity::TyArityEnc::emit_outputs(&mut program);
 
     program.header("constants");
     ConstEnc::emit_outputs(&mut program);

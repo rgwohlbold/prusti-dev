@@ -16,7 +16,7 @@ use crate::encoders::{
             bitvec::BitVecSize,
             float_conv::{FloatBitVecConvEnc, float_pow2_bits},
         },
-        lifetime_query::LifetimeQueryEnc,
+        range::{Range, int},
         use_pure::TyUsePureEnc,
     },
 };
@@ -52,8 +52,8 @@ pub(super) enum MirBuiltinCastOutput<'vir> {
     /// shared references (and currently for all coercions, pending completion).
     Unsize {
         cast: FunctionIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap), vir::CSnap>,
-        unsize: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap, vir::LifetimeQuery)>>,
-        undo: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap, vir::LifetimeQuery)>>,
+        unsize: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
+        undo: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
     },
 }
 
@@ -438,16 +438,14 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         let addr = src_mutref.deref_access(src_ex);
 
                         // The referents are held by the references' own
-                        // indirect pieces, selected by the query `q` (that of
-                        // the operand's own lifetime, supplied by the caller):
-                        // `p_Ref_mutable_ind(src, U, q)` and
-                        // `p_Ref_mutable_ind(cast(src), V, q)`.
-                        let q_decl = vcx.mk_local_decl("q", vir::TYPE_LIFETIME_QUERY);
-                        let q = vcx.mk_local_ex(q_decl);
+                        // indirect pieces, of position 0:
+                        // `p_Ref_mutable_ind(src, U, 0, 1)` and
+                        // `p_Ref_mutable_ind(cast(src), V, 0, 1)`.
                         let ind = deps.require_ref::<TyIndirectEnc>(operand_ty)?.pred;
                         let dst_ex = fn_idn(src_ex, unsize_params.ty_exprs(), unsize_params.const_exprs());
-                        let u_piece = ind(src_ex.upcast_ty(), &[u], &[], q)(None);
-                        let v_piece = ind(dst_ex.upcast_ty(), &[v], &[], q)(None);
+                        let own = Range::starting_at(int(0), int(1));
+                        let u_piece = ind(src_ex.upcast_ty(), &[u], &[], own.lo, own.hi)(None);
+                        let v_piece = ind(dst_ex.upcast_ty(), &[v], &[], own.lo, own.hi)(None);
                         let u_pred = vcx.mk_predicate_app_expr(u_piece);
                         let v_pred = vcx.mk_predicate_app_expr(v_piece);
                         let u_snap = vcx.mk_unfolding_expr(
@@ -459,10 +457,6 @@ impl TaskEncoder for MirBuiltinCastEnc {
                             v_piece,
                             v_impure.ref_to_snap(dst_addr).downcast_ty::<vir::PSnap>(),
                         );
-                        // the pieces hold the referents
-                        let query = deps.require_dep::<LifetimeQueryEnc>(())?;
-                        let own_selected = query.is_one(q, 0);
-
                         // `unsize`: operand referent `U` -> result referent `V`; the
                         // new `V` value is `value_cast(old(U), U, V)`. `undo` is the
                         // *reverse* equation: the old `V` value is `value_cast` of the
@@ -485,7 +479,6 @@ impl TaskEncoder for MirBuiltinCastEnc {
                                 op_ty_snap,
                                 unsize_params.ty_args(),
                                 unsize_params.const_args(),
-                                vir::TYPE_LIFETIME_QUERY,
                             ),
                         );
                         let undo_idn = MethodIdn::new(
@@ -499,7 +492,6 @@ impl TaskEncoder for MirBuiltinCastEnc {
                                 op_ty_snap,
                                 unsize_params.ty_args(),
                                 unsize_params.const_args(),
-                                vir::TYPE_LIFETIME_QUERY,
                             ),
                         );
                         let unsize_method = vcx.mk_method(
@@ -508,10 +500,9 @@ impl TaskEncoder for MirBuiltinCastEnc {
                                 src_decl,
                                 unsize_params.ty_decls(),
                                 unsize_params.const_decls(),
-                                q_decl,
                             ),
                             &[],
-                            vcx.alloc_slice(&[own_selected, u_pred]),
+                            vcx.alloc_slice(&[u_pred]),
                             vcx.alloc_slice(&[v_pred, unsize_value]),
                             None,
                         );
@@ -521,10 +512,9 @@ impl TaskEncoder for MirBuiltinCastEnc {
                                 src_decl,
                                 unsize_params.ty_decls(),
                                 unsize_params.const_decls(),
-                                q_decl,
                             ),
                             &[],
-                            vcx.alloc_slice(&[own_selected, v_pred]),
+                            vcx.alloc_slice(&[v_pred]),
                             vcx.alloc_slice(&[u_pred, undo_value]),
                             None,
                         );

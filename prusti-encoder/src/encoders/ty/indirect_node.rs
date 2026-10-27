@@ -7,10 +7,11 @@ use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDe
 
 use super::{
     RustTyDecomposition,
-    generics::GArgsTyEnc,
+    arity::TyArityEnc,
+    generics::{GArgsTy, GArgsTyEnc, GParams, GenericParamsEnc},
     indirect_pred::{TyIndirectEnc, TyIndirectRef},
-    lifetime_query::LifetimeQueryEnc,
-    occurrences::{End, Step, occurrence_query, occurrences},
+    occurrences::{End, Pos, Step, occurrences, param_position},
+    range::{Range, int, pos_expr},
 };
 
 pub type RegionIdx = LifetimeProjectionIdx<Region>;
@@ -64,24 +65,26 @@ pub fn node_for_generalized_idx<'tcx>(
 
 /// Encodes, for a type `T` (the type of the base of PCG lifetime projection
 /// nodes), the indirect pieces of each node `p↓r`: one per occurrence of the
-/// region `r` in `T` (see `occurrences`), `p_T_ind(key, .., Q)` where `Q`
-/// selects the occurrence. The key is the snapshot `S` of `p` if no other
-/// occurrence encloses it; otherwise it is `S` extended by the pieces of the
-/// enclosing occurrences, outer ones first:
-/// `ext_T(.. ext_T(S, .., key(o_1), Q_o1) .., key(o_k), Q_ok)`.
+/// region `r` in `T` (see `occurrences`), `p_T_ind(key, .., lo, hi)` for the
+/// positions `lo .. hi` of the occurrence. The key is the snapshot `S` of `p`
+/// if no other occurrence encloses it; otherwise it is `S` extended by the
+/// pieces of the enclosing occurrences, outer ones first:
+/// `ext_T(.. ext_T(S, .., key(o_1), r_o1) .., key(o_k), r_ok)`.
 pub struct IndirectNodesEnc;
 
-/// The piece of one occurrence of a region, or of a type parameter (query
-/// `path ++ q_all()`).
+/// The piece of one occurrence of a region (one position), or of a type
+/// parameter (its `arity` positions).
 #[derive(Clone, Debug)]
-pub struct NodePiece<'vir> {
+pub struct NodePiece {
     /// The PCG node `p↓node` the piece belongs to: a region, or the
     /// pseudo-region `RegionsIn(T)` of a type parameter.
     pub node: RegionIdx,
     /// Is it the piece of a type parameter (`RegionsIn(T)`)?
     pub all: bool,
     pub path: Vec<Step>,
-    pub query: vir::ExprLifetimeQuery<'vir>,
+    pos: Pos,
+    /// The type parameter whose positions the piece covers (`all`).
+    width: Option<ty::ParamTy>,
     /// The pieces enclosing this one.
     parents: Vec<usize>,
 }
@@ -91,9 +94,13 @@ pub struct IndirectNodes<'vir> {
     ind: TyIndirectRef<'vir>,
     tys: &'vir [vir::ExprTyVal<'vir>],
     consts: &'vir [vir::ExprCSnap<'vir>],
+    /// The context of the type's arguments, and the type values of its type
+    /// parameters (for the positions).
+    context: GParams<'vir>,
+    context_tys: &'vir [vir::ExprTyVal<'vir>],
     /// The pieces, enclosing ones first. A region without pieces holds
     /// nothing (e.g. one only behind shared references).
-    pieces: Vec<NodePiece<'vir>>,
+    pieces: Vec<NodePiece>,
     /// The region indices, enclosing regions first.
     order: Vec<RegionIdx>,
 }
@@ -116,7 +123,7 @@ impl<'vir> IndirectNodes<'vir> {
             .collect()
     }
 
-    pub fn piece(&self, piece: usize) -> &NodePiece<'vir> {
+    pub fn piece(&self, piece: usize) -> &NodePiece {
         &self.pieces[piece]
     }
 
@@ -126,13 +133,34 @@ impl<'vir> IndirectNodes<'vir> {
     }
 
     /// The same pieces for other (Viper) type arguments of the type: e.g. a
-    /// callee's view of its argument, instantiated with a caller's types.
-    pub fn with_args(&self, args: crate::encoders::ty::generics::GArgsTy<'vir>) -> Self {
+    /// callee's view of its argument, instantiated with a caller's types
+    /// (`context` the callee's type parameters instantiated).
+    pub fn with_args(&self, args: GArgsTy<'vir>, context: GArgsTy<'vir>) -> Self {
         Self {
             tys: args.get_ty(),
             consts: args.get_const(),
+            context_tys: context.get_ty(),
             ..self.clone()
         }
+    }
+
+    /// The positions of `piece`.
+    pub fn range(&self, piece: usize) -> Range<'vir> {
+        let piece = &self.pieces[piece];
+        let ty_of = |param: ty::ParamTy| {
+            self.context_tys[param_position(self.context, param.index, |arg| arg.as_type().is_some())]
+        };
+        let lo = pos_expr(&piece.pos, ty_of);
+        let width = match piece.width {
+            Some(param) => TyArityEnc::arity(ty_of(param)),
+            None => int(1),
+        };
+        Range::starting_at(lo, width)
+    }
+
+    /// The type arguments of the type.
+    pub fn args(&self) -> GArgsTy<'vir> {
+        GArgsTy::new(self.tys, self.consts)
     }
 
     /// The pieces enclosing `piece`.
@@ -145,27 +173,19 @@ impl<'vir> IndirectNodes<'vir> {
         self.pieces.iter().position(|p| p.path == path)
     }
 
-    /// `ext_T(k, .., kp, q)` in any expression context: the type arguments
-    /// and queries are fully reified, so they are valid in any context (as in
-    /// `GArgsTy::get_ty`), and reifying the result substitutes their locals.
-    fn ext<Curr, Next>(
+    /// `ext_T(k, .., kp, range)` in any expression context: the type
+    /// arguments and the range are fully reified, so they are valid in any
+    /// context (as in `GArgsTy::get_ty`), and reifying the result substitutes
+    /// their locals.
+    pub fn ext<Curr, Next>(
         &self,
         k: vir::ExprGenSnap<'vir, Curr, Next>,
         kp: vir::ExprGenSnap<'vir, Curr, Next>,
-        q: vir::ExprLifetimeQuery<'vir>,
+        range: Range<'vir>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        // SAFETY: see `GArgsTy::get_ty`.
-        let (tys, consts, q) = unsafe {
-            (
-                &*(self.tys as *const [vir::ExprTyVal<'vir>]
-                    as *const [vir::ExprGenTyVal<'vir, Curr, Next>]),
-                &*(self.consts as *const [vir::ExprCSnap<'vir>]
-                    as *const [vir::ExprGenCSnap<'vir, Curr, Next>]),
-                &*(q as *const vir::ExprData<'vir, vir::LifetimeQuery>
-                    as *const vir::ExprGenData<'vir, Curr, Next, vir::LifetimeQuery>),
-            )
-        };
-        self.ind.ext.call()(k, tys, consts, kp, q)
+        let (tys, consts) = (self.args().get_ty(), self.args().get_const());
+        let (lo, hi) = range.args();
+        self.ind.ext.call()(k, tys, consts, kp, lo, hi)
     }
 
     /// The key of `piece`, for the snapshot `s` of `p`.
@@ -176,7 +196,7 @@ impl<'vir> IndirectNodes<'vir> {
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
         self.pieces[piece].parents.iter().fold(s, |k, parent| {
             let parent_key = self.key(*parent, s);
-            self.ext(k, parent_key, self.pieces[*parent].query)
+            self.ext(k, parent_key, self.range(*parent))
         })
     }
 
@@ -187,7 +207,17 @@ impl<'vir> IndirectNodes<'vir> {
         key: vir::ExprSnap<'vir>,
         perm: Option<vir::ExprPerm<'vir>>,
     ) -> vir::PredicateApp<'vir> {
-        (self.ind.pred)(key, self.tys, self.consts, self.pieces[piece].query)(perm)
+        self.app_range(self.range(piece), key, perm)
+    }
+
+    /// The predicate application of the positions `range` with the given key.
+    pub fn app_range(
+        &self,
+        range: Range<'vir>,
+        key: vir::ExprSnap<'vir>,
+        perm: Option<vir::ExprPerm<'vir>>,
+    ) -> vir::PredicateApp<'vir> {
+        (self.ind.pred)(key, self.tys, self.consts, range.lo, range.hi)(perm)
     }
 
     /// The predicate applications of node `p↓idx`, enclosing ones first.
@@ -226,9 +256,9 @@ impl<'vir> IndirectNodes<'vir> {
         idx: RegionIdx,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        self.pieces_of(idx).into_iter().fold(s, |k, piece| {
-            self.ext(k, self.key(piece, s), self.pieces[piece].query)
-        })
+        self.pieces_of(idx)
+            .into_iter()
+            .fold(s, |k, piece| self.ext(k, self.key(piece, s), self.range(piece)))
     }
 
     /// `s` extended by all pieces: a snapshot whose `&mut` value slots are
@@ -237,9 +267,7 @@ impl<'vir> IndirectNodes<'vir> {
         &self,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        (0..self.pieces.len()).fold(s, |k, piece| {
-            self.ext(k, self.key(piece, s), self.pieces[piece].query)
-        })
+        (0..self.pieces.len()).fold(s, |k, piece| self.ext(k, self.key(piece, s), self.range(piece)))
     }
 }
 
@@ -262,7 +290,6 @@ impl TaskEncoder for IndirectNodesEnc {
         deps.emit_output_ref(*task_key, ())?;
         let decomp = *task_key;
         let regions = PrustiPcgCtxt.extract_regions(decomp);
-        let query = deps.require_dep::<LifetimeQueryEnc>(())?;
         let occurrences =
             occurrences(decomp).map_err(|err| EncodeFullError::EncodingError(err, None))?;
 
@@ -274,12 +301,12 @@ impl TaskEncoder for IndirectNodesEnc {
                     End::Param(param) => (PcgRegion::RegionsIn(param), true),
                 };
                 let node = regions.iter_enumerated().find(|(_, r)| **r == region).unwrap().0;
-                let query = occurrence_query(&query, &occurrence.path, all.then(|| query.all()));
                 NodePiece {
                     node,
                     all,
                     path: occurrence.path.clone(),
-                    query,
+                    pos: occurrence.pos.clone(),
+                    width: occurrence.width_param(),
                     parents: occurrence.parents.clone(),
                 }
             })
@@ -310,12 +337,17 @@ impl TaskEncoder for IndirectNodesEnc {
 
         let ind = deps.require_ref::<TyIndirectEnc>(decomp.ty)?;
         let args = deps.require_dep::<GArgsTyEnc>(decomp.args)?;
+        let context = decomp.args.context();
+        let context_params = deps.require_dep::<GenericParamsEnc>(context)?;
+        let context_tys = vir::with_vcx(|vcx| vcx.alloc_slice(context_params.ty_exprs()));
         Ok((
             (),
             IndirectNodes {
                 ind,
                 tys: args.get_ty(),
                 consts: args.get_const(),
+                context,
+                context_tys,
                 pieces,
                 order,
             },

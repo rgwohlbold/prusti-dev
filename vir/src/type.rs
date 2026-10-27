@@ -108,7 +108,6 @@ impl_exp_type!(Err[TYPE_ERR = Err] => Prim | Dyn, "Type for encoding errors");
 impl_exp_type!(CSnap => Snap | Dyn, ref kind if matches!(kind, TypeKind::Bool | TypeKind::Int | TypeKind::Perm | TypeKind::Set(_) | TypeKind::Multiset(_) | TypeKind::Seq(_) | TypeKind::Map(..)) || matches!(kind, TypeKind::Domain(name, ..) if name.starts_with("s_") && *name != "s_Param"), "A concrete Prusti snapshot type");
 impl_exp_type!(PSnap[TYPE_PSNAP = Domain("s_Param", &[])] => Snap | Dyn, "The generic snapshot domain (`s_Param`)");
 impl_exp_type!(TyVal[TYPE_TYVAL = Domain("Type", &[])] => Dyn, "The type domain (`ExpType`) which gives values to types");
-impl_exp_type!(LifetimeQuery[TYPE_LIFETIME_QUERY = Domain("LifetimeQuery", &[])] => Dyn, "The adt selecting lifetimes of a type for an indirect predicate");
 
 impl_exp_type!(Pair => Dyn, TypeKind::Domain(name, args) if name == format!("Pair{}", args.len()), "A custom generic tuple type");
 

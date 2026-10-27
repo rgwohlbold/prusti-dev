@@ -20,7 +20,6 @@ use super::{
         ind_casters::{IndCasters, IndCastersEnc},
     },
     impure::{ImpureTyDatas, TyImpureEnc},
-    has_ind::TyHasIndEnc,
     indirect_node::{IndirectNodes, IndirectNodesEnc, PrustiPcgCtxt, RegionIdx},
     indirect_pred::{TyIndirectEmpty, TyIndirectEnc, TyIndirectExt},
     occurrences::Step,
@@ -100,7 +99,7 @@ type RefToSnap<'vir> = vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::Ma
 pub struct ReferentPieces<'vir> {
     nodes: &'vir IndirectNodes<'vir>,
     /// `None` if the referent is a type parameter: no casts; an empty piece
-    /// (`!has_ind`) is made by `empty` instead.
+    /// (empty range) is made by `empty` instead.
     casters: Option<IndCasters<'vir>>,
     empty: Option<TyIndirectEmpty<'vir>>,
     /// The concrete referent's type arguments.
@@ -125,11 +124,13 @@ impl<'vir> ReferentPieces<'vir> {
             .iter()
             .rev()
             .map(|(_, r)| {
+                let range = self.nodes.range(*r);
                 (casters.make_generic)(
                     self.nodes.key(*r, p_snap),
                     self.ty_args.get_ty(),
                     self.ty_args.get_const(),
-                    self.nodes.piece(*r).query,
+                    range.lo,
+                    range.hi,
                 )
                 .alloc()
             })
@@ -146,21 +147,23 @@ impl<'vir> ReferentPieces<'vir> {
         let p_generic = self.generic_snap.call()(addr, tys, &[]);
         let Some(casters) = self.casters else {
             // the referent's (generic) piece, if the reference's was empty
-            let has_ind = TyHasIndEnc::has_ind_fn().call()(tys[0]);
-            let no_ind = vir::expr! { !([has_ind]) };
             return self
                 .pairs
                 .iter()
                 .rev()
                 .map(|(_, r)| {
+                    let range = self.nodes.range(*r);
                     let empty = (self.empty.unwrap())(
                         self.generic_key(*r, p_generic, tys),
                         tys,
                         &[],
-                        self.nodes.piece(*r).query,
+                        range.lo,
+                        range.hi,
                     )
                     .alloc();
-                    vir::with_vcx(|vcx| vcx.mk_if_stmt(no_ind, vcx.alloc_slice(&[empty]), &[]))
+                    let nonempty = range.nonempty();
+                    let is_empty = vir::expr! { !([nonempty]) };
+                    vir::with_vcx(|vcx| vcx.mk_if_stmt(is_empty, vcx.alloc_slice(&[empty]), &[]))
                 })
                 .collect();
         };
@@ -168,11 +171,13 @@ impl<'vir> ReferentPieces<'vir> {
             .iter()
             .rev()
             .map(|(_, r)| {
+                let range = self.nodes.range(*r);
                 (casters.make_concrete)(
                     self.generic_key(*r, p_generic, tys),
                     self.ty_args.get_ty(),
                     self.ty_args.get_const(),
-                    self.nodes.piece(*r).query,
+                    range.lo,
+                    range.hi,
                 )
                 .alloc()
             })
@@ -188,7 +193,8 @@ impl<'vir> ReferentPieces<'vir> {
     ) -> vir::ExprSnap<'vir> {
         self.nodes.parents(r).iter().fold(p, |k, parent| {
             let parent_key = self.generic_key(*parent, p, tys);
-            (self.param_ext)(k, tys, &[], parent_key, self.nodes.piece(*parent).query)
+            let range = self.nodes.range(*parent);
+            (self.param_ext)(k, tys, &[], parent_key, range.lo, range.hi)
         })
     }
 }
@@ -419,7 +425,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         Ok(Some(ReferentPieces {
             nodes: vir::with_vcx(|vcx| &*vcx.alloc(referent_nodes)),
             casters: None,
-            empty: param_ind.empty,
+            empty: param_ind.param.map(|param| param.empty),
             ty_args: self.deps.require_dep::<GArgsTyEnc>(concrete.args)?,
             generic_snap: param_snap,
             concrete_snap: param_snap,
@@ -1020,7 +1026,7 @@ impl<'vir> TyUseImpureMutRef<'vir> {
     }
 
     /// The indirect piece of the reference's own lifetime itself, which
-    /// holds the referent: `p_Ref_mutable_ind(S, U, q_one(0))` for the
+    /// holds the referent: `p_Ref_mutable_ind(S, U, 0, 1)` for the
     /// snapshot `S` of the reference (its key, as nothing encloses it).
     fn own_piece(
         &self,

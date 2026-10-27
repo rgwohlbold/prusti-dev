@@ -15,8 +15,8 @@
 //!   `Aggregate` edges) are folded at the end of the phase.
 //!
 //! The nodes `p↓RegionsIn(T)` of type parameters are handled the same way.
-//! Their parts are guarded by `has_ind(T)`: at an expansion, a child's piece
-//! is made empty (`ind_empty` or a fold) if `T` holds nothing.
+//! Their parts are guarded by their ranges being nonempty: at an expansion, a
+//! child's piece is made empty (`ind_empty` or a fold) if `arity(T)` is 0.
 
 use pcg::{
     borrow_pcg::{
@@ -43,10 +43,10 @@ use crate::encoders::{
             GArgsTy, GArgsTyEnc,
             ind_casters::{IndCasters, IndCastersEnc},
         },
-        has_ind::TyHasIndEnc,
         indirect_node::{IndirectNodesEnc, RegionIdx},
         indirect_pred::TyIndirectEnc,
         occurrences::Step,
+        range::Range,
     },
 };
 
@@ -86,7 +86,7 @@ struct ChildCast<'vir> {
     piece: usize,
     casters: IndCasters<'vir>,
     ty_args: GArgsTy<'vir>,
-    query: vir::ExprLifetimeQuery<'vir>,
+    range: Range<'vir>,
 }
 
 impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
@@ -355,7 +355,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                     generic.upcast_ty(),
                     cast.ty_args.get_ty(),
                     cast.ty_args.get_const(),
-                    cast.query,
+                    cast.range.lo,
+                    cast.range.hi,
                 )
                 .alloc(),
             );
@@ -497,7 +498,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         for cast in casts {
             let key = self.child_key(&cast)?;
             self.stmt(
-                (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.query)
+                (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.range.lo, cast.range.hi)
                     .alloc(),
             );
         }
@@ -509,10 +510,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     }
 
     /// After unfolding the `RegionsIn(T_j)` pieces (with `keys`) of `base` at
-    /// an expansion into `children`: a part is guarded by `has_ind(T_j)`, so
-    /// without it, make the child's piece empty: `ind_empty` for a field of
-    /// type `T_j` (`p_Param_ind`, before any cast), a fold for a constructor
-    /// around `T_j`.
+    /// an expansion into `children`: a part is guarded by its range being
+    /// nonempty, so for an empty range (`arity(T_j)` is 0), make the child's
+    /// piece empty: `ind_empty` for a field of type `T_j` (`p_Param_ind`,
+    /// before any cast), a fold for a constructor around `T_j`.
     fn regions_in_empty_children(
         &mut self,
         base: Place<'vir>,
@@ -548,15 +549,15 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 };
                 let k = part.read.read(*key);
                 let tau = args.get_ty()[*j];
-                let has_ind = TyHasIndEnc::has_ind_fn().call()(tau);
-                let no_ind = vir::expr! { !([has_ind]) };
+                let range = child_nodes.range(piece);
+                let nonempty = range.nonempty();
+                let is_empty = vir::expr! { !([nonempty]) };
                 let empty = if part.path.is_empty() {
-                    let query = child_nodes.piece(piece).query;
-                    (param_ind.empty.unwrap())(k, &[tau], &[], query).alloc()
+                    (param_ind.param.unwrap().empty)(k, &[tau], &[], range.lo, range.hi).alloc()
                 } else {
                     self.vcx.mk_fold_stmt(child_nodes.app(piece, k, None))
                 };
-                self.stmt(self.vcx.mk_if_stmt(no_ind, self.vcx.alloc_slice(&[empty]), &[]));
+                self.stmt(self.vcx.mk_if_stmt(is_empty, self.vcx.alloc_slice(&[empty]), &[]));
             }
         }
         Ok(())
@@ -621,7 +622,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 piece,
                 casters,
                 ty_args,
-                query: child_nodes.piece(piece).query,
+                range: child_nodes.range(piece),
             })
             .collect())
     }
@@ -781,7 +782,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                     key,
                     cast.ty_args.get_ty(),
                     cast.ty_args.get_const(),
-                    cast.query,
+                    cast.range.lo,
+                    cast.range.hi,
                 )
                 .alloc(),
             );
@@ -894,7 +896,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                     generic.upcast_ty(),
                     ty_args.get_ty(),
                     ty_args.get_const(),
-                    nodes.piece(piece).query,
+                    nodes.range(piece).lo,
+                    nodes.range(piece).hi,
                 )
                 .alloc(),
             );
@@ -1023,7 +1026,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                         key,
                         cast.ty_args.get_ty(),
                         cast.ty_args.get_const(),
-                        nodes.piece(piece).query,
+                        nodes.range(piece).lo,
+                        nodes.range(piece).hi,
                     )
                     .alloc(),
                 );

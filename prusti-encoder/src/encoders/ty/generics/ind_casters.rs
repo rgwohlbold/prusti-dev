@@ -16,20 +16,20 @@ use super::{GenericParamsEnc, casters::CastersEnc};
 /// The trusted casts of an indirect predicate between a type `X` and `Param`,
 /// for the same pairs as [`CastersEnc`]:
 /// ```text
-/// method make_generic_ind_X(k: s_X, T.., q: LifetimeQuery)
-///   requires p_X_ind(k, T.., q)
-///   ensures  p_Param_ind(make_generic_s_X(k, T..), X_type(T..), q)
-///   ensures  pre(q) ==> forall K: s_X :: { ext_Param(make_generic_s_X(K, T..), X_type(T..), make_generic_s_X(k, T..), q) }
-///              agree(K, k) ==> ext_Param(..) == make_generic_s_X(old(ext_X(K, T.., k, q)), T..)
-/// method make_concrete_ind_X(p: s_Param, T.., q: LifetimeQuery)
-///   requires p_Param_ind(p, X_type(T..), q)
-///   ensures  p_X_ind(make_concrete_s_X(p), T.., q)
+/// method make_generic_ind_X(k: s_X, T.., lo: Int, hi: Int)
+///   requires p_X_ind(k, T.., lo, hi)
+///   ensures  p_Param_ind(make_generic_s_X(k, T..), X_type(T..), lo, hi)
+///   ensures  forall K: s_X :: { ext_Param(make_generic_s_X(K, T..), X_type(T..), make_generic_s_X(k, T..), lo, hi) }
+///              agree(K, k) ==> ext_Param(..) == make_generic_s_X(old(ext_X(K, T.., k, lo, hi)), T..)
+/// method make_concrete_ind_X(p: s_Param, T.., lo: Int, hi: Int)
+///   requires p_Param_ind(p, X_type(T..), lo, hi)
+///   ensures  p_X_ind(make_concrete_s_X(p), T.., lo, hi)
 ///   ensures  make_generic_s_X(make_concrete_s_X(p), T..) == p
-///   ensures  pre(q) ==> forall K: s_Param :: { ext_X(make_concrete_s_X(K), T.., make_concrete_s_X(p), q) }
+///   ensures  forall K: s_Param :: { ext_X(make_concrete_s_X(K), T.., make_concrete_s_X(p), lo, hi) }
 ///              agree(make_concrete_s_X(K), make_concrete_s_X(p)) ==>
-///                old(ext_Param(K, X_type(T..), p, q)) == make_generic_s_X(ext_X(..), T..)
+///                old(ext_Param(K, X_type(T..), p, lo, hi)) == make_generic_s_X(ext_X(..), T..)
 /// ```
-/// where `pre(q)` and `agree` are the preconditions of `ext_X`. The equations
+/// where `agree` is the precondition of `ext_X`. The equations
 /// are the only link between `ext_Param` and `ext_X`; the concrete one
 /// triggers on an `ext_X(make_concrete_s_X(K), ..)` term.
 pub(crate) struct IndCastersEnc;
@@ -48,7 +48,7 @@ pub(crate) struct IndCasters<'vir> {
 }
 
 pub(crate) type IndCaster<'vir> =
-    MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::LifetimeQuery)>;
+    MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int)>;
 
 impl<'vir> task_encoder::OutputRefAny for IndCasters<'vir> {}
 
@@ -78,7 +78,8 @@ impl TaskEncoder for IndCastersEnc {
                 concrete_snap,
                 generics.ty_args(),
                 generics.const_args(),
-                vir::TYPE_LIFETIME_QUERY,
+                vir::TYPE_INT,
+                vir::TYPE_INT,
             );
             let make_generic_ident = MethodIdn::new(
                 vir::vir_format_identifier!(vcx, "make_generic_ind_{base_name}"),
@@ -86,7 +87,7 @@ impl TaskEncoder for IndCastersEnc {
             );
             let make_concrete_ident = MethodIdn::new(
                 vir::vir_format_identifier!(vcx, "make_concrete_ind_{base_name}"),
-                (vir::TYPE_PSNAP.upcast_ty(), args.1, args.2, args.3),
+                (vir::TYPE_PSNAP.upcast_ty(), args.1, args.2, args.3, args.4),
             );
             let casters = deps.require_ref::<CastersEnc<Pure>>(*task_key)?;
             deps.emit_output_ref(
@@ -107,22 +108,23 @@ impl TaskEncoder for IndCastersEnc {
             let tys = generics.ty_exprs();
             let consts = generics.const_exprs();
             let lifted_ty = ty_constructor(tys, consts);
-            let q_decl = vcx.mk_local_decl("q", vir::TYPE_LIFETIME_QUERY);
-            let q = vcx.mk_local_ex(q_decl);
+            let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
+            let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
+            let (lo, hi) = (vcx.mk_local_ex(lo_decl), vcx.mk_local_ex(hi_decl));
 
             let make_generic =
                 |s: vir::ExprSnap<'vir>| (casters.make_generic)(s.downcast_ty(), tys, consts);
             let make_concrete =
                 |p: vir::ExprSnap<'vir>| casters.make_concrete.call()(p.downcast_ty()).upcast_ty();
             let concrete_pred = |k: vir::ExprSnap<'vir>| {
-                vir::expr! { vcx; acc([concrete_ind.pred](k, [..[tys]], [..[consts]], q)) }
+                vir::expr! { vcx; acc([concrete_ind.pred](k, [..[tys]], [..[consts]], lo, hi)) }
             };
             let no_consts: [vir::ExprCSnap<'vir>; 0] = [];
             let param_pred = |p: vir::ExprSnap<'vir>| {
-                vir::expr! { vcx; acc([param_ind.pred](p, [..[[lifted_ty]]], [..[no_consts]], q)) }
+                vir::expr! { vcx; acc([param_ind.pred](p, [..[[lifted_ty]]], [..[no_consts]], lo, hi)) }
             };
-            let concrete_ext = |k, kp| (concrete_ind.ext)(k, tys, consts, kp, q);
-            let param_ext = |p, pp| (param_ind.ext)(p, &[lifted_ty], &[], pp, q);
+            let concrete_ext = |k, kp| (concrete_ind.ext)(k, tys, consts, kp, lo, hi);
+            let param_ext = |p, pp| (param_ind.ext)(p, &[lifted_ty], &[], pp, lo, hi);
             // `forall K :: { trigger } agree ==> body`
             let equation = |k_decl: vir::LocalDeclSnap<'vir>,
                              trigger: vir::ExprSnap<'vir>,
@@ -158,7 +160,7 @@ impl TaskEncoder for IndCastersEnc {
             let generic_instance = vir::expr! { vcx; ([instance_value]) == ([instance_old]) };
             let make_generic_method = vcx.mk_method(
                 make_generic_ident,
-                (k_decl, generics.ty_decls(), generics.const_decls(), q_decl),
+                (k_decl, generics.ty_decls(), generics.const_decls(), lo_decl, hi_decl),
                 &[],
                 vcx.alloc_slice(&[concrete_pred(k)]),
                 vcx.alloc_slice(&[
@@ -192,7 +194,7 @@ impl TaskEncoder for IndCastersEnc {
             let round_trip = make_generic(make_concrete(p));
             let make_concrete_method = vcx.mk_method(
                 make_concrete_ident,
-                (p_decl, generics.ty_decls(), generics.const_decls(), q_decl),
+                (p_decl, generics.ty_decls(), generics.const_decls(), lo_decl, hi_decl),
                 &[],
                 vcx.alloc_slice(&[param_pred(p)]),
                 vcx.alloc_slice(&[

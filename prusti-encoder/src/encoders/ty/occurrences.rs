@@ -8,15 +8,17 @@
 //! pointers). `a` encloses `b` if `a` is the lifetime of a `&mut` whose
 //! referent contains `b`, either syntactically or through the definition of a
 //! type constructor (e.g. `Node<'a, 'b>`: `'a` encloses `'b`).
+//!
+//! Every occurrence has a position (see `Pos`): the lifetime positions of a
+//! type expression are numbered flat, a constructor's own lifetimes first (in
+//! topological order of enclosure, enclosing ones first), then the positions
+//! of its type arguments. A type parameter `T` covers `arity(T)` positions.
 
 use std::collections::{BTreeSet, HashMap};
 
 use prusti_rustc_interface::middle::ty;
 
-use super::{
-    RustParamData, RustTy, RustTyDecomposition, TySpecifics, generics::GParams,
-    lifetime_query::LifetimeQueryFns,
-};
+use super::{RustParamData, RustTy, RustTyDecomposition, TySpecifics, generics::GParams};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Step {
@@ -40,31 +42,61 @@ pub struct Occurrence<'tcx> {
     pub end: End<'tcx>,
     /// The (indices of the) occurrences enclosing this one.
     pub parents: Vec<usize>,
+    /// The first position the occurrence covers.
+    pub pos: Pos,
 }
 
-/// The occurrences of `decomp`, enclosing ones first.
+impl<'tcx> Occurrence<'tcx> {
+    /// The type parameter whose `arity` positions the occurrence covers;
+    /// `None` for a region (one position).
+    pub fn width_param(&self) -> Option<ty::ParamTy> {
+        match self.end {
+            End::Region(_) => None,
+            End::Param(param) => Some(param),
+        }
+    }
+}
+
+/// A position: `konst + Σ arity(param)` over `params`, type parameters of the
+/// context of the type expression.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct Pos {
+    pub konst: usize,
+    pub params: Vec<ty::ParamTy>,
+}
+
+/// The occurrences of `decomp`, in position order (enclosing ones first).
 pub fn occurrences<'tcx>(decomp: RustTyDecomposition<'tcx>) -> Result<Vec<Occurrence<'tcx>>, String> {
     let mut walker = Walker::default();
     let mut found = Found::default();
     walker.walk(decomp, &mut Vec::new(), &mut found);
-    sort(found).ok_or_else(|| format!("lifetimes enclosing each other are not supported ({decomp:?})"))
-}
-
-/// The query selecting the occurrence `path`; for a type parameter
-/// occurrence, `rest` selects inside it.
-pub fn occurrence_query<'vir>(
-    fns: &LifetimeQueryFns<'vir>,
-    path: &[Step],
-    rest: Option<vir::ExprLifetimeQuery<'vir>>,
-) -> vir::ExprLifetimeQuery<'vir> {
-    let (init, last) = match path.last() {
-        Some(Step::Here(i)) => (&path[..path.len() - 1], fns.one(*i)),
-        _ => (path, rest.expect("a type parameter occurrence needs the rest of its query")),
-    };
-    init.iter().rev().fold(last, |q, step| match step {
-        Step::In(j) => fns.arg(*j, q),
-        Step::Here(_) => unreachable!("`Here` ends a path"),
-    })
+    // the own lifetimes of a constructor whose lifetimes enclose each other
+    // cannot be ordered
+    if found.pairs.iter().any(|(a, b)| a > b) {
+        return Err(format!("lifetimes enclosing each other are not supported ({decomp:?})"));
+    }
+    let mut pos = Pos::default();
+    Ok(found
+        .list
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (path, end))| {
+            let mut parents = found
+                .pairs
+                .iter()
+                .filter(|(a, b)| *b == idx && *a != idx)
+                .map(|(a, _)| *a)
+                .collect::<Vec<_>>();
+            parents.sort();
+            parents.dedup();
+            let occurrence = Occurrence { path, end, parents, pos: pos.clone() };
+            match end {
+                End::Region(_) => pos.konst += 1,
+                End::Param(param) => pos.params.push(param),
+            }
+            occurrence
+        })
+        .collect())
 }
 
 /// The position of the generic parameter `index` of `params` among those of
@@ -102,6 +134,24 @@ struct Summary {
     rel: BTreeSet<(usize, Target)>,
 }
 
+impl Summary {
+    /// The own lifetimes in position order: enclosing ones first, otherwise
+    /// in declaration order (on a cycle, the rest in declaration order).
+    fn own_order(&self) -> Vec<usize> {
+        let mut order = Vec::new();
+        while order.len() < self.lifetimes.len() {
+            let mut rest = self.lifetimes.iter().copied().filter(|i| !order.contains(i));
+            let next = rest.clone().find(|b| {
+                self.rel
+                    .iter()
+                    .all(|(a, t)| *t != Target::Lifetime(*b) || order.contains(a))
+            });
+            order.push(next.or_else(|| rest.next()).unwrap());
+        }
+        order
+    }
+}
+
 #[derive(Default)]
 struct Walker<'tcx> {
     done: HashMap<RustTy<'tcx>, Summary>,
@@ -136,16 +186,16 @@ impl<'tcx> Walker<'tcx> {
             }
             TySpecifics::StructLike(_) | TySpecifics::EnumLike(_) => {
                 let summary = self.summary(decomp.ty);
+                let regions = decomp
+                    .args
+                    .args()
+                    .iter()
+                    .filter_map(|arg| arg.as_region())
+                    .collect::<Vec<_>>();
                 let mut lifetimes = HashMap::new();
-                let mut i = 0;
-                for arg in decomp.args.args() {
-                    if let Some(region) = arg.as_region() {
-                        if summary.lifetimes.contains(&i) {
-                            lifetimes.insert(i, found.list.len());
-                            found.list.push((with(prefix, Step::Here(i)), End::Region(region)));
-                        }
-                        i += 1;
-                    }
+                for i in summary.own_order() {
+                    lifetimes.insert(i, found.list.len());
+                    found.list.push((with(prefix, Step::Here(i)), End::Region(regions[i])));
                 }
                 let mut tys = HashMap::new();
                 for j in summary.tys.iter().copied() {
@@ -263,39 +313,4 @@ fn with(prefix: &[Step], step: Step) -> Vec<Step> {
     let mut path = prefix.to_vec();
     path.push(step);
     path
-}
-
-/// Sorts enclosing occurrences first (otherwise in walk order); `None` on a
-/// cycle.
-fn sort(found: Found<'_>) -> Option<Vec<Occurrence<'_>>> {
-    let n = found.list.len();
-    let mut order = Vec::with_capacity(n);
-    while order.len() < n {
-        let next = (0..n).find(|b| {
-            !order.contains(b)
-                && found
-                    .pairs
-                    .iter()
-                    .all(|(a, b2)| b2 != b || a == b || order.contains(a))
-        })?;
-        order.push(next);
-    }
-    let new_index = |old: usize| order.iter().position(|o| *o == old).unwrap();
-    Some(
-        order
-            .iter()
-            .map(|old| {
-                let (path, end) = found.list[*old].clone();
-                let mut parents = found
-                    .pairs
-                    .iter()
-                    .filter(|(a, b)| b == old && a != old)
-                    .map(|(a, _)| new_index(*a))
-                    .collect::<Vec<_>>();
-                parents.sort();
-                parents.dedup();
-                Occurrence { path, end, parents }
-            })
-            .collect(),
-    )
 }

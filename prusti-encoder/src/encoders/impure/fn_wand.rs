@@ -198,7 +198,11 @@ impl<'vir> WandEncOutput<'vir> {
                 let args = deps
                     .require_dep::<GArgsTyEnc>(decomp.args.substitute(ctx))
                     .map_err(|err| format!("type arguments of `{arg_ty}`: {err:?}"))?;
-                nodes.with_args(args)
+                // the callee's type parameters, for the positions
+                let context = deps
+                    .require_dep::<GArgsTyEnc>(ctx)
+                    .map_err(|err| format!("type arguments of the call: {err:?}"))?;
+                nodes.with_args(args, context)
             }
         };
         Ok(Some((nodes, node)))
