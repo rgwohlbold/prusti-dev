@@ -761,6 +761,13 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         place: Place<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> EncodeResult<'vir, (), E> {
+        // the children's pieces that are still to be folded (their parts were
+        // collapsed in this phase): fold them first
+        let (children, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_aggregates)
+            .into_iter()
+            .partition(|(target, _)| target.place().last_projection().is_some_and(|(parent, _)| parent == place));
+        self.pending_aggregates = rest;
+        self.fold_aggregate_targets(children)?;
         let mut casts = Vec::new();
         for expansion in self.open_expansions.clone() {
             let Some((base, _, children)) = Self::lp_expansion_any(&expansion) else {
@@ -1034,6 +1041,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             }
         }
         let aggregates = std::mem::take(&mut self.pending_aggregates);
+        self.fold_aggregate_targets(aggregates)
+    }
+
+    /// Fold the pieces of the values built from parts `aggregates`.
+    fn fold_aggregate_targets(
+        &mut self,
+        aggregates: Vec<(MaybeLabelledPlace<'vir>, usize)>,
+    ) -> EncodeResult<'vir, (), E> {
         let mut by_place: Vec<(Place<'vir>, Vec<usize>)> = Vec::new();
         for (target, idx) in aggregates {
             let place = target.place();
