@@ -269,12 +269,31 @@ impl<'vir> WandEncOutput<'vir> {
         deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
         g: impl Into<FunctionShapeNode<Generalized>>,
         call_ctx: WandCallContext<'vir>,
+        snap: impl FnMut(mir::Local) -> vir::ExprSnap<'vir>,
+    ) -> Option<vir::ExprBool<'vir>> {
+        self.encode_predicates_at(vcx, deps, g, call_ctx, snap, &[])
+    }
+
+    /// As `encode_predicates_for_function_shape_node`, with the key steps over
+    /// the nodes of `at_old` (of the same local) in the pre-state.
+    fn encode_predicates_at(
+        &self,
+        vcx: &'vir vir::VirCtxt<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
+        g: impl Into<FunctionShapeNode<Generalized>>,
+        call_ctx: WandCallContext<'vir>,
         mut snap: impl FnMut(mir::Local) -> vir::ExprSnap<'vir>,
+        at_old: &[FunctionShapeInput<Generalized>],
     ) -> Option<vir::ExprBool<'vir>> {
         let g = g.into();
         let (nodes, node) = self.function_shape_node(vcx, deps, g, call_ctx).unwrap()?;
+        let old_nodes = at_old
+            .iter()
+            .filter(|i| i.mir_local() == g.mir_local())
+            .filter_map(|i| Some(self.function_shape_node(vcx, deps, (*i).into(), call_ctx).ok()??.1))
+            .collect::<Vec<_>>();
         let snap = self.callee_snap(vcx, deps, g, call_ctx, snap(g.mir_local()));
-        nodes.pred(node, snap)
+        nodes.pred_with(node, snap, |idx| old_nodes.contains(&idx))
     }
 
     pub fn indirect_pres<'a, E: TaskEncoder>(
@@ -308,12 +327,19 @@ impl<'vir> WandEncOutput<'vir> {
             .filter(|i| !self.blocked_inputs().contains(i))
             .collect::<Vec<_>>();
         unblocked_inputs.sort_by_cached_key(|g| self.node_rank(vcx, deps, (*g).into()));
+        // the chain keys read the blocked pieces at the pre-state
+        let blocked = self.blocked_inputs().into_iter().collect::<Vec<_>>();
         let unblocked_input_posts = unblocked_inputs
             .into_iter()
             .filter_map(|lp| {
-                self.encode_predicates_for_function_shape_node(vcx, deps, lp, None, |i| {
-                    vcx.mk_old_expr(local_defs[i].impure_snap)
-                })
+                self.encode_predicates_at(
+                    vcx,
+                    deps,
+                    lp,
+                    None,
+                    |i| vcx.mk_old_expr(local_defs[i].impure_snap),
+                    &blocked,
+                )
             })
             .collect::<Vec<_>>()
             .into_iter();

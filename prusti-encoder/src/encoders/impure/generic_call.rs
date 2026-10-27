@@ -1,14 +1,12 @@
 //! Calls to generic callees: a callee's contract names one piece per type
 //! parameter occurrence (`RegionsIn(T)`, the positions `lo .. hi` of `T`),
 //! while the caller holds one piece per lifetime occurrence of the
-//! instantiation (its pieces under the occurrence's path, in position order).
-//! Before the call the caller's pieces are merged into the callee's piece:
-//! re-keyed to chain keys (the first piece's key, extended by the previous
-//! pieces), cast to `p_Param_ind` of the argument's type, merged with
+//! instantiation (its pieces under the occurrence's path, in position order,
+//! chain-keyed as `merge_Param` expects). Before the call the caller's pieces
+//! are cast to `p_Param_ind` of the argument's type, merged with
 //! `merge_Param` (right to left) and, below the top of the argument, cast
 //! back. After the call they are split again in reverse (`split_Param` left
-//! to right) and re-keyed to their own keys (extended by their enclosing
-//! pieces only).
+//! to right).
 
 use prusti_rustc_interface::middle::mir;
 use task_encoder::TaskEncoder;
@@ -38,9 +36,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         generic: &[GenericNode<'vir>],
         args: &[(prusti_rustc_interface::middle::ty::Ty<'vir>, vir::ExprSnap<'vir>)],
     ) -> EncodeResult<'vir, (), E> {
-        for node in generic.iter().filter(|n| n.blocked.is_some()) {
-            let (ty, snap) = args[node.local.as_usize() - 1];
-            self.convert_node(ty, snap, node, true)?;
+        for nodes in by_local(generic.iter().filter(|n| n.blocked.is_some())) {
+            let (ty, snap) = args[nodes[0].local.as_usize() - 1];
+            self.convert_nodes(ty, snap, &nodes, true)?;
         }
         Ok(())
     }
@@ -55,12 +53,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         dest: mir::Place<'vir>,
         label_pre: &'vir str,
     ) -> EncodeResult<'vir, (), E> {
-        for node in generic {
+        let returned = generic.iter().filter(|n| match n.blocked {
+            Some(blocked) => !blocked,
+            None => n.local == mir::RETURN_PLACE,
+        });
+        for nodes in by_local(returned) {
+            let node = nodes[0];
             let (place, snap) = match node.blocked {
-                Some(true) => continue,
-                // the post-state of an argument: given back with the argument
-                None if node.local != mir::RETURN_PLACE => continue,
-                Some(false) => {
+                Some(_) => {
                     let Some(place) = args[node.local.as_usize() - 1] else { continue };
                     let snap = self.encode_place_with_snap(place.into())?.1;
                     (place, self.vcx.mk_local_labelled_old_expr(snap, label_pre))
@@ -68,7 +68,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 None => (dest, self.encode_place_with_snap(dest.into())?.1),
             };
             let ty = place.ty(self.local_decls, self.vcx.tcx()).ty;
-            self.convert_node(ty, snap, node, false)?;
+            self.convert_nodes(ty, snap, &nodes, false)?;
         }
         Ok(())
     }
@@ -82,9 +82,11 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         ty: prusti_rustc_interface::middle::ty::Ty<'vir>,
         snap: vir::ExprSnap<'vir>,
     ) -> EncodeResult<'vir, (), E> {
-        for node in generic.iter().filter(|n| n.blocked.is_none() && n.local == mir::RETURN_PLACE) {
-            self.convert_node(ty, snap, node, true)?;
-        }
+        let nodes = generic
+            .iter()
+            .filter(|n| n.blocked.is_none() && n.local == mir::RETURN_PLACE)
+            .collect::<Vec<_>>();
+        self.convert_nodes(ty, snap, &nodes, true)?;
         Ok(())
     }
 
@@ -96,25 +98,27 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         generic: &[GenericNode<'vir>],
         args: &[(prusti_rustc_interface::middle::ty::Ty<'vir>, vir::ExprSnap<'vir>)],
     ) -> EncodeResult<'vir, (), E> {
-        for node in generic.iter().filter(|n| n.blocked == Some(true)) {
-            let (ty, snap) = args[node.local.as_usize() - 1];
-            self.convert_node(ty, snap, node, false)?;
+        for nodes in by_local(generic.iter().filter(|n| n.blocked == Some(true))) {
+            let (ty, snap) = args[nodes[0].local.as_usize() - 1];
+            self.convert_nodes(ty, snap, &nodes, false)?;
         }
         Ok(())
     }
 
     /// Merge (`into_callee`) or split the caller's pieces of a value of type
-    /// `ty` (with snapshot `snap`) at the positions of the callee's `node`.
-    fn convert_node(
+    /// `ty` (with snapshot `snap`) at the positions of the callee's `nodes`
+    /// (of the same value).
+    fn convert_nodes(
         &mut self,
         ty: prusti_rustc_interface::middle::ty::Ty<'vir>,
         snap: vir::ExprSnap<'vir>,
-        node: &GenericNode<'vir>,
+        nodes: &[&GenericNode<'vir>],
         into_callee: bool,
     ) -> EncodeResult<'vir, (), E> {
         let decomp = RustTyDecomposition::from_ty(ty, self.def_id);
         let caller = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
-        for g in node.nodes.pieces_of(node.node) {
+        let mut groups = Vec::new();
+        for (node, g) in nodes.iter().flat_map(|n| n.nodes.pieces_of(n.node).into_iter().map(move |g| (*n, g))) {
             let path = node.nodes.piece(g).path.clone();
             // generic in the caller as well: the same piece
             if decomp.ty.specifics.is_param() || caller.find(&path).is_some_and(|c| caller.piece(c).all) {
@@ -130,6 +134,16 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             if group.len() == 1 && !top || group.is_empty() && !into_callee {
                 continue;
             }
+            // bound before any group is merged or split: the caller's key of
+            // the first piece, or the callee's key
+            let key = match group.first() {
+                Some(c) if into_callee => Some(self.bind(caller.key(*c, snap))),
+                Some(_) if !top => Some(self.bind(node.nodes.key(g, snap))),
+                _ => None,
+            };
+            groups.push((node, g, group, top, key));
+        }
+        for (node, g, group, top, key) in groups {
             let range = node.nodes.range(g);
             let c = self.group_casts(decomp)?;
             if group.is_empty() {
@@ -142,9 +156,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                     self.stmt(self.vcx.mk_fold_stmt(caller.app_range(range, key, None)));
                 }
             } else if into_callee {
-                self.merge_pieces(&c, &caller, &group, snap, range, top);
+                self.merge_pieces(&c, &caller, &group, key.unwrap(), range, top);
             } else {
-                let key = (!top).then(|| self.bind(node.nodes.key(g, snap)));
                 self.split_pieces(&c, &caller, &group, snap, range, key);
             }
         }
@@ -165,34 +178,22 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         })
     }
 
-    /// Re-key the caller's piece `c` from `from` to `to` (unfold, fold).
-    fn rekey(&mut self, caller: &IndirectNodes<'vir>, c: usize, from: vir::ExprSnap<'vir>, to: vir::ExprSnap<'vir>) {
-        let range = caller.range(c);
-        self.stmt(self.vcx.mk_unfold_stmt(caller.app_range(range, from, None)));
-        self.stmt(self.vcx.mk_fold_stmt(caller.app_range(range, to, None)));
-    }
-
-    /// Before a call: merge the caller's pieces `group` (of a value with
-    /// snapshot `snap`) into the callee's piece of `range`: of the caller's
-    /// type (keyed by the first piece's key), or at the `top` its cast.
+    /// Before a call: merge the caller's pieces `group` (the first keyed by
+    /// `first`, the others by its chain) into the callee's piece of `range`:
+    /// of the caller's type, or at the `top` its cast.
     fn merge_pieces(
         &mut self,
         c: &GroupCasts<'vir>,
         caller: &IndirectNodes<'vir>,
         group: &[usize],
-        snap: vir::ExprSnap<'vir>,
+        first: vir::ExprSnap<'vir>,
         range: Range<'vir>,
         top: bool,
     ) {
-        // the pieces' own keys, while all are held
-        let own_keys = group.iter().map(|p| self.bind(caller.key(*p, snap))).collect::<Vec<_>>();
-        // re-key to chain keys, in position order
-        let mut chain = vec![own_keys[0]];
-        for (i, p) in group.iter().enumerate().skip(1) {
-            let prev = chain[i - 1];
-            let key = self.bind(caller.ext(prev, prev, caller.range(group[i - 1])));
-            self.rekey(caller, *p, own_keys[i], key);
-            chain.push(key);
+        let mut chain = vec![first];
+        for p in &group[..group.len() - 1] {
+            let prev = *chain.last().unwrap();
+            chain.push(self.bind(caller.ext(prev, prev, caller.range(*p))));
         }
         for (p, k) in group.iter().zip(&chain) {
             let r = caller.range(*p);
@@ -232,11 +233,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         for (p, k) in group.iter().zip(&chain) {
             self.stmt(c.make_concrete(*k, caller.range(*p)));
         }
-        // re-key to the pieces' own keys, enclosing ones first
-        for (p, k) in group.iter().zip(&chain).skip(1) {
-            let own_key = self.bind(caller.key(*p, snap));
-            self.rekey(caller, *p, c.casters.make_concrete_s.call()(k.downcast_ty()).upcast_ty(), own_key);
-        }
     }
 
     /// A fresh variable holding `expr` (a key read before the pieces it reads
@@ -270,4 +266,16 @@ impl<'vir> GroupCasts<'vir> {
     fn make_concrete(&self, p: vir::ExprSnap<'vir>, r: Range<'vir>) -> vir::Stmt<'vir> {
         (self.casters.make_concrete)(p, self.args.get_ty(), self.args.get_const(), r.lo, r.hi).alloc()
     }
+}
+
+/// The nodes grouped by their local (in order of first appearance).
+fn by_local<'a, 'vir>(nodes: impl Iterator<Item = &'a GenericNode<'vir>>) -> Vec<Vec<&'a GenericNode<'vir>>> {
+    let mut groups: Vec<Vec<&GenericNode<'vir>>> = Vec::new();
+    for node in nodes {
+        match groups.iter_mut().find(|g| g[0].local == node.local) {
+            Some(group) => group.push(node),
+            None => groups.push(vec![node]),
+        }
+    }
+    groups
 }

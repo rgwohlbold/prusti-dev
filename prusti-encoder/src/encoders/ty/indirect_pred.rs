@@ -20,8 +20,8 @@ use super::{
 ///   `X` reaches through the references of its lifetime positions `lo .. hi`
 ///   (see `occurrences`). Its body holds, per field and per occurrence of a
 ///   parameter of `X` in the field's type, the field's piece for the part of
-///   the range at that occurrence. The key is the shallow snapshot of the
-///   value, extended by the enclosing occurrences in the range.
+///   the range at that occurrence, keyed by the field's key extended by the
+///   earlier occurrences in the range.
 /// - the key extension `ext_X(K: s_X, T.., Kp: s_X, lo: Int, hi: Int): s_X`:
 ///   the key `K` with the cells owned by the piece `p_X_ind(Kp, .., lo, hi)`
 ///   read in (`K` itself for an empty range). `K` supplies the values, `Kp`
@@ -593,26 +593,23 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
     }
 
     /// The keys of the occurrences in a field with key `key` (`None` for an
-    /// occurrence of no parameter): extended by the enclosing occurrences in
-    /// the range (the others are in `key` already).
+    /// occurrence of no parameter): extended by the earlier occurrences in the
+    /// range (the lower positions outside it are in `key` already).
     fn occurrence_keys(
         &mut self,
         field: &FieldOccurrences<'vir>,
         key: vir::ExprSnap<'vir>,
     ) -> EncResult<'vir, Vec<Option<vir::ExprSnap<'vir>>>> {
         let mut keys: Vec<Option<vir::ExprSnap<'vir>>> = Vec::new();
-        for (idx, occurrence) in field.occurrences.iter().enumerate() {
+        for idx in 0..field.occurrences.len() {
             if field.params[idx].is_none() {
                 keys.push(None);
                 continue;
             }
             let mut occurrence_key = key;
-            for parent in &occurrence.parents {
-                let (Some(parent_key), Some(range)) = (keys[*parent], self.occurrence_range(field, *parent))
-                else {
-                    continue;
-                };
-                occurrence_key = self.ext(field.ty, occurrence_key, parent_key, range.0)?;
+            for earlier in 0..idx {
+                let Some(range) = self.occurrence_range(field, earlier) else { continue };
+                occurrence_key = self.ext(field.ty, occurrence_key, occurrence_key, range.0)?;
             }
             keys.push(Some(occurrence_key));
         }

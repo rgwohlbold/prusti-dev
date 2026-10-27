@@ -66,10 +66,9 @@ pub fn node_for_generalized_idx<'tcx>(
 /// Encodes, for a type `T` (the type of the base of PCG lifetime projection
 /// nodes), the indirect pieces of each node `p↓r`: one per occurrence of the
 /// region `r` in `T` (see `occurrences`), `p_T_ind(key, .., lo, hi)` for the
-/// positions `lo .. hi` of the occurrence. The key is the snapshot `S` of `p`
-/// if no other occurrence encloses it; otherwise it is `S` extended by the
-/// pieces of the enclosing occurrences, outer ones first:
-/// `ext_T(.. ext_T(S, .., key(o_1), r_o1) .., key(o_k), r_ok)`.
+/// positions `lo .. hi` of the occurrence. The key of the piece at position
+/// `lo` is the snapshot `S` of `p` extended by the pieces of the positions
+/// `0 .. lo` in order: `K_0 = S`, `K_i+1 = ext_T(K_i, .., K_i, r_i)`.
 pub struct IndirectNodesEnc;
 
 /// The piece of one occurrence of a region (one position), or of a type
@@ -188,16 +187,14 @@ impl<'vir> IndirectNodes<'vir> {
         self.ind.ext.call()(k, tys, consts, kp, lo, hi)
     }
 
-    /// The key of `piece`, for the snapshot `s` of `p`.
+    /// The key of `piece`, for the snapshot `s` of `p`: `s` extended by the
+    /// pieces of all lower positions (a chain key).
     pub fn key<Curr, Next>(
         &self,
         piece: usize,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        self.pieces[piece].parents.iter().fold(s, |k, parent| {
-            let parent_key = self.key(*parent, s);
-            self.ext(k, parent_key, self.range(*parent))
-        })
+        (0..piece).fold(s, |k, lower| self.ext(k, k, self.range(lower)))
     }
 
     /// The predicate application of `piece` with the given key.
@@ -230,7 +227,31 @@ impl<'vir> IndirectNodes<'vir> {
 
     /// The predicate of node `p↓idx`, `None` if it holds nothing.
     pub fn pred(&self, idx: RegionIdx, s: vir::ExprSnap<'vir>) -> Option<vir::ExprBool<'vir>> {
-        let apps = self.apps(idx, s);
+        self.pred_with(idx, s, |_| false)
+    }
+
+    /// As [Self::pred], with the key steps over the pieces of the nodes in
+    /// `at_old` evaluated in the pre-state (`old`), e.g. those a result took.
+    pub fn pred_with(
+        &self,
+        idx: RegionIdx,
+        s: vir::ExprSnap<'vir>,
+        at_old: impl Fn(RegionIdx) -> bool,
+    ) -> Option<vir::ExprBool<'vir>> {
+        let apps = self
+            .pieces_of(idx)
+            .into_iter()
+            .map(|piece| {
+                let key = (0..piece).fold(s, |k, lower| {
+                    let ext = self.ext(k, k, self.range(lower));
+                    match at_old(self.pieces[lower].node) {
+                        true => vir::with_vcx(|vcx| vcx.mk_old_expr(ext)),
+                        false => ext,
+                    }
+                });
+                self.app(piece, key, None)
+            })
+            .collect::<Vec<_>>();
         vir::with_vcx(|vcx| {
             (!apps.is_empty()).then(|| {
                 vcx.mk_conj(

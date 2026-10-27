@@ -191,10 +191,9 @@ impl<'vir> ReferentPieces<'vir> {
         p: vir::ExprSnap<'vir>,
         tys: &'vir [vir::ExprTyVal<'vir>],
     ) -> vir::ExprSnap<'vir> {
-        self.nodes.parents(r).iter().fold(p, |k, parent| {
-            let parent_key = self.generic_key(*parent, p, tys);
-            let range = self.nodes.range(*parent);
-            (self.param_ext)(k, tys, &[], parent_key, range.lo, range.hi)
+        (0..r).fold(p, |k, lower| {
+            let range = self.nodes.range(lower);
+            (self.param_ext)(k, tys, &[], k, range.lo, range.hi)
         })
     }
 }
