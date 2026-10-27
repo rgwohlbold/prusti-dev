@@ -193,7 +193,7 @@ impl<'vir> ReferentPieces<'vir> {
     ) -> vir::ExprSnap<'vir> {
         (0..r).fold(p, |k, lower| {
             let range = self.nodes.range(lower);
-            (self.param_ext)(k, tys, &[], k, range.lo, range.hi)
+            (self.param_ext)(k, tys, &[], range.lo, range.hi)
         })
     }
 }

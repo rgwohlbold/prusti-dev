@@ -1,5 +1,5 @@
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::{CastType, MethodIdn, Reify};
+use vir::{CastType, MethodIdn};
 
 use crate::encoders::{
     Pure,
@@ -19,19 +19,16 @@ use super::{GenericParamsEnc, casters::CastersEnc};
 /// method make_generic_ind_X(k: s_X, T.., lo: Int, hi: Int)
 ///   requires p_X_ind(k, T.., lo, hi)
 ///   ensures  p_Param_ind(make_generic_s_X(k, T..), X_type(T..), lo, hi)
-///   ensures  forall K: s_X :: { ext_Param(make_generic_s_X(K, T..), X_type(T..), make_generic_s_X(k, T..), lo, hi) }
-///              agree(K, k) ==> ext_Param(..) == make_generic_s_X(old(ext_X(K, T.., k, lo, hi)), T..)
+///   ensures  ext_Param(make_generic_s_X(k, T..), X_type(T..), lo, hi)
+///              == make_generic_s_X(old(ext_X(k, T.., lo, hi)), T..)
 /// method make_concrete_ind_X(p: s_Param, T.., lo: Int, hi: Int)
 ///   requires p_Param_ind(p, X_type(T..), lo, hi)
 ///   ensures  p_X_ind(make_concrete_s_X(p), T.., lo, hi)
 ///   ensures  make_generic_s_X(make_concrete_s_X(p), T..) == p
-///   ensures  forall K: s_Param :: { ext_X(make_concrete_s_X(K), T.., make_concrete_s_X(p), lo, hi) }
-///              agree(make_concrete_s_X(K), make_concrete_s_X(p)) ==>
-///                old(ext_Param(K, X_type(T..), p, lo, hi)) == make_generic_s_X(ext_X(..), T..)
+///   ensures  old(ext_Param(p, X_type(T..), lo, hi))
+///              == make_generic_s_X(ext_X(make_concrete_s_X(p), T.., lo, hi), T..)
 /// ```
-/// where `agree` is the precondition of `ext_X`. The equations
-/// are the only link between `ext_Param` and `ext_X`; the concrete one
-/// triggers on an `ext_X(make_concrete_s_X(K), ..)` term.
+/// The equations are the only link between `ext_Param` and `ext_X`.
 pub(crate) struct IndCastersEnc;
 
 // TODO: remove once the impure encoder casts indirect predicates.
@@ -102,7 +99,6 @@ impl TaskEncoder for IndCastersEnc {
 
             let ty_constructor = deps.require_ref::<TyConstructorEnc>(concrete)?.ty_constructor;
             let concrete_ind = deps.require_ref::<TyIndirectEnc>(concrete)?;
-            let concrete_dep = deps.require_dep::<TyIndirectEnc>(concrete)?;
             let param_ind = deps.require_ref::<TyIndirectEnc>(param)?;
 
             let tys = generics.ty_exprs();
@@ -123,41 +119,14 @@ impl TaskEncoder for IndCastersEnc {
             let param_pred = |p: vir::ExprSnap<'vir>| {
                 vir::expr! { vcx; acc([param_ind.pred](p, [..[[lifted_ty]]], [..[no_consts]], lo, hi)) }
             };
-            let concrete_ext = |k, kp| (concrete_ind.ext)(k, tys, consts, kp, lo, hi);
-            let param_ext = |p, pp| (param_ind.ext)(p, &[lifted_ty], &[], pp, lo, hi);
-            // `forall K :: { trigger } agree ==> body`
-            let equation = |k_decl: vir::LocalDeclSnap<'vir>,
-                             trigger: vir::ExprSnap<'vir>,
-                             agree: Option<vir::ExprBool<'vir>>,
-                             body: vir::ExprBool<'vir>| {
-                let body = match agree {
-                    Some(agree) => vir::expr! { vcx; ([agree]) ==> ([body]) },
-                    None => body,
-                };
-                vir::expr! { vcx; forall [k_decl] :: {[trigger]} [body] }
-            };
+            let concrete_ext = |k| (concrete_ind.ext)(k, tys, consts, lo, hi);
+            let param_ext = |p| (param_ind.ext)(p, &[lifted_ty], &[], lo, hi);
 
             // make_generic_ind_X
             let k_decl = vcx.mk_local_decl("k", concrete_snap);
             let k = vcx.mk_local_ex(k_decl);
-            let big_k_decl = vcx.mk_local_decl("K", concrete_snap);
-            let big_k = vcx.mk_local_ex(big_k_decl);
-            let generic_ext = param_ext(make_generic(big_k).upcast_ty(), make_generic(k).upcast_ty());
-            let generic_ext_value = generic_ext.downcast_ty::<vir::PSnap>();
-            let generic_ext_old = make_generic(vir::expr! { vcx; old([concrete_ext(big_k, k)]) });
-            let generic_equation = equation(
-                big_k_decl,
-                generic_ext,
-                concrete_dep.agree.map(|agree| agree.reify(vcx, (big_k, k))),
-                vir::expr! { vcx; ([generic_ext_value]) == ([generic_ext_old]) },
-            );
-            // The instance `K := k` (the piece's own key) of the equation,
-            // stated explicitly so that its terms exist after the call (the
-            // quantified version needs a trigger term).
-            let k_generic = make_generic(k).upcast_ty();
-            let instance_value = param_ext(k_generic, k_generic).downcast_ty::<vir::PSnap>();
-            let instance_old = make_generic(vir::expr! { vcx; old([concrete_ext(k, k)]) });
-            let generic_instance = vir::expr! { vcx; ([instance_value]) == ([instance_old]) };
+            let generic_ext = param_ext(make_generic(k).upcast_ty()).downcast_ty::<vir::PSnap>();
+            let generic_ext_old = make_generic(vir::expr! { vcx; old([concrete_ext(k)]) });
             let make_generic_method = vcx.mk_method(
                 make_generic_ident,
                 (k_decl, generics.ty_decls(), generics.const_decls(), lo_decl, hi_decl),
@@ -165,8 +134,7 @@ impl TaskEncoder for IndCastersEnc {
                 vcx.alloc_slice(&[concrete_pred(k)]),
                 vcx.alloc_slice(&[
                     param_pred(make_generic(k).upcast_ty()),
-                    generic_equation,
-                    generic_instance,
+                    vir::expr! { vcx; ([generic_ext]) == ([generic_ext_old]) },
                 ]),
                 None,
             );
@@ -174,23 +142,8 @@ impl TaskEncoder for IndCastersEnc {
             // make_concrete_ind_X
             let p_decl = vcx.mk_local_decl("p", vir::TYPE_PSNAP.upcast_ty());
             let p = vcx.mk_local_ex(p_decl);
-            let big_p_decl = vcx.mk_local_decl("K", vir::TYPE_PSNAP.upcast_ty());
-            let big_p = vcx.mk_local_ex(big_p_decl);
-            let concrete_ext_app = concrete_ext(make_concrete(big_p), make_concrete(p));
-            let param_ext_old = vir::expr! { vcx; old([param_ext(big_p, p)]) }.downcast_ty::<vir::PSnap>();
-            let concrete_ext_value = make_generic(concrete_ext_app);
-            let concrete_equation = equation(
-                big_p_decl,
-                concrete_ext_app,
-                concrete_dep
-                    .agree
-                    .map(|agree| agree.reify(vcx, (make_concrete(big_p), make_concrete(p)))),
-                vir::expr! { vcx; ([param_ext_old]) == ([concrete_ext_value]) },
-            );
-            // the instance `K := p` (see `make_generic_ind_X`)
-            let instance_old = vir::expr! { vcx; old([param_ext(p, p)]) }.downcast_ty::<vir::PSnap>();
-            let instance_value = make_generic(concrete_ext(make_concrete(p), make_concrete(p)));
-            let concrete_instance = vir::expr! { vcx; ([instance_old]) == ([instance_value]) };
+            let param_ext_old = vir::expr! { vcx; old([param_ext(p)]) }.downcast_ty::<vir::PSnap>();
+            let concrete_ext_value = make_generic(concrete_ext(make_concrete(p)));
             let round_trip = make_generic(make_concrete(p));
             let make_concrete_method = vcx.mk_method(
                 make_concrete_ident,
@@ -200,8 +153,7 @@ impl TaskEncoder for IndCastersEnc {
                 vcx.alloc_slice(&[
                     concrete_pred(make_concrete(p)),
                     vir::expr! { vcx; ([round_trip]) == ([p.downcast_ty::<vir::PSnap>()]) },
-                    concrete_equation,
-                    concrete_instance,
+                    vir::expr! { vcx; ([param_ext_old]) == ([concrete_ext_value]) },
                 ]),
                 None,
             );

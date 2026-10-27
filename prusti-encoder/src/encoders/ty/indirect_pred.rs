@@ -1,6 +1,6 @@
 use prusti_rustc_interface::{abi, middle::ty};
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::{CastType, FunctionIdn, PredicateIdn, Reify};
+use vir::{CastType, FunctionIdn, PredicateIdn};
 
 use crate::encoders::TyUseImpureEnc;
 
@@ -22,11 +22,9 @@ use super::{
 ///   parameter of `X` in the field's type, the field's piece for the part of
 ///   the range at that occurrence, keyed by the field's key extended by the
 ///   earlier occurrences in the range.
-/// - the key extension `ext_X(K: s_X, T.., Kp: s_X, lo: Int, hi: Int): s_X`:
-///   the key `K` with the cells owned by the piece `p_X_ind(Kp, .., lo, hi)`
-///   read in (`K` itself for an empty range). `K` supplies the values, `Kp`
-///   only the permission; both must agree on the discriminants that `ext_X`
-///   branches on (a precondition).
+/// - the key extension `ext_X(K: s_X, T.., lo: Int, hi: Int): s_X`: the key
+///   `K` with the cells owned by the piece `p_X_ind(K, .., lo, hi)` read in
+///   (`K` itself for an empty range).
 /// - for `Param` only: the trusted range algebra `split_Param`/`merge_Param`
 ///   and `ind_empty` (see `ParamRanges`).
 pub struct TyIndirectEnc;
@@ -36,7 +34,7 @@ pub type TyIndirectPred<'vir> =
 
 pub type TyIndirectExt<'vir> = FunctionIdn<
     'vir,
-    (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Snap, vir::Int, vir::Int),
+    (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int),
     vir::Snap,
 >;
 
@@ -53,10 +51,10 @@ pub type TyIndirectSplit<'vir> =
 /// method split_Param(K, T, lo, m, hi)
 ///   requires lo <= m && m <= hi && p_Param_ind(K, T, lo, hi)
 ///   ensures  p_Param_ind(K, T, lo, m) && p_Param_ind(E, T, m, hi)
-///   ensures  ext_Param(E, T, E, m, hi) == old(ext_Param(K, T, K, lo, hi))
+///   ensures  ext_Param(E, T, m, hi) == old(ext_Param(K, T, lo, hi))
 /// method merge_Param(K, T, lo, m, hi)   // the inverse
 /// ```
-/// where `E = ext_Param(K, T, K, lo, m)`.
+/// where `E = ext_Param(K, T, lo, m)`.
 #[derive(Debug, Clone, Copy)]
 pub struct ParamRanges<'vir> {
     pub empty: TyIndirectEmpty<'vir>,
@@ -74,15 +72,8 @@ pub struct TyIndirectRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for TyIndirectRef<'vir> {}
 
-/// The discriminant agreement of two keys `(K, Kp)` that `ext_X(K, .., Kp, ..)`
-/// requires.
-pub(crate) type Agree<'vir> =
-    vir::ExprGenBool<'vir, (vir::ExprSnap<'vir>, vir::ExprSnap<'vir>), vir::ExprKind<'vir>>;
-
 #[derive(Clone)]
 pub struct TyIndirectDep<'vir> {
-    /// `None` if `ext_X` requires no agreement.
-    pub(crate) agree: Option<Agree<'vir>>,
     /// Per type parameter `T_j`: where `T_j` occurs in the fields.
     pub(crate) ty_param_parts: Vec<Vec<TyParamPart<'vir>>>,
 }
@@ -166,7 +157,6 @@ impl TaskEncoder for TyIndirectEnc {
                     snap.snapshot,
                     params.ty_args(),
                     params.const_args(),
-                    snap.snapshot,
                     vir::TYPE_INT,
                     vir::TYPE_INT,
                 ),
@@ -258,139 +248,78 @@ impl TaskEncoder for TyIndirectEnc {
 
             // ext_X
             let k_decl = vcx.mk_local_decl("K", snap.snapshot);
-            let kp_decl = vcx.mk_local_decl("Kp", snap.snapshot);
             let k = vcx.mk_local_ex(k_decl);
-            let kp = vcx.mk_local_ex(kp_decl);
-            // `acc(p_X_ind(Kp, .., lo, hi), wildcard)`
-            let parent = || {
-                pred(kp, params.ty_exprs(), params.const_exprs(), range.lo, range.hi)(Some(
-                    vcx.mk_wildcard(),
-                ))
+            // `acc(p_X_ind(K, .., lo, hi), wildcard)`
+            let piece = || {
+                pred(k, params.ty_exprs(), params.const_exprs(), range.lo, range.hi)(Some(vcx.mk_wildcard()))
             };
             let nonempty = range.nonempty();
             // `K` for an empty range, which needs no permission
             let unfolding = |expr: vir::ExprSnap<'vir>| {
-                let unfolded = vcx.mk_unfolding_expr(parent(), expr);
+                let unfolded = vcx.mk_unfolding_expr(piece(), expr);
                 vir::expr! { vcx; ([nonempty]) ? ([unfolded]) : ([k]) }
             };
-            let parent_app = vcx.mk_predicate_app_expr(parent());
-            let mut pres = vec![vir::expr! { vcx; ([nonempty]) ==> ([parent_app]) }];
-            let (body, agree) = match &combined.specifics {
+            let piece_app = vcx.mk_predicate_app_expr(piece());
+            let pre = vir::expr! { vcx; ([nonempty]) ==> ([piece_app]) };
+            let body = match &combined.specifics {
                 TySpecifics::MutRef((rust, pure)) => {
-                    let (k, kp) = (k.downcast_ty::<vir::CSnap>(), kp.downcast_ty::<vir::CSnap>());
+                    let k = k.downcast_ty::<vir::CSnap>();
                     let referent = rust.referent.decompose(ty.params);
                     let referent_impure = builder.deps.require_dep::<TyUseImpureEnc>(referent)?;
                     // With position 0, the value slot becomes the snapshot of the
-                    // referent the parent owns, extended inside; otherwise the
-                    // slot is extended.
+                    // referent the piece owns; either way extended inside.
                     let own_in = range.contains(int(0));
-                    let owned = referent_impure.ref_to_snap(pure.deref_access.call()(kp));
-                    let inner_range = builder.referent_range();
-                    let owned_ext = builder.ext(referent, owned, owned, inner_range)?;
-                    let slot_ext = builder.ext(
-                        referent,
-                        pure.value_access.call()(k).upcast_ty(),
-                        pure.value_access.call()(kp).upcast_ty(),
-                        inner_range,
-                    )?;
-                    let value = vir::expr! { vcx; ([own_in]) ? ([owned_ext]) : ([slot_ext]) };
+                    let owned = referent_impure.ref_to_snap(pure.deref_access.call()(k));
+                    let slot: vir::ExprSnap<'vir> = pure.value_access.call()(k).upcast_ty();
+                    let inner_key = vir::expr! { vcx; ([own_in]) ? ([owned]) : ([slot]) };
+                    let value = builder.ext(referent, inner_key, builder.referent_range())?;
                     let cons = (pure.prim_to_snap)(
                         pure.deref_access.call()(k),
                         pure.metadata_access.call()(k),
                         value.downcast_ty::<vir::PSnap>(),
                     );
-                    (Some(unfolding(cons.upcast_ty())), None)
+                    Some(unfolding(cons.upcast_ty()))
                 }
                 TySpecifics::StructLike(data) => {
-                    let (k, kp) = (k.downcast_ty::<vir::CSnap>(), kp.downcast_ty::<vir::CSnap>());
-                    let fields = builder.ext_fields(k, kp, data)?;
-                    let body = match fields {
-                        Some(fields) => {
-                            let cons = (data.data.1.field_snaps_to_snap)(fields.as_slice());
-                            unfolding(cons.upcast_ty())
-                        }
+                    let k = k.downcast_ty::<vir::CSnap>();
+                    Some(match builder.ext_fields(k, data)? {
+                        Some(fields) => unfolding((data.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty()),
                         None => k.upcast_ty(),
-                    };
-                    let fields = builder.agree_fields(data)?;
-                    let agree = (!fields.is_empty()).then(|| {
-                        vcx.mk_lazy_expr(
-                            "agree_struct",
-                            vir::TYPE_BOOL,
-                            Box::new(move |vcx, (k, kp): (vir::ExprSnap<'vir>, vir::ExprSnap<'vir>)| {
-                                agree_fields(vcx, &fields, k, kp).kind
-                            }),
-                        )
-                    });
-                    (Some(body), agree)
+                    })
                 }
                 TySpecifics::EnumLike(data) => {
-                    let (k, kp) = (k.downcast_ty::<vir::CSnap>(), kp.downcast_ty::<vir::CSnap>());
-                    let snap_to_discr = data.data.1.snap_to_discr_snap;
-                    let discr = snap_to_discr.call()(k);
+                    let k = k.downcast_ty::<vir::CSnap>();
+                    let discr = data.data.1.snap_to_discr_snap.call()(k);
                     let mut body = k.upcast_ty();
-                    let mut variants = Vec::new();
+                    let mut branches = false;
                     for variant in data.variants.iter().rev() {
-                        let Some(fields) = builder.ext_fields(k, kp, &variant.inner)? else {
+                        let Some(fields) = builder.ext_fields(k, &variant.inner)? else {
                             continue;
                         };
+                        branches = true;
                         let cons = (variant.inner.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty();
                         body = vir::expr! { vcx;
                             (([discr]) == ([variant.data.1.discr])) ? ([cons]) : ([body])
                         };
-                        variants.push((
-                            variant.data.1.discr,
-                            builder.agree_fields(&variant.inner)?,
-                        ));
                     }
-                    // Agreement is needed iff `ext_X` branches.
-                    let branches = !variants.is_empty();
-                    let agree = branches.then(|| {
-                        vcx.mk_lazy_expr(
-                            "agree_enum",
-                            vir::TYPE_BOOL,
-                            Box::new(move |vcx, (k, kp): (vir::ExprSnap<'vir>, vir::ExprSnap<'vir>)| {
-                                let k_discr = snap_to_discr.call()(k.downcast_ty());
-                                let kp_discr = snap_to_discr.call()(kp.downcast_ty());
-                                let mut conjuncts = vec![vir::expr! { vcx; ([k_discr]) == ([kp_discr]) }];
-                                for (discr, fields) in &variants {
-                                    if !fields.is_empty() {
-                                        let fields = agree_fields(vcx, fields, k, kp);
-                                        conjuncts.push(vir::expr! { vcx;
-                                            (([k_discr]) == ([*discr])) ==> ([fields])
-                                        });
-                                    }
-                                }
-                                vcx.mk_conj(&conjuncts).kind
-                            }),
-                        )
-                    });
-                    let body = if branches { unfolding(body) } else { body };
-                    (Some(body), agree)
+                    Some(if branches { unfolding(body) } else { body })
                 }
                 TySpecifics::Primitive(_)
                 | TySpecifics::Raw(_)
                 | TySpecifics::Builtin(_)
                 | TySpecifics::ImmRef(_)
-                | TySpecifics::ArrayLike(_) => (Some(k), None),
-                TySpecifics::Opaque(_) if ty.special != RustTySpecial::Trusted => (Some(k), None),
-                TySpecifics::Param(_) | TySpecifics::Opaque(_) => (None, None),
+                | TySpecifics::ArrayLike(_) => Some(k),
+                TySpecifics::Opaque(_) if ty.special != RustTySpecial::Trusted => Some(k),
+                TySpecifics::Param(_) | TySpecifics::Opaque(_) => None,
             };
-            let mut posts = Vec::new();
-            if let Some(agree) = agree {
-                pres.push(agree.reify(vcx, (k, kp)));
-                // `ext_X` keeps the discriminants (so that chained extensions
-                // agree again)
-                posts.push(agree.reify(vcx, (vcx.mk_result(snap.snapshot), k)));
-            }
-            if body.is_none() {
-                // an empty range extends nothing
-                let result = vcx.mk_result(snap.snapshot);
-                posts.push(vir::expr! { vcx; (!([nonempty])) ==> (([result]) == ([k])) });
-            }
+            // an empty range extends nothing (the bodies say so for the others)
+            let result = vcx.mk_result(snap.snapshot);
+            let empty = vir::expr! { vcx; (!([nonempty])) ==> (([result]) == ([k])) };
+            let posts = if body.is_none() { vec![empty] } else { Vec::new() };
             let ext = vcx.mk_function(
                 ext_idn,
-                (k_decl, params.ty_decls(), params.const_decls(), kp_decl, lo_decl, hi_decl),
-                vcx.alloc_slice(&pres),
+                (k_decl, params.ty_decls(), params.const_decls(), lo_decl, hi_decl),
+                vcx.alloc_slice(&[pre]),
                 vcx.alloc_slice(&posts),
                 None,
                 body,
@@ -416,7 +345,7 @@ impl TaskEncoder for TyIndirectEnc {
                 Some(ranges) => param_methods(vcx, ranges, pred, ext_idn, snap.snapshot, &params),
                 None => Vec::new(),
             };
-            Ok((TyIndirectLocal { predicate, ext, param }, TyIndirectDep { agree, ty_param_parts }))
+            Ok((TyIndirectLocal { predicate, ext, param }, TyIndirectDep { ty_param_parts }))
         })
     }
 
@@ -452,7 +381,7 @@ fn param_methods<'vir>(
         vir::expr! { vcx; acc([pred](key, [..[tys]], [..[consts]], lo, hi)) }
     };
     let ext_of = |key: vir::ExprSnap<'vir>, lo: vir::ExprInt<'vir>, hi: vir::ExprInt<'vir>| {
-        ext(key, tys, consts, key, lo, hi)
+        ext(key, tys, consts, lo, hi)
     };
     let empty = vcx.mk_method(
         ranges.empty,
@@ -609,19 +538,18 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
             let mut occurrence_key = key;
             for earlier in 0..idx {
                 let Some(range) = self.occurrence_range(field, earlier) else { continue };
-                occurrence_key = self.ext(field.ty, occurrence_key, occurrence_key, range.0)?;
+                occurrence_key = self.ext(field.ty, occurrence_key, range.0)?;
             }
             keys.push(Some(occurrence_key));
         }
         Ok(keys)
     }
 
-    /// Per field: the field of `K` extended by the occurrences in the range
-    /// (with keys read from `Kp`). `None` if no parameter occurs in a field.
+    /// Per field: the field of `K` extended by the occurrences in the range,
+    /// in order. `None` if no parameter occurs in a field.
     fn ext_fields(
         &mut self,
         k: vir::ExprCSnap<'vir>,
-        kp: vir::ExprCSnap<'vir>,
         data: &StructData<'vir, (RustTyDatas, PureTyDatas)>,
     ) -> EncResult<'vir, Option<Vec<vir::ExprSnap<'vir>>>> {
         let mut extended = false;
@@ -629,49 +557,26 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
         for (rust, pure) in &data.fields {
             let field = self.field_occurrences(rust.ty().decompose(self.params));
             let mut value = pure.read.call()(k);
-            let keys = self.occurrence_keys(&field, pure.read.call()(kp))?;
-            for (idx, key) in keys.into_iter().enumerate() {
-                let (Some(key), Some(range)) = (key, self.occurrence_range(&field, idx)) else {
-                    continue;
-                };
+            for idx in 0..field.occurrences.len() {
+                let Some(range) = self.occurrence_range(&field, idx) else { continue };
                 extended = true;
-                value = self.ext(field.ty, value, key, range.0)?;
+                value = self.ext(field.ty, value, range.0)?;
             }
             values.push(value);
         }
         Ok(extended.then_some(values))
     }
 
-    /// The agreement `ext_F` requires, for every field `F` that `ext_X` may
-    /// extend.
-    fn agree_fields(
-        &mut self,
-        data: &StructData<'vir, (RustTyDatas, PureTyDatas)>,
-    ) -> EncResult<'vir, Vec<(FieldRead<'vir>, Agree<'vir>)>> {
-        let mut result = Vec::new();
-        for (rust, pure) in &data.fields {
-            let field_ty = rust.ty().decompose(self.params);
-            if self.field_occurrences(field_ty).params.iter().all(Option::is_none) {
-                continue;
-            }
-            if let Some(agree) = self.deps.require_dep::<TyIndirectEnc>(field_ty.ty)?.agree {
-                result.push((pure.read, agree));
-            }
-        }
-        Ok(result)
-    }
-
-    /// `ext_F(k, .., kp, range)` for the (decomposed) type `F`.
+    /// `ext_F(k, .., range)` for the (decomposed) type `F`.
     fn ext(
         &mut self,
         ty: RustTyDecomposition<'vir>,
         k: vir::ExprSnap<'vir>,
-        kp: vir::ExprSnap<'vir>,
         range: Range<'vir>,
     ) -> EncResult<'vir, vir::ExprSnap<'vir>> {
         let ext = self.deps.require_ref::<TyIndirectEnc>(ty.ty)?.ext;
         let args = self.deps.require_dep::<GArgsTyEnc>(ty.args)?;
-        Ok(ext(k, args.get_ty(), args.get_const(), kp, range.lo, range.hi))
+        Ok(ext(k, args.get_ty(), args.get_const(), range.lo, range.hi))
     }
 
     /// `p_F_ind(key, .., range)` for the (decomposed) type `F`.
@@ -737,25 +642,3 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
 }
 
 type FieldRead<'vir> = vir::AdtDestructor<'vir, vir::CSnap, vir::Snap>;
-
-/// The conjunction of the fields' agreements on `(K.f, Kp.f)`.
-fn agree_fields<'vir>(
-    vcx: &'vir vir::VirCtxt<'_>,
-    fields: &[(FieldRead<'vir>, Agree<'vir>)],
-    k: vir::ExprSnap<'vir>,
-    kp: vir::ExprSnap<'vir>,
-) -> vir::ExprBool<'vir> {
-    let conjuncts = fields
-        .iter()
-        .map(|(read, agree)| {
-            agree.reify(
-                vcx,
-                (
-                    read.call()(k.downcast_ty()),
-                    read.call()(kp.downcast_ty()),
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    vcx.mk_conj(&conjuncts)
-}

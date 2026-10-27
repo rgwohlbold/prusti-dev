@@ -157,7 +157,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                     let nodes = self.deps.require_dep::<IndirectNodesEnc>(
                         RustTyDecomposition::from_ty(parent_ty.ty, self.def_id),
                     )?;
-                    let extended = nodes.extend_with(RegionIdx::from(0), snap);
+                    // by the reference's own piece (position 0)
+                    let extended = nodes.extend(1, snap);
                     let e_ty = self.ty_use_pure(parent_ty.ty);
                     e_ty.expect_mutref().value_access(extended.downcast_ty())
                 }

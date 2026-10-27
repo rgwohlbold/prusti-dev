@@ -68,7 +68,7 @@ pub fn node_for_generalized_idx<'tcx>(
 /// region `r` in `T` (see `occurrences`), `p_T_ind(key, .., lo, hi)` for the
 /// positions `lo .. hi` of the occurrence. The key of the piece at position
 /// `lo` is the snapshot `S` of `p` extended by the pieces of the positions
-/// `0 .. lo` in order: `K_0 = S`, `K_i+1 = ext_T(K_i, .., K_i, r_i)`.
+/// `0 .. lo` in order: `K_0 = S`, `K_i+1 = ext_T(K_i, .., r_i)`.
 pub struct IndirectNodesEnc;
 
 /// The piece of one occurrence of a region (one position), or of a type
@@ -172,19 +172,18 @@ impl<'vir> IndirectNodes<'vir> {
         self.pieces.iter().position(|p| p.path == path)
     }
 
-    /// `ext_T(k, .., kp, range)` in any expression context: the type
+    /// `ext_T(k, .., range)` in any expression context: the type
     /// arguments and the range are fully reified, so they are valid in any
     /// context (as in `GArgsTy::get_ty`), and reifying the result substitutes
     /// their locals.
     pub fn ext<Curr, Next>(
         &self,
         k: vir::ExprGenSnap<'vir, Curr, Next>,
-        kp: vir::ExprGenSnap<'vir, Curr, Next>,
         range: Range<'vir>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
         let (tys, consts) = (self.args().get_ty(), self.args().get_const());
         let (lo, hi) = range.args();
-        self.ind.ext.call()(k, tys, consts, kp, lo, hi)
+        self.ind.ext.call()(k, tys, consts, lo, hi)
     }
 
     /// The key of `piece`, for the snapshot `s` of `p`: `s` extended by the
@@ -194,7 +193,16 @@ impl<'vir> IndirectNodes<'vir> {
         piece: usize,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        (0..piece).fold(s, |k, lower| self.ext(k, k, self.range(lower)))
+        self.extend(piece, s)
+    }
+
+    /// `s` extended by the first `n` pieces, in order. Requires them.
+    pub fn extend<Curr, Next>(
+        &self,
+        n: usize,
+        s: vir::ExprGenSnap<'vir, Curr, Next>,
+    ) -> vir::ExprGenSnap<'vir, Curr, Next> {
+        (0..n).fold(s, |k, piece| self.ext(k, self.range(piece)))
     }
 
     /// The predicate application of `piece` with the given key.
@@ -243,7 +251,7 @@ impl<'vir> IndirectNodes<'vir> {
             .into_iter()
             .map(|piece| {
                 let key = (0..piece).fold(s, |k, lower| {
-                    let ext = self.ext(k, k, self.range(lower));
+                    let ext = self.ext(k, self.range(lower));
                     match at_old(self.pieces[lower].node) {
                         true => vir::with_vcx(|vcx| vcx.mk_old_expr(ext)),
                         false => ext,
@@ -270,25 +278,13 @@ impl<'vir> IndirectNodes<'vir> {
         &self.order
     }
 
-    /// `s` extended by the pieces of node `p↓idx` only (e.g. the own piece of
-    /// a reference, to read its referent). Requires that node's pieces.
-    pub fn extend_with<Curr, Next>(
-        &self,
-        idx: RegionIdx,
-        s: vir::ExprGenSnap<'vir, Curr, Next>,
-    ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        self.pieces_of(idx)
-            .into_iter()
-            .fold(s, |k, piece| self.ext(k, self.key(piece, s), self.range(piece)))
-    }
-
     /// `s` extended by all pieces: a snapshot whose `&mut` value slots are
     /// filled with the referents. Requires all pieces.
     pub fn extend_all<Curr, Next>(
         &self,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        (0..self.pieces.len()).fold(s, |k, piece| self.ext(k, self.key(piece, s), self.range(piece)))
+        self.extend(self.pieces.len(), s)
     }
 }
 

@@ -193,7 +193,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let mut chain = vec![first];
         for p in &group[..group.len() - 1] {
             let prev = *chain.last().unwrap();
-            chain.push(self.bind(caller.ext(prev, prev, caller.range(*p))));
+            chain.push(self.bind(caller.ext(prev, caller.range(*p))));
         }
         for (p, k) in group.iter().zip(&chain) {
             let r = caller.range(*p);
@@ -228,7 +228,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         for p in &group[..group.len() - 1] {
             let (r, k) = (caller.range(*p), *chain.last().unwrap());
             self.stmt((c.param.split)(k, &[c.x], &[], r.lo, r.hi, range.hi).alloc());
-            chain.push(self.bind((c.param_ext)(k, &[c.x], &[], k, r.lo, r.hi)));
+            chain.push(self.bind((c.param_ext)(k, &[c.x], &[], r.lo, r.hi)));
         }
         for (p, k) in group.iter().zip(&chain) {
             self.stmt(c.make_concrete(*k, caller.range(*p)));
