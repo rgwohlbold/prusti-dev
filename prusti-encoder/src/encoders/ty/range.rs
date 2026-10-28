@@ -36,11 +36,14 @@ impl<'vir> Range<'vir> {
 
     /// The part of the range inside the positions `offset .. offset + width`,
     /// numbered from `offset` (so within `0 .. width`; empty if disjoint).
-    pub fn clamp(&self, offset: vir::ExprInt<'vir>, width: vir::ExprInt<'vir>) -> Self {
-        Self {
-            lo: clamp(self.lo, offset, width),
-            hi: clamp(self.hi, offset, width),
-        }
+    pub fn restrict(&self, offset: vir::ExprInt<'vir>, width: vir::ExprInt<'vir>) -> Self {
+        let local = |x| {
+            if let (Some(x), Some(offset), Some(width)) = (as_const(x), as_const(offset), as_const(width)) {
+                return int(x.saturating_sub(offset).min(width));
+            }
+            clamp(sub(x, offset), int(0), width)
+        };
+        Self { lo: local(self.lo), hi: local(self.hi) }
     }
 
     /// `lo` and `hi` in any expression context (they are fully reified).
@@ -75,17 +78,23 @@ pub fn add<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'
     }
 }
 
-/// `x` relative to `offset`, clamped to `0 .. width`: `clamp(x, offset, width)`
-/// (see `clamp_axiom`), a function so that Silicon does not branch on it.
+/// `a - b`
+fn sub<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'vir> {
+    match (as_const(a), as_const(b)) {
+        (Some(a), Some(b)) if a >= b => int(a - b),
+        (_, Some(0)) => a,
+        _ => vir::expr! { ([a]) - ([b]) }.downcast_ty(),
+    }
+}
+
+/// `x` clamped to `lo .. hi` (both inclusive): `clamp(x, lo, hi)` (see
+/// `clamp_axiom`), a function so that Silicon does not branch on it.
 fn clamp<'vir>(
     x: vir::ExprInt<'vir>,
-    offset: vir::ExprInt<'vir>,
-    width: vir::ExprInt<'vir>,
+    lo: vir::ExprInt<'vir>,
+    hi: vir::ExprInt<'vir>,
 ) -> vir::ExprInt<'vir> {
-    if let (Some(x), Some(offset), Some(width)) = (as_const(x), as_const(offset), as_const(width)) {
-        return int(x.saturating_sub(offset).min(width));
-    }
-    clamp_fn().call()(x, offset, width)
+    clamp_fn().call()(x, lo, hi)
 }
 
 pub fn clamp_fn<'vir>() -> vir::FunctionIdn<'vir, (vir::Int, vir::Int, vir::Int), vir::Int> {
@@ -96,19 +105,17 @@ pub fn clamp_fn<'vir>() -> vir::FunctionIdn<'vir, (vir::Int, vir::Int, vir::Int)
     )
 }
 
-/// The definition of `clamp`:
-/// `clamp(x, o, w) == (x <= o ? 0 : (o + w <= x ? w : x - o))`.
+/// The definition of `clamp`, i.e. `max(lo, min(hi, x))` for `lo <= hi`:
+/// `clamp(x, lo, hi) == (x <= lo ? lo : (hi <= x ? hi : x))`.
 pub fn clamp_axiom<'vir>(vcx: &'vir vir::VirCtxt<'vir>) -> vir::DomainAxiom<'vir> {
-    let [x, o, w] = ["x", "o", "w"].map(|name| vcx.mk_local_decl(name, vir::TYPE_INT));
-    let (xe, oe, we) = (vcx.mk_local_ex(x), vcx.mk_local_ex(o), vcx.mk_local_ex(w));
-    let app = clamp_fn().call()(xe, oe, we);
-    let (zero, end) = (int(0), add(oe, we));
-    let relative = vcx.mk_bin_op_expr(vir::BinOpKind::Sub, xe, oe).downcast_ty::<vir::Int>();
+    let [x, lo, hi] = ["x", "lo", "hi"].map(|name| vcx.mk_local_decl(name, vir::TYPE_INT));
+    let (xe, loe, hie) = (vcx.mk_local_ex(x), vcx.mk_local_ex(lo), vcx.mk_local_ex(hi));
+    let app = clamp_fn().call()(xe, loe, hie);
     vcx.mk_domain_axiom(
         vir::ViperIdent::new("clamp_def"),
         vir::expr! { vcx;
-            forall [x], [o], [w] :: {[app]}
-                ([app]) == ((([xe]) <= ([oe])) ? ([zero]) : ((([end]) <= ([xe])) ? ([we]) : ([relative])))
+            forall [x], [lo], [hi] :: {[app]}
+                ([app]) == ((([xe]) <= ([loe])) ? ([loe]) : ((([hie]) <= ([xe])) ? ([hie]) : ([xe])))
         },
     )
 }

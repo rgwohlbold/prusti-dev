@@ -483,7 +483,7 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
     /// The part of the range inside the referent of `&'a mut T` (positions
     /// `1 .. 1 + arity(T)`), in the referent's positions.
     fn referent_range(&self) -> Range<'vir> {
-        self.range.clamp(int(1), TyArityEnc::arity(self.ty_args[0]))
+        self.range.restrict(int(1), TyArityEnc::arity(self.ty_args[0]))
     }
 
     /// The part of the range at occurrence `idx` of a field (in the field
@@ -495,7 +495,7 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
     ) -> Option<(Range<'vir>, vir::ExprBool<'vir>)> {
         let param = field.params[idx]?;
         let (_, offset, width) = self.offsets.iter().find(|(p, ..)| *p == param)?;
-        let part = self.range.clamp(*offset, *width);
+        let part = self.range.restrict(*offset, *width);
         Some((part.shift(self.pos(&field.occurrences[idx].pos)), part.nonempty()))
     }
 

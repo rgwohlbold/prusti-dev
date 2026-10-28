@@ -332,6 +332,11 @@ macro_rules! expr_inner {
         $crate::expr_inner!(@expr_one; $($lhs)*),
         $crate::expr_inner!(@expr_one; $($rhs)*),
     ) };
+    (@expr_one; ( $($lhs:tt)+ ) - ( $($rhs:tt)+ )) => { vcx!().mk_bin_op_expr(
+        $crate::BinOpKind::Sub,
+        $crate::expr_inner!(@expr_one; $($lhs)*),
+        $crate::expr_inner!(@expr_one; $($rhs)*),
+    ) };
     (@expr_one; ( $($lhs:tt)+ ) in ( $($rhs:tt)+ )) => { vcx!().mk_contains_expr(
         $crate::expr_inner!(@expr_one; $($lhs)*),
         $crate::expr_inner!(@expr_one; $($rhs)*),
