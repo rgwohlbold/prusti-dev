@@ -134,7 +134,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .pieces_of(idx)
             .into_iter()
             .map(|piece| {
-                let key = self.vcx.maybe_apply_label(nodes.key(piece, snap), key_label);
+                let key = self
+                    .vcx
+                    .maybe_apply_label(nodes.key(piece, snap), key_label);
                 nodes.app(piece, key, None)
             })
             .collect())
@@ -145,35 +147,41 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// the place's own predicate (which an expansion may have unfolded or a
     /// deref may not have produced yet), this only needs the own pieces of the
     /// references on the path, as at the start of a phase.
-    pub(crate) fn path_snap(&mut self, place: Place<'vir>) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
+    pub(crate) fn path_snap(
+        &mut self,
+        place: Place<'vir>,
+    ) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
         let Some((parent, elem)) = place.last_projection() else {
             return Ok(self.encode_place_with_snap(place)?.1);
         };
         let parent_ty = parent.ty(self.pcg_ctxt());
         Ok(match elem {
-            mir::ProjectionElem::Deref => match parent_ty.ty.kind() {
-                ty::TyKind::Ref(.., ty::Mutability::Mut) => {
-                    let snap = self.path_snap(parent)?;
-                    let nodes = self.deps.require_dep::<IndirectNodesEnc>(
-                        RustTyDecomposition::from_ty(parent_ty.ty, self.def_id),
-                    )?;
-                    // by the reference's own piece (position 0)
-                    let extended = nodes.extend(1, snap);
-                    let e_ty = self.ty_use_pure(parent_ty.ty);
-                    e_ty.expect_mutref().value_access(extended.downcast_ty())
+            mir::ProjectionElem::Deref => {
+                match parent_ty.ty.kind() {
+                    ty::TyKind::Ref(.., ty::Mutability::Mut) => {
+                        let snap = self.path_snap(parent)?;
+                        let nodes = self.deps.require_dep::<IndirectNodesEnc>(
+                            RustTyDecomposition::from_ty(parent_ty.ty, self.def_id),
+                        )?;
+                        // by the reference's own piece (position 0)
+                        let extended = nodes.extend(1, snap);
+                        let e_ty = self.ty_use_pure(parent_ty.ty);
+                        e_ty.expect_mutref().value_access(extended.downcast_ty())
+                    }
+                    ty::TyKind::Ref(.., ty::Mutability::Not) => {
+                        let snap = self.path_snap(parent)?;
+                        let e_ty = self.ty_use_pure(parent_ty.ty);
+                        e_ty.expect_immref().value_access(snap.downcast_ty())
+                    }
+                    _ if parent_ty.ty.is_box() => {
+                        let snap = self.path_snap(parent)?;
+                        let e_ty = self.ty_use_pure(parent_ty.ty);
+                        e_ty.expect_structlike()
+                            .box_value_access(snap.downcast_ty())
+                    }
+                    _ => self.encode_place_with_snap(place)?.1,
                 }
-                ty::TyKind::Ref(.., ty::Mutability::Not) => {
-                    let snap = self.path_snap(parent)?;
-                    let e_ty = self.ty_use_pure(parent_ty.ty);
-                    e_ty.expect_immref().value_access(snap.downcast_ty())
-                }
-                _ if parent_ty.ty.is_box() => {
-                    let snap = self.path_snap(parent)?;
-                    let e_ty = self.ty_use_pure(parent_ty.ty);
-                    e_ty.expect_structlike().box_value_access(snap.downcast_ty())
-                }
-                _ => self.encode_place_with_snap(place)?.1,
-            },
+            }
             mir::ProjectionElem::Field(field, _) => {
                 let snap = self.path_snap(parent)?;
                 let e_ty = self.ty_use_pure(parent_ty.ty);
@@ -217,7 +225,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             })
             .collect::<Vec<_>>();
         if children.iter().any(|(child, _)| {
-            matches!(child.last_projection(), Some((_, mir::ProjectionElem::Downcast(..))))
+            matches!(
+                child.last_projection(),
+                Some((_, mir::ProjectionElem::Downcast(..)))
+            )
         }) {
             return None;
         }
@@ -241,7 +252,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             })
             .collect::<Vec<_>>();
         if children.iter().any(|(child, _)| {
-            matches!(child.last_projection(), Some((_, mir::ProjectionElem::Downcast(..))))
+            matches!(
+                child.last_projection(),
+                Some((_, mir::ProjectionElem::Downcast(..)))
+            )
         }) {
             return None;
         }
@@ -300,7 +314,15 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             let keys = nodes
                 .pieces_of(region)
                 .into_iter()
-                .map(|piece| (piece, self.bind(self.vcx.maybe_apply_label(nodes.key(piece, snap), key_label))))
+                .map(|piece| {
+                    (
+                        piece,
+                        self.bind(
+                            self.vcx
+                                .maybe_apply_label(nodes.key(piece, snap), key_label),
+                        ),
+                    )
+                })
                 .collect::<Vec<_>>();
             for (piece, key) in keys.iter().rev() {
                 self.stmt(self.vcx.mk_unfold_stmt(nodes.app(*piece, *key, None)));
@@ -311,7 +333,11 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             });
             return Ok(());
         }
-        for piece in self.node_pred_apps(base, region, key_label)?.into_iter().rev() {
+        for piece in self
+            .node_pred_apps(base, region, key_label)?
+            .into_iter()
+            .rev()
+        {
             self.stmt(self.vcx.mk_unfold_stmt(piece));
         }
         Ok(())
@@ -333,7 +359,11 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             let label = self.current_phase_label();
             self.nested_expansion_unfold(expansion, Some(label))?;
         }
-        if let Some(i) = self.opened_regions_in.iter().position(|o| o.expansion == *expansion) {
+        if let Some(i) = self
+            .opened_regions_in
+            .iter()
+            .position(|o| o.expansion == *expansion)
+        {
             let opened = self.opened_regions_in.remove(i);
             self.regions_in_empty_children(base_place, &children, &opened.keys)?;
         }
@@ -367,7 +397,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// The places of by-value arguments that are expanded in the owned PCG
     /// of `pcg` (deepest first), with their children.
-    pub(crate) fn owed_expansions(&self, pcg: &Pcg<'_, 'vir>) -> Vec<(Place<'vir>, Vec<Place<'vir>>)> {
+    pub(crate) fn owed_expansions(
+        &self,
+        pcg: &Pcg<'_, 'vir>,
+    ) -> Vec<(Place<'vir>, Vec<Place<'vir>>)> {
         use pcg::pcg::CapabilityKind;
         let with_capability = [
             CapabilityKind::Read,
@@ -391,7 +424,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             }
         }
         expanded.retain(|place| {
-            !place.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref))
+            !place
+                .projection()
+                .iter()
+                .any(|e| matches!(e, mir::ProjectionElem::Deref))
         });
         expanded.sort_by_key(|place| std::cmp::Reverse(place.projection().len()));
         expanded
@@ -400,7 +436,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let children = with_capability
                     .iter()
                     .chain(expanded.iter())
-                    .filter(|c| c.last_projection().is_some_and(|(parent, _)| parent == *base))
+                    .filter(|c| {
+                        c.last_projection()
+                            .is_some_and(|(parent, _)| parent == *base)
+                    })
                     .copied()
                     .collect();
                 (*base, children)
@@ -419,7 +458,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let children = children
                     .iter()
                     .filter_map(|c| {
-                        let i = c.regions(self.pcg_ctxt()).iter().position(|r| r == region)?;
+                        let i = c
+                            .regions(self.pcg_ctxt())
+                            .iter()
+                            .position(|r| r == region)?;
                         Some((*c, RegionIdx::from(i)))
                     })
                     .collect::<Vec<_>>();
@@ -432,7 +474,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// At `return`: fold the pieces of the by-value arguments that are still
     /// expanded (the PCG does not collapse them at the end, and may have
     /// removed their lifetime projection expansions as dead).
-    pub(crate) fn nested_fold_at_return(&mut self, pcg: &Pcg<'_, 'vir>) -> EncodeResult<'vir, (), E> {
+    pub(crate) fn nested_fold_at_return(
+        &mut self,
+        pcg: &Pcg<'_, 'vir>,
+    ) -> EncodeResult<'vir, (), E> {
         let owed = self.owed_expansions(pcg);
         self.fold_owed_expansions(owed)
     }
@@ -449,7 +494,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     }
 
     fn is_by_value_arg(&self, local: mir::Local) -> bool {
-        self.body.local_kind(local) == mir::LocalKind::Arg && !self.body.local_decls[local].ty.is_ref()
+        self.body.local_kind(local) == mir::LocalKind::Arg
+            && !self.body.local_decls[local].ty.is_ref()
     }
 
     /// Fold the pieces of `base↓region` of a by-value argument that the
@@ -464,7 +510,11 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         children: &[(Place<'vir>, RegionIdx)],
     ) -> EncodeResult<'vir, (), E> {
         let place = strip_downcasts(base);
-        if place.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref)) {
+        if place
+            .projection()
+            .iter()
+            .any(|e| matches!(e, mir::ProjectionElem::Deref))
+        {
             return Ok(());
         }
         let ty = place.ty(self.pcg_ctxt()).ty;
@@ -486,7 +536,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             .unblocked_regions_in(self.vcx, self.deps)
             .into_iter()
             .any(|(local, idx)| {
-                local == place.local && Place::from(local).regions(self.pcg_ctxt())[idx] == pcg_region
+                local == place.local
+                    && Place::from(local).regions(self.pcg_ctxt())[idx] == pcg_region
             });
         if !unblocked {
             return Ok(());
@@ -499,8 +550,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         for cast in casts {
             let key = self.child_key(&cast)?;
             self.stmt(
-                (cast.casters.make_generic)(key, cast.ty_args.get_ty(), cast.ty_args.get_const(), cast.range.lo, cast.range.hi)
-                    .alloc(),
+                (cast.casters.make_generic)(
+                    key,
+                    cast.ty_args.get_ty(),
+                    cast.ty_args.get_const(),
+                    cast.range.lo,
+                    cast.range.hi,
+                )
+                .alloc(),
             );
         }
         let snap = self.vcx.mk_old_expr(self.path_snap(place)?);
@@ -542,7 +599,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 else {
                     continue;
                 };
-                let child_decomp = RustTyDecomposition::from_ty(child.ty(self.pcg_ctxt()).ty, self.def_id);
+                let child_decomp =
+                    RustTyDecomposition::from_ty(child.ty(self.pcg_ctxt()).ty, self.def_id);
                 let child_nodes = self.deps.require_dep::<IndirectNodesEnc>(child_decomp)?;
                 let path = part.path.iter().chain(rest).copied().collect::<Vec<_>>();
                 let Some(piece) = child_nodes.find(&path) else {
@@ -558,7 +616,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 } else {
                     self.vcx.mk_fold_stmt(child_nodes.app(piece, k, None))
                 };
-                self.stmt(self.vcx.mk_if_stmt(is_empty, self.vcx.alloc_slice(&[empty]), &[]));
+                self.stmt(
+                    self.vcx
+                        .mk_if_stmt(is_empty, self.vcx.alloc_slice(&[empty]), &[]),
+                );
             }
         }
         Ok(())
@@ -614,7 +675,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let casters = self
             .deps
             .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?;
-        let ty_args = self.deps.require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
+        let ty_args = self
+            .deps
+            .require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
         Ok(child_nodes
             .pieces_of(idx)
             .into_iter()
@@ -661,7 +724,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         }
         let place_ref = self.encode_place(place)?;
         let ty = place_ref.ty.ty;
-        let place_ref = self.vcx.maybe_apply_label(place_ref.expr.expect_predicate(), label);
+        let place_ref = self
+            .vcx
+            .maybe_apply_label(place_ref.expr.expect_predicate(), label);
         let data = self.ty_use_impure(ty);
         Ok(data.ref_to_snap(place_ref))
     }
@@ -680,8 +745,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let mut lp_expansions = Vec::new();
         for edge in state.graph().edges() {
             match edge.kind() {
-                BorrowPcgEdgeKind::Deref(deref) => place_edges
-                    .push((deref.blocked_place().place(), vec![deref.deref_place().place()])),
+                BorrowPcgEdgeKind::Deref(deref) => place_edges.push((
+                    deref.blocked_place().place(),
+                    vec![deref.deref_place().place()],
+                )),
                 BorrowPcgEdgeKind::BorrowPcgExpansion(expansion) => match expansion.base() {
                     PcgNode::Place(base) => place_edges.push((
                         base.place(),
@@ -718,10 +785,15 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let Some((base, _, _)) = Self::lp_expansion_any(expansion) else {
                     return false;
                 };
-                let owned = !base.projection().iter().any(|e| matches!(e, mir::ProjectionElem::Deref));
+                let owned = !base
+                    .projection()
+                    .iter()
+                    .any(|e| matches!(e, mir::ProjectionElem::Deref));
                 let owned_expanded = match pcg {
                     Some(pcg) => owned && pcg.place_capability(base, self.pcg_ctxt()).is_none(),
-                    None => children.iter().all(|c| matches!(c, MaybeLabelledPlace::Current(_))),
+                    None => children
+                        .iter()
+                        .all(|c| matches!(c, MaybeLabelledPlace::Current(_))),
                 };
                 let place_expanded = place_edges.iter().any(|(blocked, targets)| {
                     *blocked == base && children.iter().all(|c| targets.contains(&c.place()))
@@ -766,7 +838,12 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         // collapsed in this phase): fold them first
         let (children, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_aggregates)
             .into_iter()
-            .partition(|(target, _)| target.place().last_projection().is_some_and(|(parent, _)| parent == place));
+            .partition(|(target, _)| {
+                target
+                    .place()
+                    .last_projection()
+                    .is_some_and(|(parent, _)| parent == place)
+            });
         self.pending_aggregates = rest;
         self.fold_aggregate_targets(children)?;
         let mut casts = Vec::new();
@@ -775,7 +852,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 continue;
             };
             for (child, idx) in children {
-                if child.last_projection().is_some_and(|(parent, _)| parent == place) {
+                if child
+                    .last_projection()
+                    .is_some_and(|(parent, _)| parent == place)
+                {
                     casts.extend(self.child_casts(base, child, idx)?);
                 }
             }
@@ -856,13 +936,20 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             self.forget_open_expansion(target_place, target_idx);
             return Ok(());
         }
-        if !self.released_aggregates.contains(&(target_place, target_idx)) {
+        if !self
+            .released_aggregates
+            .contains(&(target_place, target_idx))
+        {
             let idx = RegionIdx::from(target_idx);
             let key_label = match target {
                 MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
                 MaybeLabelledPlace::Current(_) => None,
             };
-            for piece in self.node_pred_apps(target_place, idx, key_label)?.into_iter().rev() {
+            for piece in self
+                .node_pred_apps(target_place, idx, key_label)?
+                .into_iter()
+                .rev()
+            {
                 self.stmt(self.vcx.mk_unfold_stmt(piece));
             }
             self.released_aggregates.push((target_place, target_idx));
@@ -872,7 +959,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let BorrowFlowEdgeKind::Aggregate { field_idx, .. } = kind else {
             return Ok(());
         };
-        if !self.released_aggregates.contains(&(target_place, target_idx))
+        if !self
+            .released_aggregates
+            .contains(&(target_place, target_idx))
             || self.released_parts.contains(&(source, source_idx))
         {
             return Ok(());
@@ -884,7 +973,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let casters = self
             .deps
             .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?;
-        let ty_args = self.deps.require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
+        let ty_args = self
+            .deps
+            .require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
         let label = match source {
             MaybeLabelledPlace::Labelled(snap) => Some(self.get_location_label(snap.at())),
             MaybeLabelledPlace::Current(_) => None,
@@ -894,11 +985,14 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let nodes = self
             .deps
             .require_dep::<IndirectNodesEnc>(RustTyDecomposition::from_ty(ty, self.def_id))?;
-        let snap = self.vcx.maybe_apply_label(self.encode_place_with_snap(place)?.1, label);
+        let snap = self
+            .vcx
+            .maybe_apply_label(self.encode_place_with_snap(place)?.1, label);
         // enclosing pieces first: the concrete keys of the enclosed ones read them
         for piece in nodes.pieces_of(source_idx) {
             let key = nodes.key(piece, snap);
-            let generic = (casters.make_generic_s)(key.downcast_ty(), ty_args.get_ty(), ty_args.get_const());
+            let generic =
+                (casters.make_generic_s)(key.downcast_ty(), ty_args.get_ty(), ty_args.get_const());
             self.stmt(
                 (casters.make_concrete)(
                     generic.upcast_ty(),
@@ -946,7 +1040,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             let casters = self
                 .deps
                 .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?;
-            let ty_args = self.deps.require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
+            let ty_args = self
+                .deps
+                .require_dep::<GArgsTyEnc>(normalized.concrete.args)?;
             // one edge per target node: cast once, at the end of the phase
             if !self
                 .pending_aggregate_casts
@@ -970,7 +1066,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// `place = C { .. }` was assigned: its pieces are folded at the end of
     /// the phase, also those no part flows into (e.g. of `None`, without PCG
     /// `Aggregate` edges).
-    pub(crate) fn nested_aggregate_assigned(&mut self, place: Place<'vir>) -> EncodeResult<'vir, (), E> {
+    pub(crate) fn nested_aggregate_assigned(
+        &mut self,
+        place: Place<'vir>,
+    ) -> EncodeResult<'vir, (), E> {
         let ty = place.ty(self.pcg_ctxt()).ty;
         let nodes = self
             .deps

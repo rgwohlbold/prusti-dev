@@ -66,14 +66,18 @@ pub struct Pos {
 }
 
 /// The occurrences of `decomp`, in position order (enclosing ones first).
-pub fn occurrences<'tcx>(decomp: RustTyDecomposition<'tcx>) -> Result<Vec<Occurrence<'tcx>>, String> {
+pub fn occurrences<'tcx>(
+    decomp: RustTyDecomposition<'tcx>,
+) -> Result<Vec<Occurrence<'tcx>>, String> {
     let mut walker = Walker::default();
     let mut found = Found::default();
     walker.walk(decomp, &mut Vec::new(), &mut found);
     // the own lifetimes of a constructor whose lifetimes enclose each other
     // cannot be ordered
     if found.pairs.iter().any(|(a, b)| a > b) {
-        return Err(format!("lifetimes enclosing each other are not supported ({decomp:?})"));
+        return Err(format!(
+            "lifetimes enclosing each other are not supported ({decomp:?})"
+        ));
     }
     let mut pos = Pos::default();
     Ok(found
@@ -89,7 +93,12 @@ pub fn occurrences<'tcx>(decomp: RustTyDecomposition<'tcx>) -> Result<Vec<Occurr
                 .collect::<Vec<_>>();
             parents.sort();
             parents.dedup();
-            let occurrence = Occurrence { path, end, parents, pos: pos.clone() };
+            let occurrence = Occurrence {
+                path,
+                end,
+                parents,
+                pos: pos.clone(),
+            };
             match end {
                 End::Region(_) => pos.konst += 1,
                 End::Param(param) => pos.params.push(param),
@@ -140,7 +149,11 @@ impl Summary {
     fn own_order(&self) -> Vec<usize> {
         let mut order = Vec::new();
         while order.len() < self.lifetimes.len() {
-            let mut rest = self.lifetimes.iter().copied().filter(|i| !order.contains(i));
+            let mut rest = self
+                .lifetimes
+                .iter()
+                .copied()
+                .filter(|i| !order.contains(i));
             let next = rest.clone().find(|b| {
                 self.rel
                     .iter()
@@ -180,7 +193,9 @@ impl<'tcx> Walker<'tcx> {
             TySpecifics::MutRef(_) => {
                 let own = found.list.len();
                 let region = decomp.args.args()[0].expect_region();
-                found.list.push((with(prefix, Step::Here(0)), End::Region(region)));
+                found
+                    .list
+                    .push((with(prefix, Step::Here(0)), End::Region(region)));
                 let referent = self.descend(decomp, 0, prefix, found);
                 found.pairs.extend(referent.map(|b| (own, b)));
             }
@@ -195,7 +210,9 @@ impl<'tcx> Walker<'tcx> {
                 let mut lifetimes = HashMap::new();
                 for i in summary.own_order() {
                     lifetimes.insert(i, found.list.len());
-                    found.list.push((with(prefix, Step::Here(i)), End::Region(regions[i])));
+                    found
+                        .list
+                        .push((with(prefix, Step::Here(i)), End::Region(regions[i])));
                 }
                 let mut tys = HashMap::new();
                 for j in summary.tys.iter().copied() {
@@ -204,7 +221,9 @@ impl<'tcx> Walker<'tcx> {
                 for (i, target) in &summary.rel {
                     let Some(a) = lifetimes.get(i) else { continue };
                     match target {
-                        Target::Lifetime(i2) => found.pairs.extend(lifetimes.get(i2).map(|b| (*a, *b))),
+                        Target::Lifetime(i2) => {
+                            found.pairs.extend(lifetimes.get(i2).map(|b| (*a, *b)))
+                        }
                         Target::Ty(j) => found.pairs.extend(tys[j].clone().map(|b| (*a, b))),
                     }
                 }
@@ -223,11 +242,21 @@ impl<'tcx> Walker<'tcx> {
         prefix: &mut Vec<Step>,
         found: &mut Found<'tcx>,
     ) -> std::ops::Range<usize> {
-        let Some(arg) = decomp.args.args().iter().filter_map(|arg| arg.as_type()).nth(j) else {
+        let Some(arg) = decomp
+            .args
+            .args()
+            .iter()
+            .filter_map(|arg| arg.as_type())
+            .nth(j)
+        else {
             return found.list.len()..found.list.len();
         };
         prefix.push(Step::In(j));
-        let range = self.walk(RustTyDecomposition::from_ty(arg, decomp.args.context()), prefix, found);
+        let range = self.walk(
+            RustTyDecomposition::from_ty(arg, decomp.args.context()),
+            prefix,
+            found,
+        );
         prefix.pop();
         range
     }

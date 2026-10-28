@@ -16,7 +16,10 @@ pub struct Range<'vir> {
 impl<'vir> Range<'vir> {
     /// `lo .. lo + width`
     pub fn starting_at(lo: vir::ExprInt<'vir>, width: vir::ExprInt<'vir>) -> Self {
-        Self { lo, hi: add(lo, width) }
+        Self {
+            lo,
+            hi: add(lo, width),
+        }
     }
 
     /// `lo <= pos && pos < hi`
@@ -31,26 +34,40 @@ impl<'vir> Range<'vir> {
 
     /// The range moved up by `offset`.
     pub fn shift(&self, offset: vir::ExprInt<'vir>) -> Self {
-        Self { lo: add(offset, self.lo), hi: add(offset, self.hi) }
+        Self {
+            lo: add(offset, self.lo),
+            hi: add(offset, self.hi),
+        }
     }
 
     /// The part of the range inside the positions `offset .. offset + width`,
     /// numbered from `offset` (so within `0 .. width`; empty if disjoint).
     pub fn restrict(&self, offset: vir::ExprInt<'vir>, width: vir::ExprInt<'vir>) -> Self {
         let local = |x| {
-            if let (Some(x), Some(offset), Some(width)) = (as_const(x), as_const(offset), as_const(width)) {
+            if let (Some(x), Some(offset), Some(width)) =
+                (as_const(x), as_const(offset), as_const(width))
+            {
                 return int(x.saturating_sub(offset).min(width));
             }
             clamp(sub(x, offset), int(0), width)
         };
-        Self { lo: local(self.lo), hi: local(self.hi) }
+        Self {
+            lo: local(self.lo),
+            hi: local(self.hi),
+        }
     }
 
     /// `lo` and `hi` in any expression context (they are fully reified).
-    pub fn args<Curr, Next>(&self) -> (vir::ExprGenInt<'vir, Curr, Next>, vir::ExprGenInt<'vir, Curr, Next>) {
+    pub fn args<Curr, Next>(
+        &self,
+    ) -> (
+        vir::ExprGenInt<'vir, Curr, Next>,
+        vir::ExprGenInt<'vir, Curr, Next>,
+    ) {
         // SAFETY: see `GArgsTy::get_ty`.
         let any_ctx = |e: vir::ExprInt<'vir>| unsafe {
-            &*(e as *const vir::ExprData<'vir, vir::Int> as *const vir::ExprGenData<'vir, Curr, Next, vir::Int>)
+            &*(e as *const vir::ExprData<'vir, vir::Int>
+                as *const vir::ExprGenData<'vir, Curr, Next, vir::Int>)
         };
         (any_ctx(self.lo), any_ctx(self.hi))
     }
@@ -58,7 +75,10 @@ impl<'vir> Range<'vir> {
 
 /// The integer constant `value`.
 pub fn int<'vir>(value: usize) -> vir::ExprInt<'vir> {
-    vir::with_vcx(|vcx| vcx.mk_const_expr(vir::ConstData::Int(value as u128)).downcast_ty())
+    vir::with_vcx(|vcx| {
+        vcx.mk_const_expr(vir::ConstData::Int(value as u128))
+            .downcast_ty()
+    })
 }
 
 fn as_const(expr: vir::ExprInt<'_>) -> Option<usize> {
@@ -121,8 +141,11 @@ pub fn clamp_axiom<'vir>(vcx: &'vir vir::VirCtxt<'vir>) -> vir::DomainAxiom<'vir
 }
 
 /// The position `pos`, with `ty_of` the type value of a type parameter.
-pub fn pos_expr<'vir>(pos: &Pos, ty_of: impl Fn(ty::ParamTy) -> vir::ExprTyVal<'vir>) -> vir::ExprInt<'vir> {
-    pos.params
-        .iter()
-        .fold(int(pos.konst), |sum, param| add(sum, TyArityEnc::arity(ty_of(*param))))
+pub fn pos_expr<'vir>(
+    pos: &Pos,
+    ty_of: impl Fn(ty::ParamTy) -> vir::ExprTyVal<'vir>,
+) -> vir::ExprInt<'vir> {
+    pos.params.iter().fold(int(pos.konst), |sum, param| {
+        add(sum, TyArityEnc::arity(ty_of(*param)))
+    })
 }

@@ -219,10 +219,15 @@ impl<'vir> WandEncOutput<'vir> {
         call_ctx: WandCallContext<'vir>,
         snap: vir::ExprSnap<'vir>,
     ) -> vir::ExprSnap<'vir> {
-        if call_ctx.is_none() || !matches!(g.ty(self.fn_sig(vcx, None)).kind(), ty::TyKind::Param(_)) {
+        if call_ctx.is_none()
+            || !matches!(g.ty(self.fn_sig(vcx, None)).kind(), ty::TyKind::Param(_))
+        {
             return snap;
         }
-        let concrete = RustTyDecomposition::from_ty(g.ty(self.fn_sig(vcx, call_ctx)), self.g_params(vcx, call_ctx));
+        let concrete = RustTyDecomposition::from_ty(
+            g.ty(self.fn_sig(vcx, call_ctx)),
+            self.g_params(vcx, call_ctx),
+        );
         if concrete.ty.specifics.is_param() {
             return snap;
         }
@@ -257,9 +262,12 @@ impl<'vir> WandEncOutput<'vir> {
         deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
         g: FunctionShapeNode<Generalized>,
     ) -> (mir::Local, usize) {
-        let position = self.function_shape_node(vcx, deps, g, None).unwrap().map_or(0, |(nodes, node)| {
-            nodes.pieces_of(node).first().copied().unwrap_or(0)
-        });
+        let position = self
+            .function_shape_node(vcx, deps, g, None)
+            .unwrap()
+            .map_or(0, |(nodes, node)| {
+                nodes.pieces_of(node).first().copied().unwrap_or(0)
+            });
         (g.mir_local(), position)
     }
 
@@ -290,7 +298,13 @@ impl<'vir> WandEncOutput<'vir> {
         let old_nodes = at_old
             .iter()
             .filter(|i| i.mir_local() == g.mir_local())
-            .filter_map(|i| Some(self.function_shape_node(vcx, deps, (*i).into(), call_ctx).ok()??.1))
+            .filter_map(|i| {
+                Some(
+                    self.function_shape_node(vcx, deps, (*i).into(), call_ctx)
+                        .ok()??
+                        .1,
+                )
+            })
             .collect::<Vec<_>>();
         let snap = self.callee_snap(vcx, deps, g, call_ctx, snap(g.mir_local()));
         nodes.pred_with(node, snap, |idx| old_nodes.contains(&idx))
@@ -584,7 +598,8 @@ impl TaskEncoder for WandEnc {
             let mut moved = edges
                 .iter()
                 .filter(|(input, output)| {
-                    output.mir_local() != mir::RETURN_PLACE && output.mir_local() != input.mir_local()
+                    output.mir_local() != mir::RETURN_PLACE
+                        && output.mir_local() != input.mir_local()
                 })
                 .map(|(input, _)| *input)
                 .collect::<Vec<_>>();
@@ -606,7 +621,9 @@ impl TaskEncoder for WandEnc {
             {
                 nodes_output
                     .function_shape_node(vcx, deps, g, None)
-                    .map_err(|err| EncodeFullError::EncodingError(WandEncError::Unsupported(err), None))?;
+                    .map_err(|err| {
+                        EncodeFullError::EncodingError(WandEncError::Unsupported(err), None)
+                    })?;
             }
             let spec = deps.require_dep::<MirSpecEnc>((def_id, def_id, MirSpecEncMode::Impure))?;
             if coupled_edges.is_empty() {
@@ -737,7 +754,11 @@ impl<'vir> WandEncOutput<'vir> {
             break;
         }
         for wand in &mut wands {
-            let returned = wand.rhs.iter().map(|g| g.to_function_shape_node()).collect::<Vec<_>>();
+            let returned = wand
+                .rhs
+                .iter()
+                .map(|g| g.to_function_shape_node())
+                .collect::<Vec<_>>();
             let lhs = wand
                 .lhs
                 .iter()
@@ -815,15 +836,19 @@ impl<'vir> WandEncOutput<'vir> {
         vcx: &'vir vir::VirCtxt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<Vec<WandData<'vir>>, WandEncError> {
-        let has_resources = |g: FunctionShapeNode<Generalized>,
-                             deps: &mut TaskEncoderDependencies<'vir, E>| {
-            self.has_resources(vcx, deps, g, None)
-        };
+        let has_resources =
+            |g: FunctionShapeNode<Generalized>, deps: &mut TaskEncoderDependencies<'vir, E>| {
+                self.has_resources(vcx, deps, g, None)
+            };
         // A wand is only needed if it gives back a resource, or to carry the
         // pledges if none does (e.g. for shared references).
-        let (mut wands, resourceless): (Vec<_>, Vec<_>) = wands
-            .into_iter()
-            .partition(|wand_data| wand_data.rhs.iter().any(|g| has_resources((*g).into(), deps)));
+        let (mut wands, resourceless): (Vec<_>, Vec<_>) =
+            wands.into_iter().partition(|wand_data| {
+                wand_data
+                    .rhs
+                    .iter()
+                    .any(|g| has_resources((*g).into(), deps))
+            });
         // A wand gives back its sources only once all of its targets have
         // expired. That matches the signature only if each source with
         // resources flows into each target with resources.
@@ -837,7 +862,10 @@ impl<'vir> WandEncOutput<'vir> {
             let mut targets: Vec<Vec<WandLhsKey>> = Vec::new();
             for t in &wand_data.lhs {
                 if !has_resources(*t, deps)
-                    || wand_data.lhs.iter().any(|a| self.encloses(vcx, deps, *a, *t))
+                    || wand_data
+                        .lhs
+                        .iter()
+                        .any(|a| self.encloses(vcx, deps, *a, *t))
                 {
                     continue;
                 }
@@ -850,9 +878,11 @@ impl<'vir> WandEncOutput<'vir> {
                 targets.push(group);
             }
             let precise = sources.iter().all(|source| {
-                targets
-                    .iter()
-                    .all(|group| group.iter().any(|target| edges.contains(&(**source, *target))))
+                targets.iter().all(|group| {
+                    group
+                        .iter()
+                        .any(|target| edges.contains(&(**source, *target)))
+                })
             });
             if !precise {
                 return Err(WandEncError::Unsupported(
@@ -900,12 +930,16 @@ impl<'vir> WandEncOutput<'vir> {
         call_ctx: GArgs<'vir>,
     ) -> Vec<GenericNode<'vir>> {
         let blocked = self.blocked_inputs();
-        let inputs = self.inputs().map(|i| (FunctionShapeNode::from(i), Some(blocked.contains(&i))));
+        let inputs = self
+            .inputs()
+            .map(|i| (FunctionShapeNode::from(i), Some(blocked.contains(&i))));
         let outputs = self.outputs().map(|o| (FunctionShapeNode::from(o), None));
         inputs
             .chain(outputs)
             .filter_map(|(g, blocked)| {
-                let (nodes, node) = self.function_shape_node(vcx, deps, g, Some(call_ctx)).ok()??;
+                let (nodes, node) = self
+                    .function_shape_node(vcx, deps, g, Some(call_ctx))
+                    .ok()??;
                 nodes.is_regions_in(node).then(|| GenericNode {
                     local: g.mir_local(),
                     node,

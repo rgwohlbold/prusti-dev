@@ -34,7 +34,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     pub(crate) fn generic_call_regroup(
         &mut self,
         generic: &[GenericNode<'vir>],
-        args: &[(prusti_rustc_interface::middle::ty::Ty<'vir>, vir::ExprSnap<'vir>)],
+        args: &[(
+            prusti_rustc_interface::middle::ty::Ty<'vir>,
+            vir::ExprSnap<'vir>,
+        )],
     ) -> EncodeResult<'vir, (), E> {
         for nodes in by_local(generic.iter().filter(|n| n.blocked.is_some())) {
             let (ty, snap) = args[nodes[0].local.as_usize() - 1];
@@ -61,7 +64,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             let node = nodes[0];
             let (place, snap) = match node.blocked {
                 Some(_) => {
-                    let Some(place) = args[node.local.as_usize() - 1] else { continue };
+                    let Some(place) = args[node.local.as_usize() - 1] else {
+                        continue;
+                    };
                     let snap = self.encode_place_with_snap(place.into())?.1;
                     (place, self.vcx.mk_local_labelled_old_expr(snap, label_pre))
                 }
@@ -96,7 +101,10 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     pub(crate) fn generic_wand_split(
         &mut self,
         generic: &[GenericNode<'vir>],
-        args: &[(prusti_rustc_interface::middle::ty::Ty<'vir>, vir::ExprSnap<'vir>)],
+        args: &[(
+            prusti_rustc_interface::middle::ty::Ty<'vir>,
+            vir::ExprSnap<'vir>,
+        )],
     ) -> EncodeResult<'vir, (), E> {
         for nodes in by_local(generic.iter().filter(|n| n.blocked == Some(true))) {
             let (ty, snap) = args[nodes[0].local.as_usize() - 1];
@@ -118,10 +126,15 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let decomp = RustTyDecomposition::from_ty(ty, self.def_id);
         let caller = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
         let mut groups = Vec::new();
-        for (node, g) in nodes.iter().flat_map(|n| n.nodes.pieces_of(n.node).into_iter().map(move |g| (*n, g))) {
+        for (node, g) in nodes
+            .iter()
+            .flat_map(|n| n.nodes.pieces_of(n.node).into_iter().map(move |g| (*n, g)))
+        {
             let path = node.nodes.piece(g).path.clone();
             // generic in the caller as well: the same piece
-            if decomp.ty.specifics.is_param() || caller.find(&path).is_some_and(|c| caller.piece(c).all) {
+            if decomp.ty.specifics.is_param()
+                || caller.find(&path).is_some_and(|c| caller.piece(c).all)
+            {
                 continue;
             }
             let group = (0..caller.len())
@@ -164,10 +177,16 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(())
     }
 
-    fn group_casts(&mut self, decomp: RustTyDecomposition<'vir>) -> EncodeResult<'vir, GroupCasts<'vir>, E> {
+    fn group_casts(
+        &mut self,
+        decomp: RustTyDecomposition<'vir>,
+    ) -> EncodeResult<'vir, GroupCasts<'vir>, E> {
         let param = RustTyDecomposition::param();
         let param_ind = self.deps.require_ref::<TyIndirectEnc>(param)?;
-        let constructor = self.deps.require_ref::<TyConstructorEnc>(decomp.ty)?.ty_constructor;
+        let constructor = self
+            .deps
+            .require_ref::<TyConstructorEnc>(decomp.ty)?
+            .ty_constructor;
         let args = self.deps.require_dep::<GArgsTyEnc>(decomp.args)?;
         Ok(GroupCasts {
             casters: self.deps.require_ref::<IndCastersEnc>((param, decomp.ty))?,
@@ -256,20 +275,25 @@ struct GroupCasts<'vir> {
 impl<'vir> GroupCasts<'vir> {
     /// `make_generic_s_X(k, ..)`
     fn generic(&self, k: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {
-        (self.casters.make_generic_s)(k.downcast_ty(), self.args.get_ty(), self.args.get_const()).upcast_ty()
+        (self.casters.make_generic_s)(k.downcast_ty(), self.args.get_ty(), self.args.get_const())
+            .upcast_ty()
     }
 
     fn make_generic(&self, k: vir::ExprSnap<'vir>, r: Range<'vir>) -> vir::Stmt<'vir> {
-        (self.casters.make_generic)(k, self.args.get_ty(), self.args.get_const(), r.lo, r.hi).alloc()
+        (self.casters.make_generic)(k, self.args.get_ty(), self.args.get_const(), r.lo, r.hi)
+            .alloc()
     }
 
     fn make_concrete(&self, p: vir::ExprSnap<'vir>, r: Range<'vir>) -> vir::Stmt<'vir> {
-        (self.casters.make_concrete)(p, self.args.get_ty(), self.args.get_const(), r.lo, r.hi).alloc()
+        (self.casters.make_concrete)(p, self.args.get_ty(), self.args.get_const(), r.lo, r.hi)
+            .alloc()
     }
 }
 
 /// The nodes grouped by their local (in order of first appearance).
-fn by_local<'a, 'vir>(nodes: impl Iterator<Item = &'a GenericNode<'vir>>) -> Vec<Vec<&'a GenericNode<'vir>>> {
+fn by_local<'a, 'vir>(
+    nodes: impl Iterator<Item = &'a GenericNode<'vir>>,
+) -> Vec<Vec<&'a GenericNode<'vir>>> {
     let mut groups: Vec<Vec<&GenericNode<'vir>>> = Vec::new();
     for node in nodes {
         match groups.iter_mut().find(|g| g[0].local == node.local) {

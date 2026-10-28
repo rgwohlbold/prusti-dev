@@ -90,7 +90,8 @@ pub struct TyUseImpureMutRef<'vir> {
     referent: Option<ReferentPieces<'vir>>,
 }
 
-type RefToSnap<'vir> = vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>;
+type RefToSnap<'vir> =
+    vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>;
 
 /// Pieces of a concrete referent `p: U` (occurrence `o`) and the pieces of the
 /// reference holding them (occurrence `In(0) ++ o`, whose body is the generic
@@ -119,7 +120,8 @@ impl<'vir> ReferentPieces<'vir> {
         let Some(casters) = self.casters else {
             return Vec::new();
         };
-        let p_snap = self.concrete_snap.call()(addr, self.ty_args.get_ty(), self.ty_args.get_const());
+        let p_snap =
+            self.concrete_snap.call()(addr, self.ty_args.get_ty(), self.ty_args.get_const());
         self.pairs
             .iter()
             .rev()
@@ -340,10 +342,17 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         let own_region = PrustiPcgCtxt.extract_regions(self.decomp)[own];
         let normalized = referent.decompose_compare_normalize(params, self.args);
         let Some(normalized) = normalized else {
-            return Ok((Some(nodes), None, self.param_referent_pieces(referent, nodes)?));
+            return Ok((
+                Some(nodes),
+                None,
+                self.param_referent_pieces(referent, nodes)?,
+            ));
         };
         // TODO: a referent whose type cannot be encoded keeps its pieces.
-        let Ok(referent_nodes) = self.deps.require_dep::<IndirectNodesEnc>(normalized.concrete) else {
+        let Ok(referent_nodes) = self
+            .deps
+            .require_dep::<IndirectNodesEnc>(normalized.concrete)
+        else {
             return Ok((Some(nodes), None, None));
         };
         let mentions_own = PrustiPcgCtxt
@@ -379,13 +388,21 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                     .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?,
             ),
             empty: None,
-            ty_args: self.deps.require_dep::<GArgsTyEnc>(normalized.concrete.args)?,
-            generic_snap: self.deps.require_ref::<TyImpureEnc>(normalized.param)?.ref_to_snap,
+            ty_args: self
+                .deps
+                .require_dep::<GArgsTyEnc>(normalized.concrete.args)?,
+            generic_snap: self
+                .deps
+                .require_ref::<TyImpureEnc>(normalized.param)?
+                .ref_to_snap,
             concrete_snap: self
                 .deps
                 .require_ref::<TyImpureEnc>(normalized.concrete.ty)?
                 .ref_to_snap,
-            param_ext: self.deps.require_ref::<TyIndirectEnc>(normalized.param)?.ext,
+            param_ext: self
+                .deps
+                .require_ref::<TyIndirectEnc>(normalized.param)?
+                .ext,
             pairs: vir::with_vcx(|vcx| vcx.alloc_slice(&pairs)),
         };
         Ok(match mentions_own {
@@ -454,8 +471,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             TySpecifics::MutRef(data) => {
                 let referent_caster = self.encode_normalized(data.0.referent, ty.0.params)?;
                 let metadata_caster = self.encode_normalized_pure(data.0.metadata, ty.0.params)?;
-                let (nodes, inner, referent) =
-                    self.mutref_nodes(data.0.referent, ty.0.params)?;
+                let (nodes, inner, referent) = self.mutref_nodes(data.0.referent, ty.0.params)?;
                 TySpecifics::mk_mutref(TyUseImpureMutRef {
                     referent_caster,
                     metadata_caster,

@@ -29,21 +29,52 @@ use super::{
 ///   and `ind_empty` (see `ParamRanges`).
 pub struct TyIndirectEnc;
 
-pub type TyIndirectPred<'vir> =
-    PredicateIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int)>;
+pub type TyIndirectPred<'vir> = PredicateIdn<
+    'vir,
+    (
+        vir::Snap,
+        vir::ManyTyVal,
+        vir::ManyCSnap,
+        vir::Int,
+        vir::Int,
+    ),
+>;
 
 pub type TyIndirectExt<'vir> = FunctionIdn<
     'vir,
-    (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int),
+    (
+        vir::Snap,
+        vir::ManyTyVal,
+        vir::ManyCSnap,
+        vir::Int,
+        vir::Int,
+    ),
     vir::Snap,
 >;
 
-pub type TyIndirectEmpty<'vir> =
-    vir::MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int)>;
+pub type TyIndirectEmpty<'vir> = vir::MethodIdn<
+    'vir,
+    (
+        vir::Snap,
+        vir::ManyTyVal,
+        vir::ManyCSnap,
+        vir::Int,
+        vir::Int,
+    ),
+>;
 
 /// `split_Param`/`merge_Param(K, T, lo, m, hi)`
-pub type TyIndirectSplit<'vir> =
-    vir::MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int, vir::Int)>;
+pub type TyIndirectSplit<'vir> = vir::MethodIdn<
+    'vir,
+    (
+        vir::Snap,
+        vir::ManyTyVal,
+        vir::ManyCSnap,
+        vir::Int,
+        vir::Int,
+        vir::Int,
+    ),
+>;
 
 /// The trusted methods of `p_Param_ind`:
 /// ```text
@@ -162,8 +193,15 @@ impl TaskEncoder for TyIndirectEnc {
                 ),
                 snap.snapshot,
             );
-            let is_param = matches!(ty.specifics, TySpecifics::Param(_)) && params.ty_exprs().len() == 1;
-            let range_args = (snap.snapshot, params.ty_args(), params.const_args(), vir::TYPE_INT, vir::TYPE_INT);
+            let is_param =
+                matches!(ty.specifics, TySpecifics::Param(_)) && params.ty_exprs().len() == 1;
+            let range_args = (
+                snap.snapshot,
+                params.ty_args(),
+                params.const_args(),
+                vir::TYPE_INT,
+                vir::TYPE_INT,
+            );
             let split_args = (
                 snap.snapshot,
                 params.ty_args(),
@@ -177,13 +215,24 @@ impl TaskEncoder for TyIndirectEnc {
                 split: vir::MethodIdn::new(vir::ViperIdent::new("split_Param"), split_args),
                 merge: vir::MethodIdn::new(vir::ViperIdent::new("merge_Param"), split_args),
             });
-            deps.emit_output_ref(ty, TyIndirectRef { pred, ext: ext_idn, param: param_ranges })?;
+            deps.emit_output_ref(
+                ty,
+                TyIndirectRef {
+                    pred,
+                    ext: ext_idn,
+                    param: param_ranges,
+                },
+            )?;
 
             let key_decl = vcx.mk_local_decl("key", snap.snapshot);
             let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
             let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
-            let range = Range { lo: vcx.mk_local_ex(lo_decl), hi: vcx.mk_local_ex(hi_decl) };
-            let mut builder = IndirectBuilder::new(vcx, deps, ty, vcx.alloc_slice(params.ty_exprs()), range);
+            let range = Range {
+                lo: vcx.mk_local_ex(lo_decl),
+                hi: vcx.mk_local_ex(hi_decl),
+            };
+            let mut builder =
+                IndirectBuilder::new(vcx, deps, ty, vcx.alloc_slice(params.ty_exprs()), range);
             let key = vcx.mk_local_ex(key_decl);
             let combined = ty.zip(snap);
             let body = match &combined.specifics {
@@ -242,7 +291,13 @@ impl TaskEncoder for TyIndirectEnc {
             };
             let predicate = vcx.mk_predicate(
                 pred,
-                (key_decl, params.ty_decls(), params.const_decls(), lo_decl, hi_decl),
+                (
+                    key_decl,
+                    params.ty_decls(),
+                    params.const_decls(),
+                    lo_decl,
+                    hi_decl,
+                ),
                 body,
             );
 
@@ -251,7 +306,13 @@ impl TaskEncoder for TyIndirectEnc {
             let k = vcx.mk_local_ex(k_decl);
             // `acc(p_X_ind(K, .., lo, hi), wildcard)`
             let piece = || {
-                pred(k, params.ty_exprs(), params.const_exprs(), range.lo, range.hi)(Some(vcx.mk_wildcard()))
+                pred(
+                    k,
+                    params.ty_exprs(),
+                    params.const_exprs(),
+                    range.lo,
+                    range.hi,
+                )(Some(vcx.mk_wildcard()))
             };
             let nonempty = range.nonempty();
             // `K` for an empty range, which needs no permission
@@ -283,7 +344,9 @@ impl TaskEncoder for TyIndirectEnc {
                 TySpecifics::StructLike(data) => {
                     let k = k.downcast_ty::<vir::CSnap>();
                     Some(match builder.ext_fields(k, data)? {
-                        Some(fields) => unfolding((data.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty()),
+                        Some(fields) => unfolding(
+                            (data.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty(),
+                        ),
                         None => k.upcast_ty(),
                     })
                 }
@@ -297,7 +360,8 @@ impl TaskEncoder for TyIndirectEnc {
                             continue;
                         };
                         branches = true;
-                        let cons = (variant.inner.data.1.field_snaps_to_snap)(fields.as_slice()).upcast_ty();
+                        let cons = (variant.inner.data.1.field_snaps_to_snap)(fields.as_slice())
+                            .upcast_ty();
                         body = vir::expr! { vcx;
                             (([discr]) == ([variant.data.1.discr])) ? ([cons]) : ([body])
                         };
@@ -315,10 +379,20 @@ impl TaskEncoder for TyIndirectEnc {
             // an empty range extends nothing (the bodies say so for the others)
             let result = vcx.mk_result(snap.snapshot);
             let empty = vir::expr! { vcx; (!([nonempty])) ==> (([result]) == ([k])) };
-            let posts = if body.is_none() { vec![empty] } else { Vec::new() };
+            let posts = if body.is_none() {
+                vec![empty]
+            } else {
+                Vec::new()
+            };
             let ext = vcx.mk_function(
                 ext_idn,
-                (k_decl, params.ty_decls(), params.const_decls(), lo_decl, hi_decl),
+                (
+                    k_decl,
+                    params.ty_decls(),
+                    params.const_decls(),
+                    lo_decl,
+                    hi_decl,
+                ),
                 vcx.alloc_slice(&[pre]),
                 vcx.alloc_slice(&posts),
                 None,
@@ -332,7 +406,9 @@ impl TaskEncoder for TyIndirectEnc {
                     read: PartRead::RefSlot(pure.value_access),
                     path: Vec::new(),
                 }),
-                TySpecifics::StructLike(data) => builder.collect_parts(data, None, &mut ty_param_parts),
+                TySpecifics::StructLike(data) => {
+                    builder.collect_parts(data, None, &mut ty_param_parts)
+                }
                 TySpecifics::EnumLike(data) => {
                     for variant in &data.variants {
                         let vid = Some(variant.data.0.vid);
@@ -345,7 +421,14 @@ impl TaskEncoder for TyIndirectEnc {
                 Some(ranges) => param_methods(vcx, ranges, pred, ext_idn, snap.snapshot, &params),
                 None => Vec::new(),
             };
-            Ok((TyIndirectLocal { predicate, ext, param }, TyIndirectDep { ty_param_parts }))
+            Ok((
+                TyIndirectLocal {
+                    predicate,
+                    ext,
+                    param,
+                },
+                TyIndirectDep { ty_param_parts },
+            ))
         })
     }
 
@@ -385,7 +468,13 @@ fn param_methods<'vir>(
     };
     let empty = vcx.mk_method(
         ranges.empty,
-        (k_decl, params.ty_decls(), params.const_decls(), lo_decl, hi_decl),
+        (
+            k_decl,
+            params.ty_decls(),
+            params.const_decls(),
+            lo_decl,
+            hi_decl,
+        ),
         &[],
         vcx.alloc_slice(&[vir::expr! { vcx; !(([lo]) < ([hi])) }]),
         vcx.alloc_slice(&[piece(k, lo, hi)]),
@@ -395,14 +484,29 @@ fn param_methods<'vir>(
     // `[lo, hi)` on `K` is `[lo, m)` on `K` and `[m, hi)` on `K` extended by `[lo, m)`
     let (whole, whole_ext) = (piece(k, lo, hi), ext_of(k, lo, hi));
     let upper_key = ext_of(k, lo, m);
-    let (lower, upper, upper_ext) = (piece(k, lo, m), piece(upper_key, m, hi), ext_of(upper_key, m, hi));
-    let decls = (k_decl, params.ty_decls(), params.const_decls(), lo_decl, m_decl, hi_decl);
+    let (lower, upper, upper_ext) = (
+        piece(k, lo, m),
+        piece(upper_key, m, hi),
+        ext_of(upper_key, m, hi),
+    );
+    let decls = (
+        k_decl,
+        params.ty_decls(),
+        params.const_decls(),
+        lo_decl,
+        m_decl,
+        hi_decl,
+    );
     let split = vcx.mk_method(
         ranges.split,
         decls,
         &[],
         vcx.alloc_slice(&[ordered, whole]),
-        vcx.alloc_slice(&[lower, upper, vir::expr! { vcx; ([upper_ext]) == (old([whole_ext])) }]),
+        vcx.alloc_slice(&[
+            lower,
+            upper,
+            vir::expr! { vcx; ([upper_ext]) == (old([whole_ext])) },
+        ]),
         None,
     );
     let merge = vcx.mk_method(
@@ -410,7 +514,10 @@ fn param_methods<'vir>(
         decls,
         &[],
         vcx.alloc_slice(&[ordered, lower, upper]),
-        vcx.alloc_slice(&[whole, vir::expr! { vcx; ([whole_ext]) == (old([upper_ext])) }]),
+        vcx.alloc_slice(&[
+            whole,
+            vir::expr! { vcx; ([whole_ext]) == (old([upper_ext])) },
+        ]),
         None,
     );
     vec![empty, split, merge]
@@ -483,7 +590,8 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
     /// The part of the range inside the referent of `&'a mut T` (positions
     /// `1 .. 1 + arity(T)`), in the referent's positions.
     fn referent_range(&self) -> Range<'vir> {
-        self.range.restrict(int(1), TyArityEnc::arity(self.ty_args[0]))
+        self.range
+            .restrict(int(1), TyArityEnc::arity(self.ty_args[0]))
     }
 
     /// The part of the range at occurrence `idx` of a field (in the field
@@ -496,7 +604,10 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
         let param = field.params[idx]?;
         let (_, offset, width) = self.offsets.iter().find(|(p, ..)| *p == param)?;
         let part = self.range.restrict(*offset, *width);
-        Some((part.shift(self.pos(&field.occurrences[idx].pos)), part.nonempty()))
+        Some((
+            part.shift(self.pos(&field.occurrences[idx].pos)),
+            part.nonempty(),
+        ))
     }
 
     /// Per occurrence of a parameter in the fields: `guard ==> piece`.
@@ -537,7 +648,9 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
             }
             let mut occurrence_key = key;
             for earlier in 0..idx {
-                let Some(range) = self.occurrence_range(field, earlier) else { continue };
+                let Some(range) = self.occurrence_range(field, earlier) else {
+                    continue;
+                };
                 occurrence_key = self.ext(field.ty, occurrence_key, range.0)?;
             }
             keys.push(Some(occurrence_key));
@@ -558,7 +671,9 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
             let field = self.field_occurrences(rust.ty().decompose(self.params));
             let mut value = pure.read.call()(k);
             for idx in 0..field.occurrences.len() {
-                let Some(range) = self.occurrence_range(&field, idx) else { continue };
+                let Some(range) = self.occurrence_range(&field, idx) else {
+                    continue;
+                };
                 extended = true;
                 value = self.ext(field.ty, value, range.0)?;
             }
@@ -632,12 +747,18 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
                     // Not a lifetime of the constructor (e.g. `'static`).
                     _ => None,
                 },
-                End::Param(param) => Some(Param::Ty(param_position(self.params, param.index, |arg| {
-                    arg.as_type().is_some()
-                }))),
+                End::Param(param) => {
+                    Some(Param::Ty(param_position(self.params, param.index, |arg| {
+                        arg.as_type().is_some()
+                    })))
+                }
             })
             .collect();
-        FieldOccurrences { ty, occurrences, params }
+        FieldOccurrences {
+            ty,
+            occurrences,
+            params,
+        }
     }
 }
 

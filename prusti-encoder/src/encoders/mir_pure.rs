@@ -5,8 +5,8 @@ use crate::encoders::{
     pure::spec::MirSpecEncMode,
     ty::{
         RustTyDecomposition,
-        indirect_node::IndirectNodesEnc,
         generics::{GArgs, GParams},
+        indirect_node::IndirectNodesEnc,
         use_pure::{TyUsePure, TyUsePureEnc},
     },
 };
@@ -1159,8 +1159,9 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                         if self.read_extended {
                             // The extended snapshot holds the referent.
                             let val_expr = e_ty.value_access(snap);
-                            return Ok(EncodedPlace::new(val_expr, Some(ref_expr))
-                                .with_metadata(metadata));
+                            return Ok(
+                                EncodedPlace::new(val_expr, Some(ref_expr)).with_metadata(metadata)
+                            );
                         }
                         if !self.impure_context {
                             // The value field of a mutable reference's snapshot

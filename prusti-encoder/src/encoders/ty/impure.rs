@@ -7,9 +7,9 @@ use crate::encoders::{Impure, ty::use_impure::TyUseImpure};
 
 use super::{
     RustTy, ViperTyDatas,
-    indirect_pred::TyIndirectEnc,
     data::*,
     generics::{GenericParams, GenericParamsEnc},
+    indirect_pred::TyIndirectEnc,
     pure::*,
 };
 

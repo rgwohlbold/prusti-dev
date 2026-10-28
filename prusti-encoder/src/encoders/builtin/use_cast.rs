@@ -87,7 +87,7 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
             MirBuiltinUseCastOutput::Simple(..) => None,
             MirBuiltinUseCastOutput::Unsize(u) => u
                 .unsize
-                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const())) 
+                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const()))
                 .map(vir::StmtKindGenData::alloc),
         }
     }
@@ -100,7 +100,7 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
             MirBuiltinUseCastOutput::Simple(..) => None,
             MirBuiltinUseCastOutput::Unsize(u) => u
                 .undo
-                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const())) 
+                .map(|f| f.call()(input, u.generics.get_ty(), u.generics.get_const()))
                 .map(vir::StmtKindGenData::alloc),
         }
     }

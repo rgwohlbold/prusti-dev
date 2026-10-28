@@ -442,7 +442,11 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         // `p_Ref_mutable_ind(src, U, 0, 1)` and
                         // `p_Ref_mutable_ind(cast(src), V, 0, 1)`.
                         let ind = deps.require_ref::<TyIndirectEnc>(operand_ty)?.pred;
-                        let dst_ex = fn_idn(src_ex, unsize_params.ty_exprs(), unsize_params.const_exprs());
+                        let dst_ex = fn_idn(
+                            src_ex,
+                            unsize_params.ty_exprs(),
+                            unsize_params.const_exprs(),
+                        );
                         let own = Range::starting_at(int(0), int(1));
                         let u_piece = ind(src_ex.upcast_ty(), &[u], &[], own.lo, own.hi)(None);
                         let v_piece = ind(dst_ex.upcast_ty(), &[v], &[], own.lo, own.hi)(None);

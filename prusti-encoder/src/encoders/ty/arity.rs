@@ -32,10 +32,15 @@ impl TaskEncoder for TyArityEnc {
         deps: &mut task_encoder::TaskEncoderDependencies<'vir, Self>,
     ) -> EncodeFullResult<'vir, Self> {
         deps.emit_output_ref(*task_key, ())?;
-        if matches!(task_key.specifics, TySpecifics::Param(RustParamData::Generic)) {
+        if matches!(
+            task_key.specifics,
+            TySpecifics::Param(RustParamData::Generic)
+        ) {
             return Ok((None, ()));
         }
-        let constructor = deps.require_ref::<TyConstructorEnc>(*task_key)?.ty_constructor;
+        let constructor = deps
+            .require_ref::<TyConstructorEnc>(*task_key)?
+            .ty_constructor;
         vir::with_vcx(|vcx| {
             let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
             let lhs = Self::arity(constructor(params.ty_exprs(), params.const_exprs()));
@@ -87,7 +92,11 @@ impl TaskEncoder for TyArityEnc {
 
 impl TyArityEnc {
     pub fn arity_fn<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
-        vir::FunctionIdn::new(vir::ViperIdent::new("arity"), vir::TYPE_TYVAL, vir::TYPE_INT)
+        vir::FunctionIdn::new(
+            vir::ViperIdent::new("arity"),
+            vir::TYPE_TYVAL,
+            vir::TYPE_INT,
+        )
     }
 
     /// `arity(ty)`
@@ -107,7 +116,10 @@ fn arity_rhs<'vir>(
 ) -> vir::ExprInt<'vir> {
     let occurrences = occurrences(RustTyDecomposition::identity(ty)).unwrap_or_default();
     {
-        let own = occurrences.iter().filter(|o| matches!(o.end, End::Region(_))).count();
+        let own = occurrences
+            .iter()
+            .filter(|o| matches!(o.end, End::Region(_)))
+            .count();
         let arities = occurrences.iter().filter_map(|o| match o.end {
             End::Param(param) => Some(TyArityEnc::arity(
                 ty_exprs[param_position(params, param.index, |arg| arg.as_type().is_some())],
@@ -117,4 +129,3 @@ fn arity_rhs<'vir>(
         arities.fold(int(own), add)
     }
 }
-

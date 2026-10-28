@@ -207,14 +207,18 @@ where
     pub pending_aggregate_casts: Vec<crate::encoders::impure::nested::AggregateCast<'vir>>,
     /// The open nested pieces at the end of each encoded block (see
     /// `impure::nested::NestedPathState`).
-    pub nested_at_exit: FxHashMap<mir::BasicBlock, crate::encoders::impure::nested::NestedPathState<'vir>>,
+    pub nested_at_exit:
+        FxHashMap<mir::BasicBlock, crate::encoders::impure::nested::NestedPathState<'vir>>,
     /// The enum places assigned an aggregate and their variants (the PCG
     /// `Aggregate` edges do not name it).
     pub aggregate_variants: Vec<(Place<'vir>, prusti_rustc_interface::abi::VariantIdx)>,
     /// Values built from parts whose piece was unfolded in the current phase
     /// because their loans expired, and the parts cast back to concrete.
     pub released_aggregates: Vec<(Place<'vir>, usize)>,
-    pub released_parts: Vec<(MaybeLabelledPlace<'vir>, crate::encoders::ty::indirect_node::RegionIdx)>,
+    pub released_parts: Vec<(
+        MaybeLabelledPlace<'vir>,
+        crate::encoders::ty::indirect_node::RegionIdx,
+    )>,
     pub current_block_succs: Option<FxHashMap<mir::BasicBlock, vir::CfgBlockLabel<'vir>>>,
     pub current_block_label: Option<vir::CfgBlockLabel<'vir>>,
     pub current_stmts: Option<Vec<vir::Stmt<'vir>>>,
@@ -938,7 +942,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             return Ok(());
         }
         self.applied_wands.push(block);
-        let wands = self.deps.require_dep::<WandEnc>(WandEncTask { data: function_data })?;
+        let wands = self.deps.require_dep::<WandEnc>(WandEncTask {
+            data: function_data,
+        })?;
         let bb = &self.body[block];
         let terminator = bb.terminator.as_ref().unwrap();
         let mir::TerminatorKind::Call {
@@ -958,7 +964,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         let (_, caller_substs) = self.get_call_data(func);
         let (_, dest_snap, _, _) = self.encode_place_with_snap((*destination).into())?;
         let wand_args = std::iter::once(Ok(dest_snap))
-            .chain(args.iter().map(|operand| self.encode_operand_snap_immediate(&operand.node)))
+            .chain(
+                args.iter()
+                    .map(|operand| self.encode_operand_snap_immediate(&operand.node)),
+            )
             .collect::<EncodeResult<'vir, Vec<_>, E>>()?;
         let (label_pre, label_post) = self.call_labels[&block];
         let call_ctx = self.gargs(caller_substs);
@@ -2570,7 +2579,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
             mir::TerminatorKind::Return => {
                 let current_fpcs = self.current_fpcs.take().unwrap();
-                let post_main = &current_fpcs.statements.last().unwrap().states[EvalStmtPhase::PostMain];
+                let post_main =
+                    &current_fpcs.statements.last().unwrap().states[EvalStmtPhase::PostMain];
                 let borrows = post_main.borrow_pcg();
                 self.nested_fold_at_return(post_main)?;
                 let wand_packages = self.package_wands(borrows)?;
@@ -2654,7 +2664,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                         let arg_places = args
                             .iter()
                             .map(|arg| match &arg.node {
-                                mir::Operand::Move(place) | mir::Operand::Copy(place) => Some(*place),
+                                mir::Operand::Move(place) | mir::Operand::Copy(place) => {
+                                    Some(*place)
+                                }
                                 _ => None,
                             })
                             .collect::<Vec<_>>();

@@ -1,0 +1,9 @@
+# Keep rust-analyzer's cargo runs out of target/debug so they don't invalidate ./x.py builds.
+[cargo]
+targetDir = true
+
+[cargo.extraEnv]
+JAVA_HOME = "/usr/lib/jvm/default"
+LD_LIBRARY_PATH = "/usr/lib/jvm/default/lib/server"
+VIPER_HOME = "/home/richard/progs/prusti-dev/viper_tools/backends"
+Z3_EXE = "/home/richard/progs/prusti-dev/viper_tools/z3/bin/z3"

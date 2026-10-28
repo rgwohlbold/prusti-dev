@@ -147,7 +147,8 @@ impl<'vir> IndirectNodes<'vir> {
     pub fn range(&self, piece: usize) -> Range<'vir> {
         let piece = &self.pieces[piece];
         let ty_of = |param: ty::ParamTy| {
-            self.context_tys[param_position(self.context, param.index, |arg| arg.as_type().is_some())]
+            self.context_tys
+                [param_position(self.context, param.index, |arg| arg.as_type().is_some())]
         };
         let lo = pos_expr(&piece.pos, ty_of);
         let width = match piece.width {
@@ -317,7 +318,11 @@ impl TaskEncoder for IndirectNodesEnc {
                     End::Region(region) => (PcgRegion::from(region), false),
                     End::Param(param) => (PcgRegion::RegionsIn(param), true),
                 };
-                let node = regions.iter_enumerated().find(|(_, r)| **r == region).unwrap().0;
+                let node = regions
+                    .iter_enumerated()
+                    .find(|(_, r)| **r == region)
+                    .unwrap()
+                    .0;
                 NodePiece {
                     node,
                     all,
@@ -331,9 +336,9 @@ impl TaskEncoder for IndirectNodesEnc {
 
         // enclosing regions first
         let encloses = |a: RegionIdx, b: RegionIdx| {
-            pieces.iter().any(|piece| {
-                piece.node == b && piece.parents.iter().any(|p| pieces[*p].node == a)
-            })
+            pieces
+                .iter()
+                .any(|piece| piece.node == b && piece.parents.iter().any(|p| pieces[*p].node == a))
         };
         let mut order = Vec::new();
         while order.len() < regions.len() {

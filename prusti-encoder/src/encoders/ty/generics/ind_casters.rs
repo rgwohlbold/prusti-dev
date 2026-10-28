@@ -4,9 +4,7 @@ use vir::{CastType, MethodIdn};
 use crate::encoders::{
     Pure,
     ty::{
-        RustTy,
-        indirect_pred::TyIndirectEnc,
-        lifted::ty_constructor::TyConstructorEnc,
+        RustTy, indirect_pred::TyIndirectEnc, lifted::ty_constructor::TyConstructorEnc,
         pure::TyPureEnc,
     },
 };
@@ -44,8 +42,16 @@ pub(crate) struct IndCasters<'vir> {
     pub(crate) make_concrete_s: vir::AdtDestructor<'vir, vir::PSnap, vir::CSnap>,
 }
 
-pub(crate) type IndCaster<'vir> =
-    MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Int, vir::Int)>;
+pub(crate) type IndCaster<'vir> = MethodIdn<
+    'vir,
+    (
+        vir::Snap,
+        vir::ManyTyVal,
+        vir::ManyCSnap,
+        vir::Int,
+        vir::Int,
+    ),
+>;
 
 impl<'vir> task_encoder::OutputRefAny for IndCasters<'vir> {}
 
@@ -97,7 +103,9 @@ impl TaskEncoder for IndCastersEnc {
                 },
             )?;
 
-            let ty_constructor = deps.require_ref::<TyConstructorEnc>(concrete)?.ty_constructor;
+            let ty_constructor = deps
+                .require_ref::<TyConstructorEnc>(concrete)?
+                .ty_constructor;
             let concrete_ind = deps.require_ref::<TyIndirectEnc>(concrete)?;
             let param_ind = deps.require_ref::<TyIndirectEnc>(param)?;
 
@@ -129,7 +137,13 @@ impl TaskEncoder for IndCastersEnc {
             let generic_ext_old = make_generic(vir::expr! { vcx; old([concrete_ext(k)]) });
             let make_generic_method = vcx.mk_method(
                 make_generic_ident,
-                (k_decl, generics.ty_decls(), generics.const_decls(), lo_decl, hi_decl),
+                (
+                    k_decl,
+                    generics.ty_decls(),
+                    generics.const_decls(),
+                    lo_decl,
+                    hi_decl,
+                ),
                 &[],
                 vcx.alloc_slice(&[concrete_pred(k)]),
                 vcx.alloc_slice(&[
@@ -147,7 +161,13 @@ impl TaskEncoder for IndCastersEnc {
             let round_trip = make_generic(make_concrete(p));
             let make_concrete_method = vcx.mk_method(
                 make_concrete_ident,
-                (p_decl, generics.ty_decls(), generics.const_decls(), lo_decl, hi_decl),
+                (
+                    p_decl,
+                    generics.ty_decls(),
+                    generics.const_decls(),
+                    lo_decl,
+                    hi_decl,
+                ),
                 &[],
                 vcx.alloc_slice(&[param_pred(p)]),
                 vcx.alloc_slice(&[
