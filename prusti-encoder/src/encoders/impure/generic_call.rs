@@ -216,12 +216,12 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         }
         for (p, k) in group.iter().zip(&chain) {
             let r = caller.range(*p);
-            self.stmt(c.make_generic(*k, r));
+            self.stmt(c.make_generic(k, r));
         }
         // right to left: `[l_i, l_i+1)` with the merged `[l_i+1, hi)`
         for (p, k) in group.iter().zip(&chain).rev().skip(1) {
             let r = caller.range(*p);
-            self.stmt((c.param.merge)(c.generic(*k), &[c.x], &[], r.lo, r.hi, range.hi).alloc());
+            self.stmt((c.param.merge)(c.generic(k), &[c.x], &[], r.lo, r.hi, range.hi).alloc());
         }
         if !top {
             self.stmt(c.make_concrete(c.generic(chain[0]), range));
@@ -250,7 +250,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             chain.push(self.bind((c.param_ext)(k, &[c.x], &[], r.lo, r.hi)));
         }
         for (p, k) in group.iter().zip(&chain) {
-            self.stmt(c.make_concrete(*k, caller.range(*p)));
+            self.stmt(c.make_concrete(k, caller.range(*p)));
         }
     }
 

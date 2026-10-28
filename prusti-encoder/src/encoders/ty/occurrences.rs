@@ -14,7 +14,8 @@
 //! topological order of enclosure, enclosing ones first), then the positions
 //! of its type arguments. A type parameter `T` covers `arity(T)` positions.
 
-use std::collections::{BTreeSet, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 
 use prusti_rustc_interface::middle::ty;
 
@@ -167,7 +168,7 @@ impl Summary {
 
 #[derive(Default)]
 struct Walker<'tcx> {
-    done: HashMap<RustTy<'tcx>, Summary>,
+    done: FxHashMap<RustTy<'tcx>, Summary>,
     /// Summaries being computed, with their current approximation (for
     /// recursive types; iterated to a fixpoint).
     stack: Vec<(RustTy<'tcx>, Summary)>,
@@ -207,14 +208,14 @@ impl<'tcx> Walker<'tcx> {
                     .iter()
                     .filter_map(|arg| arg.as_region())
                     .collect::<Vec<_>>();
-                let mut lifetimes = HashMap::new();
+                let mut lifetimes = FxHashMap::default();
                 for i in summary.own_order() {
                     lifetimes.insert(i, found.list.len());
                     found
                         .list
                         .push((with(prefix, Step::Here(i)), End::Region(regions[i])));
                 }
-                let mut tys = HashMap::new();
+                let mut tys = FxHashMap::default();
                 for j in summary.tys.iter().copied() {
                     tys.insert(j, self.descend(decomp, j, prefix, found));
                 }

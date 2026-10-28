@@ -359,7 +359,7 @@ impl<'vir> WandEncOutput<'vir> {
             .into_iter();
 
         let mut outputs = self.outputs().collect::<Vec<_>>();
-        outputs.sort_by_cached_key(|g| self.node_rank(vcx, deps, (*g).into()));
+        outputs.sort_by_cached_key(|g| self.node_rank(vcx, deps, *g));
         let output_posts = outputs.into_iter().filter_map(|g| {
             self.encode_predicates_for_function_shape_node(vcx, deps, g, None, |i| {
                 local_defs[i].impure_snap
@@ -617,7 +617,7 @@ impl TaskEncoder for WandEnc {
             for g in nodes_output
                 .inputs()
                 .map(FunctionShapeNode::from)
-                .chain(nodes_output.outputs().map(FunctionShapeNode::from))
+                .chain(nodes_output.outputs())
             {
                 nodes_output
                     .function_shape_node(vcx, deps, g, None)

@@ -337,7 +337,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         if nodes.find(&[Step::Here(0)]).is_none() {
             return Ok((None, None, None));
         }
-        let nodes = vir::with_vcx(|vcx| &*vcx.alloc(nodes));
+        let nodes = vir::with_vcx(|vcx| vcx.alloc(nodes));
         let own = RegionIdx::from(0);
         let own_region = PrustiPcgCtxt.extract_regions(self.decomp)[own];
         let normalized = referent.decompose_compare_normalize(params, self.args);
@@ -382,7 +382,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         }
         pairs.sort();
         let pieces = ReferentPieces {
-            nodes: vir::with_vcx(|vcx| &*vcx.alloc(referent_nodes)),
+            nodes: vir::with_vcx(|vcx| vcx.alloc(referent_nodes)),
             casters: Some(
                 self.deps
                     .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?,
@@ -439,7 +439,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         let param_ind = self.deps.require_ref::<TyIndirectEnc>(param)?;
         let param_snap = self.deps.require_ref::<TyImpureEnc>(param)?.ref_to_snap;
         Ok(Some(ReferentPieces {
-            nodes: vir::with_vcx(|vcx| &*vcx.alloc(referent_nodes)),
+            nodes: vir::with_vcx(|vcx| vcx.alloc(referent_nodes)),
             casters: None,
             empty: param_ind.param.map(|param| param.empty),
             ty_args: self.deps.require_dep::<GArgsTyEnc>(concrete.args)?,

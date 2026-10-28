@@ -603,7 +603,7 @@ impl<'a, 'vir> IndirectBuilder<'a, 'vir> {
     ) -> Option<(Range<'vir>, vir::ExprBool<'vir>)> {
         let param = field.params[idx]?;
         let (_, offset, width) = self.offsets.iter().find(|(p, ..)| *p == param)?;
-        let part = self.range.restrict(*offset, *width);
+        let part = self.range.restrict(offset, width);
         Some((
             part.shift(self.pos(&field.occurrences[idx].pos)),
             part.nonempty(),

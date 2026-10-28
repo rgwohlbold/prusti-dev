@@ -44,7 +44,7 @@ impl TaskEncoder for TyArityEnc {
         vir::with_vcx(|vcx| {
             let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
             let lhs = Self::arity(constructor(params.ty_exprs(), params.const_exprs()));
-            let rhs = arity_rhs(*task_key, task_key.params, params.ty_exprs());
+            let rhs = arity_rhs(task_key, task_key.params, params.ty_exprs());
             let body = vir::expr! { vcx; ([lhs]) == ([rhs]) };
             let axiom_expr = if params.ty_decls().is_empty() && params.const_decls().is_empty() {
                 body

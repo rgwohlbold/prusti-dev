@@ -89,6 +89,9 @@ struct ChildCast<'vir> {
     range: Range<'vir>,
 }
 
+/// An expanded lifetime projection's place and region, and its children's.
+type LpExpansion<'vir> = (Place<'vir>, RegionIdx, Vec<(Place<'vir>, RegionIdx)>);
+
 impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
     /// At the start of `block`: the state at the end of an encoded
     /// predecessor (empty at the entry).
@@ -204,9 +207,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// The lifetime projection expanded by `expansion` and its children, if it
     /// opens a nested piece (not for a downcast, which views the same value).
-    fn lp_expansion(
-        expansion: &BorrowPcgExpansion<'vir>,
-    ) -> Option<(Place<'vir>, RegionIdx, Vec<(Place<'vir>, RegionIdx)>)> {
+    fn lp_expansion(expansion: &BorrowPcgExpansion<'vir>) -> Option<LpExpansion<'vir>> {
         let PcgNode::LifetimeProjection(base) = expansion.base() else {
             return None;
         };
@@ -237,9 +238,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 
     /// As [Self::lp_expansion], but also for labelled places (an open
     /// expansion whose places were labelled since, e.g. at `StorageDead`).
-    fn lp_expansion_any(
-        expansion: &BorrowPcgExpansion<'vir>,
-    ) -> Option<(Place<'vir>, RegionIdx, Vec<(Place<'vir>, RegionIdx)>)> {
+    fn lp_expansion_any(expansion: &BorrowPcgExpansion<'vir>) -> Option<LpExpansion<'vir>> {
         let PcgNode::LifetimeProjection(base) = expansion.base() else {
             return None;
         };
@@ -325,7 +324,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 })
                 .collect::<Vec<_>>();
             for (piece, key) in keys.iter().rev() {
-                self.stmt(self.vcx.mk_unfold_stmt(nodes.app(*piece, *key, None)));
+                self.stmt(self.vcx.mk_unfold_stmt(nodes.app(*piece, key, None)));
             }
             self.opened_regions_in.push(OpenedRegionsIn {
                 expansion: expansion.clone(),
@@ -606,7 +605,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let Some(piece) = child_nodes.find(&path) else {
                     continue;
                 };
-                let k = part.read.read(*key);
+                let k = part.read.read(key);
                 let tau = args.get_ty()[*j];
                 let range = child_nodes.range(piece);
                 let nonempty = range.nonempty();
