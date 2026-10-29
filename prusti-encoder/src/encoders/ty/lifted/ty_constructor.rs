@@ -95,6 +95,8 @@ impl TaskEncoder for TyConstructorEnc {
                 },
             )?;
             SizednessEnc::require(task_key);
+            // `arity` for every type that appears as a type value
+            let _ = deps.require_ref::<crate::encoders::ty::arity::TyArityEnc>(*task_key);
 
             let args = ty_accessor_functions
                 .iter()

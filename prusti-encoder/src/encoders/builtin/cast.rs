@@ -11,10 +11,12 @@ use crate::encoders::{
     ty::{
         LazyRustTy, RustTy, RustTyDecomposition, RustTySpecial, TySpecifics,
         generics::{GParams, GenericParamsEnc},
+        indirect_pred::TyIndirectEnc,
         interpretation::{
             bitvec::BitVecSize,
             float_conv::{FloatBitVecConvEnc, float_pow2_bits},
         },
+        range::{Range, int},
         use_pure::TyUsePureEnc,
     },
 };
@@ -435,11 +437,30 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         let src_ex = vcx.mk_local_ex(src_decl);
                         let addr = src_mutref.deref_access(src_ex);
 
-                        let u_pred = u_impure.ref_to_pred(vcx, addr, None);
-                        let v_pred = v_impure.ref_to_pred(vcx, addr, None);
-                        let u_snap = u_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>();
-                        let v_snap = v_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>();
-
+                        // The referents are held by the references' own
+                        // indirect pieces, of position 0:
+                        // `p_Ref_mutable_ind(src, U, 0, 1)` and
+                        // `p_Ref_mutable_ind(cast(src), V, 0, 1)`.
+                        let ind = deps.require_ref::<TyIndirectEnc>(operand_ty)?.pred;
+                        let dst_ex = fn_idn(
+                            src_ex,
+                            unsize_params.ty_exprs(),
+                            unsize_params.const_exprs(),
+                        );
+                        let own = Range::starting_at(int(0), int(1));
+                        let u_piece = ind(src_ex.upcast_ty(), &[u], &[], own.lo, own.hi)(None);
+                        let v_piece = ind(dst_ex.upcast_ty(), &[v], &[], own.lo, own.hi)(None);
+                        let u_pred = vcx.mk_predicate_app_expr(u_piece);
+                        let v_pred = vcx.mk_predicate_app_expr(v_piece);
+                        let u_snap = vcx.mk_unfolding_expr(
+                            u_piece,
+                            u_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>(),
+                        );
+                        let dst_addr = res_ty.expect_mutref().deref_access(dst_ex);
+                        let v_snap = vcx.mk_unfolding_expr(
+                            v_piece,
+                            v_impure.ref_to_snap(dst_addr).downcast_ty::<vir::PSnap>(),
+                        );
                         // `unsize`: operand referent `U` -> result referent `V`; the
                         // new `V` value is `value_cast(old(U), U, V)`. `undo` is the
                         // *reverse* equation: the old `V` value is `value_cast` of the
