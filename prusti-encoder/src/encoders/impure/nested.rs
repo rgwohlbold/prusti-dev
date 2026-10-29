@@ -123,6 +123,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         key_label: Option<vir::OldLabel<'vir>>,
     ) -> EncodeResult<'vir, Vec<vir::PredicateApp<'vir>>, E> {
         let place = strip_downcasts(place);
+        if self.behind_shared(place) {
+            return Ok(Vec::new());
+        }
         let ty = place.ty(self.pcg_ctxt()).ty;
         let decomp = RustTyDecomposition::from_ty(ty, self.def_id);
         let nodes = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
@@ -143,6 +146,23 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 nodes.app(piece, key, None)
             })
             .collect())
+    }
+
+    /// Is `place` behind a shared reference? Such places have no pieces: a
+    /// `&T` does not carry the pieces of its referent.
+    pub(crate) fn behind_shared(&self, mut place: Place<'vir>) -> bool {
+        while let Some((parent, elem)) = place.last_projection() {
+            if matches!(elem, mir::ProjectionElem::Deref)
+                && matches!(
+                    parent.ty(self.pcg_ctxt()).ty.kind(),
+                    ty::TyKind::Ref(.., ty::Mutability::Not)
+                )
+            {
+                return true;
+            }
+            place = parent;
+        }
+        false
     }
 
     /// The snapshot of `place`, read along its path from the local: through a
@@ -300,6 +320,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             return Ok(());
         };
         let base = strip_downcasts(base);
+        if self.behind_shared(base) {
+            return Ok(());
+        }
         let ty = base.ty(self.pcg_ctxt()).ty;
         let nodes = self
             .deps
@@ -354,6 +377,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let Some((base_place, _, children)) = Self::lp_expansion(expansion) else {
             return Ok(());
         };
+        if self.behind_shared(strip_downcasts(base_place)) {
+            return Ok(());
+        }
         if !unfolded {
             let label = self.current_phase_label();
             self.nested_expansion_unfold(expansion, Some(label))?;
@@ -784,6 +810,9 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let Some((base, _, _)) = Self::lp_expansion_any(expansion) else {
                     return false;
                 };
+                if self.behind_shared(strip_downcasts(base)) {
+                    return false;
+                }
                 let owned = !base
                     .projection()
                     .iter()
