@@ -140,7 +140,24 @@ impl<'vir> ReferentPieces<'vir> {
         })
     }
 
-    /// Merge the referent's pieces and cast them to generic.
+    /// The referent's (empty) pieces keyed `k`: folded or unfolded.
+    fn empty_pieces(&self, k: vir::ExprSnap<'vir>, fold: bool) -> Vec<vir::Stmt<'vir>> {
+        vir::with_vcx(|vcx| {
+            (0..self.nodes.len())
+                .map(|r| {
+                    let app = self.nodes.app(r, self.nodes.key(r, k), None);
+                    match fold {
+                        true => vcx.mk_fold_stmt(app),
+                        false => vcx.mk_unfold_stmt(app),
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Merge the referent's pieces and cast them to generic. If the referent
+    /// has no positions (e.g. `arity(T)` is 0), the reference's own piece
+    /// holds no generic piece: the empty pieces are dropped.
     fn make_generic(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
         let k = self.concrete_snap.call()(addr, self.ty_args.get_ty(), self.ty_args.get_const());
         let full = self.full();
@@ -155,7 +172,14 @@ impl<'vir> ReferentPieces<'vir> {
             )
             .alloc(),
         );
-        stmts
+        let empty = self.empty_pieces(k, false);
+        vir::with_vcx(|vcx| {
+            vec![vcx.mk_if_stmt(
+                full.nonempty(),
+                vcx.alloc_slice(&stmts),
+                vcx.alloc_slice(&empty),
+            )]
+        })
     }
 
     /// Cast the referent's generic piece to concrete and split it. `tys`
@@ -179,7 +203,15 @@ impl<'vir> ReferentPieces<'vir> {
         ];
         let k = self.casters.make_concrete_s.call()(p.downcast_ty()).upcast_ty();
         stmts.extend(self.split(k));
-        stmts
+        // no positions: the (empty) pieces are made
+        let empty = self.empty_pieces(k, true);
+        vir::with_vcx(|vcx| {
+            vec![vcx.mk_if_stmt(
+                full.nonempty(),
+                vcx.alloc_slice(&stmts),
+                vcx.alloc_slice(&empty),
+            )]
+        })
     }
 }
 
