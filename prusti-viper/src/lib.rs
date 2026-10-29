@@ -810,11 +810,27 @@ impl<'vir, 'v> ToViper<'vir, 'v> for vir::Method<'vir> {
                     Vec::with_capacity(1 + body.blocks.len());
                 body.blocks.iter().for_each(|b| {
                     declarations.push(ctx.ast.label(&b.label.label.name(), &[]).into());
-                    b.stmts.iter().for_each(|s| {
-                        if let vir::StmtKindGenData::LocalDecl(decl, _) = s.kind {
-                            declarations.push(decl.to_viper_no_pos(ctx).into());
+                    // also those inside conditional statements (e.g. the
+                    // actions of one incoming edge of a join)
+                    fn collect<'vir, 'v>(
+                        stmts: &[vir::Stmt<'vir>],
+                        declarations: &mut Vec<viper::Declaration<'v>>,
+                        ctx: &ToViperContext<'vir, 'v>,
+                    ) {
+                        for s in stmts {
+                            match s.kind {
+                                vir::StmtKindGenData::LocalDecl(decl, _) => {
+                                    declarations.push(decl.to_viper_no_pos(ctx).into());
+                                }
+                                vir::StmtKindGenData::If(_, then, els) => {
+                                    collect(then, declarations, ctx);
+                                    collect(els, declarations, ctx);
+                                }
+                                _ => {}
+                            }
                         }
-                    });
+                    }
+                    collect(b.stmts, &mut declarations, ctx);
                     b.to_viper_extend_no_pos(&mut result, ctx);
                 });
                 ctx.ast.seqn(&result, &declarations)

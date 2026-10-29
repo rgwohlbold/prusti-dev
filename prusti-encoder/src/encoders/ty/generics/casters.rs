@@ -8,7 +8,7 @@ use crate::encoders::{
     ty::{RustTy, impure::TyImpureEnc, lifted::ty_constructor::TyConstructorEnc, pure::TyPureEnc},
 };
 
-use super::{GenericParamsEnc, ParamTypEnc};
+use super::{GenericParamsEnc, ParamTypEnc, ind_casters::IndCastersEnc};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct GArgCasters<'vir, P: PurityCasters> {
@@ -419,5 +419,7 @@ impl TaskEncoder for CastersEnc<Impure> {
                 program.add_method(method);
             }
         }
+        // The indirect casts of the pairs whose referents carry an indirect piece.
+        IndCastersEnc::emit_outputs(program);
     }
 }

@@ -1,6 +1,10 @@
 pub mod pure;
 pub mod inhabited;
-pub mod indirect;
+pub mod indirect_pred;
+pub mod indirect_node;
+pub mod occurrences;
+pub mod arity;
+pub mod range;
 pub mod impure;
 pub mod kinds;
 pub mod use_impure;

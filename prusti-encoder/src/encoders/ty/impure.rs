@@ -9,6 +9,7 @@ use super::{
     RustTy, ViperTyDatas,
     data::*,
     generics::{GenericParams, GenericParamsEnc},
+    indirect_pred::TyIndirectEnc,
     pure::*,
 };
 
@@ -238,6 +239,8 @@ impl TaskEncoder for TyImpureEnc {
                 program.add_method(method);
             }
         }
+        // The indirect predicates of the types used as bases of PCG nodes.
+        TyIndirectEnc::emit_outputs(program);
     }
 }
 
