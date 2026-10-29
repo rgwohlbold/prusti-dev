@@ -98,7 +98,7 @@ pub struct TyImpureVariantData<'vir> {
 }
 
 /// You probably never want to use this, use `TyUseImpureEnc` instead.
-pub(super) type TyImpureEnc = super::TyEnc<Impure>;
+pub(crate) type TyImpureEnc = super::TyEnc<Impure>;
 
 #[derive(Clone, Debug)]
 pub enum TyImpureEncError {

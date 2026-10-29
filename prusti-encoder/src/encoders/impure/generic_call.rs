@@ -2,7 +2,7 @@
 //! parameter occurrence (`RegionsIn(T)`, the positions `lo .. hi` of `T`),
 //! while the caller holds one piece per lifetime occurrence of the
 //! instantiation (its pieces under the occurrence's path, in position order,
-//! chain-keyed as `merge_Param` expects). Before the call the caller's pieces
+//! all keyed by the snapshot). Before the call the caller's pieces
 //! are cast to `p_Param_ind` of the argument's type, merged with
 //! `merge_Param` (right to left) and, below the top of the argument, cast
 //! back. After the call they are split again in reverse (`split_Param` left
@@ -22,7 +22,7 @@ use crate::encoders::{
             ind_casters::{IndCasters, IndCastersEnc},
         },
         indirect_node::{IndirectNodes, IndirectNodesEnc},
-        indirect_pred::{ParamRanges, TyIndirectEnc, TyIndirectExt},
+        indirect_pred::{ParamRanges, TyIndirectEnc},
         lifted::TyConstructorEnc,
         range::Range,
     },
@@ -191,14 +191,13 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         Ok(GroupCasts {
             casters: self.deps.require_ref::<IndCastersEnc>((param, decomp.ty))?,
             param: param_ind.param.unwrap(),
-            param_ext: param_ind.ext,
             args,
             x: constructor(args.get_ty(), args.get_const()),
         })
     }
 
-    /// Before a call: merge the caller's pieces `group` (the first keyed by
-    /// `first`, the others by its chain) into the callee's piece of `range`:
+    /// Before a call: merge the caller's pieces `group` (all keyed by
+    /// `first`) into the callee's piece of `range`:
     /// of the caller's type, or at the `top` its cast.
     fn merge_pieces(
         &mut self,
@@ -209,11 +208,8 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         range: Range<'vir>,
         top: bool,
     ) {
-        let mut chain = vec![first];
-        for p in &group[..group.len() - 1] {
-            let prev = *chain.last().unwrap();
-            chain.push(self.bind(caller.ext(prev, caller.range(*p))));
-        }
+        // all pieces have the same key
+        let chain = vec![first; group.len()];
         for (p, k) in group.iter().zip(&chain) {
             let r = caller.range(*p);
             self.stmt(c.make_generic(k, r));
@@ -243,12 +239,13 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             self.stmt(c.make_generic(key, range));
         }
         // left to right: `[l_i, hi)` into `[l_i, l_i+1)` and the rest
-        let mut chain = vec![self.bind(c.generic(key.unwrap_or(snap)))];
+        let k = self.bind(c.generic(key.unwrap_or(snap)));
         for p in &group[..group.len() - 1] {
-            let (r, k) = (caller.range(*p), *chain.last().unwrap());
+            let r = caller.range(*p);
             self.stmt((c.param.split)(k, &[c.x], &[], r.lo, r.hi, range.hi).alloc());
-            chain.push(self.bind((c.param_ext)(k, &[c.x], &[], r.lo, r.hi)));
         }
+        // all pieces have the same key
+        let chain = vec![k; group.len()];
         for (p, k) in group.iter().zip(&chain) {
             self.stmt(c.make_concrete(k, caller.range(*p)));
         }
@@ -267,7 +264,6 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
 struct GroupCasts<'vir> {
     casters: IndCasters<'vir>,
     param: ParamRanges<'vir>,
-    param_ext: TyIndirectExt<'vir>,
     args: GArgsTy<'vir>,
     x: vir::ExprTyVal<'vir>,
 }

@@ -173,37 +173,37 @@ impl<'vir> IndirectNodes<'vir> {
         self.pieces.iter().position(|p| p.path == path)
     }
 
-    /// `ext_T(k, .., range)` in any expression context: the type
+    /// `ext_T(v, k, .., range)` in any expression context: the type
     /// arguments and the range are fully reified, so they are valid in any
     /// context (as in `GArgsTy::get_ty`), and reifying the result substitutes
     /// their locals.
     pub fn ext<Curr, Next>(
         &self,
+        v: vir::ExprGenSnap<'vir, Curr, Next>,
         k: vir::ExprGenSnap<'vir, Curr, Next>,
         range: Range<'vir>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
         let (tys, consts) = (self.args().get_ty(), self.args().get_const());
         let (lo, hi) = range.args();
-        self.ind.ext.call()(k, tys, consts, lo, hi)
+        self.ind.ext.call()(v, k, tys, consts, lo, hi)
     }
 
-    /// The key of `piece`, for the snapshot `s` of `p`: `s` extended by the
-    /// pieces of all lower positions (a chain key).
+    /// The key of `piece`, for the snapshot `s` of `p`: `s` itself.
     pub fn key<Curr, Next>(
         &self,
-        piece: usize,
+        _piece: usize,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        self.extend(piece, s)
+        s
     }
 
-    /// `s` extended by the first `n` pieces, in order. Requires them.
+    /// `s` extended (deeply) by the first `n` pieces. Requires them.
     pub fn extend<Curr, Next>(
         &self,
         n: usize,
         s: vir::ExprGenSnap<'vir, Curr, Next>,
     ) -> vir::ExprGenSnap<'vir, Curr, Next> {
-        (0..n).fold(s, |k, piece| self.ext(k, self.range(piece)))
+        (0..n).fold(s, |v, piece| self.ext(v, s, self.range(piece)))
     }
 
     /// The predicate application of `piece` with the given key.
@@ -239,27 +239,18 @@ impl<'vir> IndirectNodes<'vir> {
         self.pred_with(idx, s, |_| false)
     }
 
-    /// As [Self::pred], with the key steps over the pieces of the nodes in
-    /// `at_old` evaluated in the pre-state (`old`), e.g. those a result took.
+    /// As [Self::pred]. TODO (outer owns): `at_old` is unused, keys no
+    /// longer read other pieces.
     pub fn pred_with(
         &self,
         idx: RegionIdx,
         s: vir::ExprSnap<'vir>,
-        at_old: impl Fn(RegionIdx) -> bool,
+        _at_old: impl Fn(RegionIdx) -> bool,
     ) -> Option<vir::ExprBool<'vir>> {
         let apps = self
             .pieces_of(idx)
             .into_iter()
-            .map(|piece| {
-                let key = (0..piece).fold(s, |k, lower| {
-                    let ext = self.ext(k, self.range(lower));
-                    match at_old(self.pieces[lower].node) {
-                        true => vir::with_vcx(|vcx| vcx.mk_old_expr(ext)),
-                        false => ext,
-                    }
-                });
-                self.app(piece, key, None)
-            })
+            .map(|piece| self.app(piece, self.key(piece, s), None))
             .collect::<Vec<_>>();
         vir::with_vcx(|vcx| {
             (!apps.is_empty()).then(|| {

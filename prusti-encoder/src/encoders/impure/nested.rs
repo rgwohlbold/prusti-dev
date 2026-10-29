@@ -43,6 +43,7 @@ use crate::encoders::{
             GArgsTy, GArgsTyEnc,
             ind_casters::{IndCasters, IndCastersEnc},
         },
+        impure::TyImpureEnc,
         indirect_node::{IndirectNodesEnc, RegionIdx},
         indirect_pred::TyIndirectEnc,
         occurrences::Step,
@@ -165,8 +166,19 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         false
     }
 
+    /// Are the lifetime-projection expansions of `place` no ghost operations?
+    /// Behind a shared reference there are no pieces; the referent of a
+    /// `&mut` moves with the reference's own piece (at the deref).
+    fn no_nested_pieces(&self, place: Place<'vir>) -> bool {
+        self.behind_shared(place)
+            || matches!(
+                place.ty(self.pcg_ctxt()).ty.kind(),
+                ty::TyKind::Ref(.., ty::Mutability::Mut)
+            )
+    }
+
     /// The snapshot of `place`, read along its path from the local: through a
-    /// `&mut`, from the reference's snapshot extended by its own piece. Unlike
+    /// `&mut`, read inside the reference's own piece. Unlike
     /// the place's own predicate (which an expansion may have unfolded or a
     /// deref may not have produced yet), this only needs the own pieces of the
     /// references on the path, as at the start of a phase.
@@ -183,13 +195,24 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 match parent_ty.ty.kind() {
                     ty::TyKind::Ref(.., ty::Mutability::Mut) => {
                         let snap = self.path_snap(parent)?;
-                        let nodes = self.deps.require_dep::<IndirectNodesEnc>(
-                            RustTyDecomposition::from_ty(parent_ty.ty, self.def_id),
-                        )?;
-                        // by the reference's own piece (position 0)
-                        let extended = nodes.extend(1, snap);
+                        let decomp = RustTyDecomposition::from_ty(parent_ty.ty, self.def_id);
+                        let nodes = self.deps.require_dep::<IndirectNodesEnc>(decomp)?;
+                        let args = self.deps.require_dep::<GArgsTyEnc>(decomp.args)?;
+                        let param_snap = self
+                            .deps
+                            .require_ref::<TyImpureEnc>(RustTyDecomposition::param())?
+                            .ref_to_snap;
                         let e_ty = self.ty_use_pure(parent_ty.ty);
-                        e_ty.expect_mutref().value_access(extended.downcast_ty())
+                        let mutref = e_ty.expect_mutref();
+                        // read inside the reference's own piece (position 0)
+                        let addr = mutref.deref_access(snap.downcast_ty());
+                        let generic = param_snap.call()(addr, &args.get_ty()[..1], &[]);
+                        let own = nodes
+                            .find(&[Step::Here(0)])
+                            .expect("a `&mut` has its own piece");
+                        let own = nodes.app(own, snap, Some(self.vcx.mk_wildcard()));
+                        let read = self.vcx.mk_unfolding_expr(own, generic);
+                        mutref.cast_to_caller_ctx(read.downcast_ty())
                     }
                     ty::TyKind::Ref(.., ty::Mutability::Not) => {
                         let snap = self.path_snap(parent)?;
@@ -320,7 +343,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
             return Ok(());
         };
         let base = strip_downcasts(base);
-        if self.behind_shared(base) {
+        if self.no_nested_pieces(base) {
             return Ok(());
         }
         let ty = base.ty(self.pcg_ctxt()).ty;
@@ -377,7 +400,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
         let Some((base_place, _, children)) = Self::lp_expansion(expansion) else {
             return Ok(());
         };
-        if self.behind_shared(strip_downcasts(base_place)) {
+        if self.no_nested_pieces(strip_downcasts(base_place)) {
             return Ok(());
         }
         if !unfolded {
@@ -810,7 +833,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                 let Some((base, _, _)) = Self::lp_expansion_any(expansion) else {
                     return false;
                 };
-                if self.behind_shared(strip_downcasts(base)) {
+                if self.no_nested_pieces(strip_downcasts(base)) {
                     return false;
                 }
                 let owned = !base

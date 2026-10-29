@@ -17,15 +17,16 @@ use super::{GenericParamsEnc, casters::CastersEnc};
 /// method make_generic_ind_X(k: s_X, T.., lo: Int, hi: Int)
 ///   requires p_X_ind(k, T.., lo, hi)
 ///   ensures  p_Param_ind(make_generic_s_X(k, T..), X_type(T..), lo, hi)
-///   ensures  ext_Param(make_generic_s_X(k, T..), X_type(T..), lo, hi)
-///              == make_generic_s_X(old(ext_X(k, T.., lo, hi)), T..)
+///   ensures  ext_Param(g, g, X_type(T..), lo, hi)
+///              == make_generic_s_X(old(ext_X(k, k, T.., lo, hi)), T..)
 /// method make_concrete_ind_X(p: s_Param, T.., lo: Int, hi: Int)
 ///   requires p_Param_ind(p, X_type(T..), lo, hi)
 ///   ensures  p_X_ind(make_concrete_s_X(p), T.., lo, hi)
 ///   ensures  make_generic_s_X(make_concrete_s_X(p), T..) == p
-///   ensures  old(ext_Param(p, X_type(T..), lo, hi))
-///              == make_generic_s_X(ext_X(make_concrete_s_X(p), T.., lo, hi), T..)
+///   ensures  old(ext_Param(p, p, X_type(T..), lo, hi))
+///              == make_generic_s_X(ext_X(c, c, T.., lo, hi), T..)
 /// ```
+/// where `g = make_generic_s_X(k, T..)` and `c = make_concrete_s_X(p)`.
 /// The equations are the only link between `ext_Param` and `ext_X`.
 pub(crate) struct IndCastersEnc;
 
@@ -127,8 +128,8 @@ impl TaskEncoder for IndCastersEnc {
             let param_pred = |p: vir::ExprSnap<'vir>| {
                 vir::expr! { vcx; acc([param_ind.pred](p, [..[[lifted_ty]]], [..[no_consts]], lo, hi)) }
             };
-            let concrete_ext = |k| (concrete_ind.ext)(k, tys, consts, lo, hi);
-            let param_ext = |p| (param_ind.ext)(p, &[lifted_ty], &[], lo, hi);
+            let concrete_ext = |k| (concrete_ind.ext)(k, k, tys, consts, lo, hi);
+            let param_ext = |p| (param_ind.ext)(p, p, &[lifted_ty], &[], lo, hi);
 
             // make_generic_ind_X
             let k_decl = vcx.mk_local_decl("k", concrete_snap);

@@ -20,12 +20,11 @@ use super::{
         ind_casters::{IndCasters, IndCastersEnc},
     },
     impure::{ImpureTyDatas, TyImpureEnc},
-    indirect_node::{IndirectNodes, IndirectNodesEnc, PrustiPcgCtxt, RegionIdx},
-    indirect_pred::{TyIndirectEmpty, TyIndirectEnc, TyIndirectExt},
+    indirect_node::{IndirectNodes, IndirectNodesEnc},
     occurrences::Step,
+    range::Range,
     rust_ty::RustTySpecial,
 };
-use pcg::borrow_pcg::region_projection::ExtractRegionsCtxt;
 
 pub(super) type UseImpureTyDatas = UseTyDatas<Impure>;
 
@@ -81,122 +80,106 @@ pub struct TyUseImpureMutRef<'vir> {
     /// The indirect nodes of this reference type; the reference's own
     /// lifetime (region 0) holds the referent. `None` if not encodable.
     nodes: Option<&'vir IndirectNodes<'vir>>,
-    /// The pieces of the reference's own lifetime inside the referent (if it
-    /// occurs there), which move with the referent on every fold/unfold.
-    inner: Option<ReferentPieces<'vir>>,
-    /// The pieces of the referent's own lifetimes, which a borrow `&mut p`
-    /// moves into the reference's inner lifetimes (if the referent is concrete
-    /// and does not mention the reference's own lifetime).
+    /// The pieces of a concrete referent, which move with the referent on
+    /// every fold/unfold (`None` for a type parameter: its one piece is the
+    /// generic piece inside the reference's).
     referent: Option<ReferentPieces<'vir>>,
 }
 
 type RefToSnap<'vir> =
     vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>;
 
-/// Pieces of a concrete referent `p: U` (occurrence `o`) and the pieces of the
-/// reference holding them (occurrence `In(0) ++ o`, whose body is the generic
-/// piece `p_Param_ind(.., U, Q_o)`).
+/// The pieces of a concrete referent `p: U`. The reference's own piece holds
+/// them as one generic piece `p_Param_ind(.., U, 0, arity(U))`.
 #[derive(Debug, Clone, Copy)]
 pub struct ReferentPieces<'vir> {
     nodes: &'vir IndirectNodes<'vir>,
-    /// `None` if the referent is a type parameter: no casts; an empty piece
-    /// (empty range) is made by `empty` instead.
-    casters: Option<IndCasters<'vir>>,
-    empty: Option<TyIndirectEmpty<'vir>>,
+    casters: IndCasters<'vir>,
     /// The concrete referent's type arguments.
     ty_args: GArgsTy<'vir>,
     generic_snap: RefToSnap<'vir>,
     concrete_snap: RefToSnap<'vir>,
-    /// `ext_Param`, for the keys of the generic pieces.
-    param_ext: TyIndirectExt<'vir>,
-    /// `(piece of the reference, piece of the referent)`, enclosing ones first.
-    pairs: &'vir [(usize, usize)],
 }
 
 impl<'vir> ReferentPieces<'vir> {
-    /// Cast the referent's pieces to generic, enclosed ones first (their keys
-    /// read the enclosing concrete pieces).
-    fn make_generic(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        let Some(casters) = self.casters else {
-            return Vec::new();
-        };
-        let p_snap =
-            self.concrete_snap.call()(addr, self.ty_args.get_ty(), self.ty_args.get_const());
-        self.pairs
-            .iter()
-            .rev()
-            .map(|(_, r)| {
-                let range = self.nodes.range(*r);
-                (casters.make_generic)(
-                    self.nodes.key(*r, p_snap),
-                    self.ty_args.get_ty(),
-                    self.ty_args.get_const(),
-                    range.lo,
-                    range.hi,
-                )
-                .alloc()
-            })
-            .collect()
+    /// All positions of the referent.
+    fn full(&self) -> Range<'vir> {
+        let last = self.nodes.len() - 1;
+        Range {
+            lo: self.nodes.range(0).lo,
+            hi: self.nodes.range(last).hi,
+        }
     }
 
-    /// Cast the referent's pieces to concrete, enclosed ones first (their keys
-    /// read the enclosing generic pieces). `tys` are the generic type args.
+    /// The whole piece of the referent (keyed `k`) into its pieces.
+    fn split(&self, k: vir::ExprSnap<'vir>) -> Vec<vir::Stmt<'vir>> {
+        if self.nodes.len() < 2 {
+            return Vec::new();
+        }
+        vir::with_vcx(|vcx| {
+            let mut stmts = vec![vcx.mk_unfold_stmt(self.nodes.app_range(self.full(), k, None))];
+            stmts.extend(
+                (0..self.nodes.len())
+                    .map(|r| vcx.mk_fold_stmt(self.nodes.app(r, self.nodes.key(r, k), None))),
+            );
+            stmts
+        })
+    }
+
+    /// The referent's pieces (keyed `k`) into its whole piece.
+    fn merge(&self, k: vir::ExprSnap<'vir>) -> Vec<vir::Stmt<'vir>> {
+        if self.nodes.len() < 2 {
+            return Vec::new();
+        }
+        vir::with_vcx(|vcx| {
+            let mut stmts = (0..self.nodes.len())
+                .map(|r| vcx.mk_unfold_stmt(self.nodes.app(r, self.nodes.key(r, k), None)))
+                .collect::<Vec<_>>();
+            stmts.push(vcx.mk_fold_stmt(self.nodes.app_range(self.full(), k, None)));
+            stmts
+        })
+    }
+
+    /// Merge the referent's pieces and cast them to generic.
+    fn make_generic(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
+        let k = self.concrete_snap.call()(addr, self.ty_args.get_ty(), self.ty_args.get_const());
+        let full = self.full();
+        let mut stmts = self.merge(k);
+        stmts.push(
+            (self.casters.make_generic)(
+                k,
+                self.ty_args.get_ty(),
+                self.ty_args.get_const(),
+                full.lo,
+                full.hi,
+            )
+            .alloc(),
+        );
+        stmts
+    }
+
+    /// Cast the referent's generic piece to concrete and split it. `tys`
+    /// are the generic type args.
     fn make_concrete(
         &self,
         addr: vir::ExprRef<'vir>,
         tys: &'vir [vir::ExprTyVal<'vir>],
     ) -> Vec<vir::Stmt<'vir>> {
-        let p_generic = self.generic_snap.call()(addr, tys, &[]);
-        let Some(casters) = self.casters else {
-            // the referent's (generic) piece, if the reference's was empty
-            return self
-                .pairs
-                .iter()
-                .rev()
-                .map(|(_, r)| {
-                    let range = self.nodes.range(*r);
-                    let empty = (self.empty.unwrap())(
-                        self.generic_key(*r, p_generic, tys),
-                        tys,
-                        &[],
-                        range.lo,
-                        range.hi,
-                    )
-                    .alloc();
-                    let nonempty = range.nonempty();
-                    let is_empty = vir::expr! { !([nonempty]) };
-                    vir::with_vcx(|vcx| vcx.mk_if_stmt(is_empty, vcx.alloc_slice(&[empty]), &[]))
-                })
-                .collect();
-        };
-        self.pairs
-            .iter()
-            .rev()
-            .map(|(_, r)| {
-                let range = self.nodes.range(*r);
-                (casters.make_concrete)(
-                    self.generic_key(*r, p_generic, tys),
-                    self.ty_args.get_ty(),
-                    self.ty_args.get_const(),
-                    range.lo,
-                    range.hi,
-                )
-                .alloc()
-            })
-            .collect()
-    }
-
-    /// The key of the generic piece of `r`, for the generic snapshot `p`.
-    fn generic_key(
-        &self,
-        r: usize,
-        p: vir::ExprSnap<'vir>,
-        tys: &'vir [vir::ExprTyVal<'vir>],
-    ) -> vir::ExprSnap<'vir> {
-        (0..r).fold(p, |k, lower| {
-            let range = self.nodes.range(lower);
-            (self.param_ext)(k, tys, &[], range.lo, range.hi)
-        })
+        let p = self.generic_snap.call()(addr, tys, &[]);
+        let full = self.full();
+        let mut stmts = vec![
+            (self.casters.make_concrete)(
+                p,
+                self.ty_args.get_ty(),
+                self.ty_args.get_const(),
+                full.lo,
+                full.hi,
+            )
+            .alloc(),
+        ];
+        let k = self.casters.make_concrete_s.call()(p.downcast_ty()).upcast_ty();
+        stmts.extend(self.split(k));
+        stmts
     }
 }
 
@@ -315,9 +298,8 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         })
     }
 
-    /// The indirect nodes of the reference type being encoded, the pieces of
-    /// its own lifetime inside the referent, and those of the referent's
-    /// lifetimes (see `TyUseImpureMutRef`).
+    /// The indirect nodes of the reference type being encoded and the pieces
+    /// of its concrete referent (see `TyUseImpureMutRef`).
     fn mutref_nodes(
         &mut self,
         referent: LazyRustTy<'vir>,
@@ -327,67 +309,34 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         (
             Option<&'vir IndirectNodes<'vir>>,
             Option<ReferentPieces<'vir>>,
-            Option<ReferentPieces<'vir>>,
         ),
     > {
         // An unencodable type is rejected where its contracts are encoded.
         let Ok(nodes) = self.deps.require_dep::<IndirectNodesEnc>(self.decomp) else {
-            return Ok((None, None, None));
+            return Ok((None, None));
         };
         if nodes.find(&[Step::Here(0)]).is_none() {
-            return Ok((None, None, None));
+            return Ok((None, None));
         }
         let nodes = vir::with_vcx(|vcx| vcx.alloc(nodes));
-        let own = RegionIdx::from(0);
-        let own_region = PrustiPcgCtxt.extract_regions(self.decomp)[own];
-        let normalized = referent.decompose_compare_normalize(params, self.args);
-        let Some(normalized) = normalized else {
-            return Ok((
-                Some(nodes),
-                None,
-                self.param_referent_pieces(referent, nodes)?,
-            ));
+        let Some(normalized) = referent.decompose_compare_normalize(params, self.args) else {
+            return Ok((Some(nodes), None));
         };
         // TODO: a referent whose type cannot be encoded keeps its pieces.
         let Ok(referent_nodes) = self
             .deps
             .require_dep::<IndirectNodesEnc>(normalized.concrete)
         else {
-            return Ok((Some(nodes), None, None));
+            return Ok((Some(nodes), None));
         };
-        let mentions_own = PrustiPcgCtxt
-            .extract_regions(normalized.concrete)
-            .iter()
-            .any(|r| *r == own_region);
-        let mut pairs = if mentions_own {
-            nodes
-                .pieces_of(own)
-                .into_iter()
-                .filter_map(|p| match nodes.piece(p).path.split_first() {
-                    Some((Step::In(0), rest)) => referent_nodes.find(rest).map(|r| (p, r)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        } else {
-            (0..referent_nodes.len())
-                .filter_map(|r| {
-                    let mut path = vec![Step::In(0)];
-                    path.extend(referent_nodes.piece(r).path.iter().copied());
-                    nodes.find(&path).map(|p| (p, r))
-                })
-                .collect::<Vec<_>>()
-        };
-        if pairs.is_empty() {
-            return Ok((Some(nodes), None, None));
+        if referent_nodes.len() == 0 {
+            return Ok((Some(nodes), None));
         }
-        pairs.sort();
         let pieces = ReferentPieces {
             nodes: vir::with_vcx(|vcx| vcx.alloc(referent_nodes)),
-            casters: Some(
-                self.deps
-                    .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?,
-            ),
-            empty: None,
+            casters: self
+                .deps
+                .require_ref::<IndCastersEnc>((normalized.param, normalized.concrete.ty))?,
             ty_args: self
                 .deps
                 .require_dep::<GArgsTyEnc>(normalized.concrete.args)?,
@@ -399,55 +348,8 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                 .deps
                 .require_ref::<TyImpureEnc>(normalized.concrete.ty)?
                 .ref_to_snap,
-            param_ext: self
-                .deps
-                .require_ref::<TyIndirectEnc>(normalized.param)?
-                .ext,
-            pairs: vir::with_vcx(|vcx| vcx.alloc_slice(&pairs)),
         };
-        Ok(match mentions_own {
-            true => (Some(nodes), Some(pieces), None),
-            false => (Some(nodes), None, Some(pieces)),
-        })
-    }
-
-    /// The pieces of a referent that is a type parameter (`RegionsIn(T)`),
-    /// moved without casts by a borrow `&mut p`.
-    fn param_referent_pieces(
-        &mut self,
-        referent: LazyRustTy<'vir>,
-        nodes: &'vir IndirectNodes<'vir>,
-    ) -> EncResult<'vir, Option<ReferentPieces<'vir>>> {
-        let concrete = referent.decompose_normalize(self.args);
-        if !concrete.ty.specifics.is_param() {
-            return Ok(None);
-        }
-        let Ok(referent_nodes) = self.deps.require_dep::<IndirectNodesEnc>(concrete) else {
-            return Ok(None);
-        };
-        let pairs = (0..referent_nodes.len())
-            .filter_map(|r| {
-                let mut path = vec![Step::In(0)];
-                path.extend(referent_nodes.piece(r).path.iter().copied());
-                nodes.find(&path).map(|p| (p, r))
-            })
-            .collect::<Vec<_>>();
-        if pairs.is_empty() {
-            return Ok(None);
-        }
-        let param = RustTyDecomposition::param();
-        let param_ind = self.deps.require_ref::<TyIndirectEnc>(param)?;
-        let param_snap = self.deps.require_ref::<TyImpureEnc>(param)?.ref_to_snap;
-        Ok(Some(ReferentPieces {
-            nodes: vir::with_vcx(|vcx| vcx.alloc(referent_nodes)),
-            casters: None,
-            empty: param_ind.param.map(|param| param.empty),
-            ty_args: self.deps.require_dep::<GArgsTyEnc>(concrete.args)?,
-            generic_snap: param_snap,
-            concrete_snap: param_snap,
-            param_ext: param_ind.ext,
-            pairs: vir::with_vcx(|vcx| vcx.alloc_slice(&pairs)),
-        }))
+        Ok((Some(nodes), Some(pieces)))
     }
 
     fn encode_ty(
@@ -471,7 +373,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             TySpecifics::MutRef(data) => {
                 let referent_caster = self.encode_normalized(data.0.referent, ty.0.params)?;
                 let metadata_caster = self.encode_normalized_pure(data.0.metadata, ty.0.params)?;
-                let (nodes, inner, referent) = self.mutref_nodes(data.0.referent, ty.0.params)?;
+                let (nodes, referent) = self.mutref_nodes(data.0.referent, ty.0.params)?;
                 TySpecifics::mk_mutref(TyUseImpureMutRef {
                     referent_caster,
                     metadata_caster,
@@ -479,7 +381,6 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                     impure: *data.1,
                     ref_to_snap: ty.1.ref_to_snap,
                     nodes,
-                    inner,
                     referent,
                 })
             }
@@ -1063,93 +964,23 @@ impl<'vir> TyUseImpureMutRef<'vir> {
         vir::with_vcx(|vcx| vcx.maybe_apply_label(snap, label))
     }
 
-    /// Fold the reference's pieces holding `pieces`, enclosing ones first
-    /// (their keys read the own piece).
-    fn fold_held(
-        &self,
-        pieces: &ReferentPieces<'vir>,
-        self_ref: vir::ExprRef<'vir>,
-        label: Option<vir::OldLabel<'vir>>,
-    ) -> Vec<vir::Stmt<'vir>> {
-        let nodes = self.nodes.unwrap();
-        let snap = self.snap(self_ref, label);
-        pieces
-            .pairs
-            .iter()
-            .map(|(p, _)| {
-                let piece = nodes.app(*p, nodes.key(*p, snap), None);
-                vir::with_vcx(|vcx| vcx.mk_fold_stmt(piece))
-            })
-            .collect()
-    }
-
-    /// Unfold the reference's pieces holding `pieces`, enclosed ones first,
-    /// while the own piece (from which their keys are read) is folded. For a
-    /// reference that is no longer current (e.g. moved into a call), its
-    /// snapshot is that of its label, and the key is read now: a callee
-    /// returns the pieces keyed by the state after the call.
-    fn unfold_held(
-        &self,
-        pieces: &ReferentPieces<'vir>,
-        self_ref: vir::ExprRef<'vir>,
-        label: Option<vir::OldLabel<'vir>>,
-    ) -> Vec<vir::Stmt<'vir>> {
-        let nodes = self.nodes.unwrap();
-        let snap = self.snap(self_ref, label);
-        pieces
-            .pairs
-            .iter()
-            .rev()
-            .map(|(p, _)| {
-                let piece = nodes.app(*p, nodes.key(*p, snap), None);
-                vir::with_vcx(|vcx| vcx.mk_unfold_stmt(piece))
-            })
-            .collect()
-    }
-
-    /// A borrow `self_ref = &mut p` is created: as [Self::fold], and the
-    /// pieces of `p`'s lifetimes move into the reference's inner lifetimes
-    /// (occurrence `o` of `p`'s type becomes `In(0) ++ o`).
+    /// A borrow `self_ref = &mut p` is created: as [Self::fold] (`p`'s pieces
+    /// move into the reference's own piece).
     fn fold_borrow(
         &self,
         self_ref: vir::ExprRef<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> Vec<vir::Stmt<'vir>> {
-        let Some(referent) = self.referent else {
-            return self.fold(self_ref, label);
-        };
-        let addr = self.deref(self_ref, label);
-        // while `p` is concrete
-        let mut stmts = referent.make_generic(addr);
-        stmts.extend(self.fold(self_ref, label));
-        stmts.extend(self.fold_held(&referent, self_ref, label));
-        stmts
+        self.fold(self_ref, label)
     }
 
-    /// The borrow `self_ref = &mut p` expires: the inner pieces move back to
-    /// `p`'s own lifetimes, then as [Self::unfold].
+    /// The borrow `self_ref = &mut p` expires: as [Self::unfold].
     fn unfold_borrow(
         &self,
         self_ref: vir::ExprRef<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> Vec<vir::Stmt<'vir>> {
-        let Some(referent) = self.referent else {
-            return self.unfold(self_ref, label);
-        };
-        // A callee that does not take the inner pieces (a generic
-        // `RegionsIn(T)` position) leaves them keyed by their value before
-        // the call.
-        let mut stmts = self.unfold_held(&referent, self_ref, label);
-        let addr = self.deref(self_ref, label);
-        let mut own = self.unfold(self_ref, label);
-        // between unfolding the own piece and the referent's `make_concrete`
-        // (a type parameter has no cast: after the own piece)
-        let make_concrete = referent.casters.and_then(|_| own.pop());
-        stmts.extend(own);
-        // while `p` is generic
-        stmts.extend(referent.make_concrete(addr, &self.args.get_ty()[..1]));
-        stmts.extend(make_concrete);
-        stmts
+        self.unfold(self_ref, label)
     }
 
     /// Give the referent back to the reference: cast it to the generic
@@ -1161,16 +992,13 @@ impl<'vir> TyUseImpureMutRef<'vir> {
     ) -> Vec<vir::Stmt<'vir>> {
         let addr = self.deref(self_ref, label);
         let mut stmts = Vec::new();
-        // the inner pieces first, while the concrete referent still exists
-        if let Some(inner) = self.inner {
-            stmts.extend(inner.make_generic(addr));
+        // the referent's pieces first, while the concrete referent still exists
+        if let Some(referent) = self.referent {
+            stmts.extend(referent.make_generic(addr));
         }
         stmts.extend(self.referent_caster.cast_to_callee_ctx(addr));
         if let Some(piece) = self.own_piece(self_ref, label) {
             stmts.push(vir::with_vcx(|vcx| vcx.mk_fold_stmt(piece)));
-        }
-        if let Some(inner) = self.inner {
-            stmts.extend(self.fold_held(&inner, self_ref, label));
         }
         stmts
     }
@@ -1184,15 +1012,12 @@ impl<'vir> TyUseImpureMutRef<'vir> {
     ) -> Vec<vir::Stmt<'vir>> {
         let addr = self.deref(self_ref, label);
         let mut stmts = Vec::new();
-        if let Some(inner) = self.inner {
-            stmts.extend(self.unfold_held(&inner, self_ref, label));
-        }
         if let Some(piece) = self.own_piece(self_ref, label) {
             stmts.push(vir::with_vcx(|vcx| vcx.mk_unfold_stmt(piece)));
         }
-        // the inner pieces, while the generic referent still exists
-        if let Some(inner) = self.inner {
-            stmts.extend(inner.make_concrete(addr, &self.args.get_ty()[..1]));
+        // the referent's pieces, while the generic referent still exists
+        if let Some(referent) = self.referent {
+            stmts.extend(referent.make_concrete(addr, &self.args.get_ty()[..1]));
         }
         stmts.extend(self.referent_caster.cast_to_caller_ctx(addr));
         stmts

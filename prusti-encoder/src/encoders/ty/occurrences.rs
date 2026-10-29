@@ -3,11 +3,10 @@
 //!
 //! An occurrence is a path through the type's arguments: into type argument
 //! `j` (`In(j)`), ending at lifetime argument `i` (`Here(i)`) or at a type
-//! parameter. Only occurrences reached through `&mut` referents and the fields
-//! of structs/enums count (not those behind shared references, arrays or raw
-//! pointers). `a` encloses `b` if `a` is the lifetime of a `&mut` whose
-//! referent contains `b`, either syntactically or through the definition of a
-//! type constructor (e.g. `Node<'a, 'b>`: `'a` encloses `'b`).
+//! parameter. Only occurrences reached through the fields of structs/enums
+//! count, and the own lifetime of a `&mut`: its referent belongs to that
+//! lifetime ("outer owns"), so nothing inside it counts (nor behind shared
+//! references, arrays or raw pointers). Hence no occurrence encloses another.
 //!
 //! Every occurrence has a position (see `Pos`): the lifetime positions of a
 //! type expression are numbered flat, a constructor's own lifetimes first (in
@@ -191,14 +190,13 @@ impl<'tcx> Walker<'tcx> {
                     found.list.push((prefix.clone(), End::Param(*param)));
                 }
             }
+            // The own lifetime owns everything behind the reference: the
+            // referent's lifetimes have no occurrences of their own.
             TySpecifics::MutRef(_) => {
-                let own = found.list.len();
                 let region = decomp.args.args()[0].expect_region();
                 found
                     .list
                     .push((with(prefix, Step::Here(0)), End::Region(region)));
-                let referent = self.descend(decomp, 0, prefix, found);
-                found.pairs.extend(referent.map(|b| (own, b)));
             }
             TySpecifics::StructLike(_) | TySpecifics::EnumLike(_) => {
                 let summary = self.summary(decomp.ty);
