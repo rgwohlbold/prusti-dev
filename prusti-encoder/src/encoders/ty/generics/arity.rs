@@ -7,6 +7,13 @@ use crate::encoders::ty::{
 
 pub struct ArityEnc;
 
+#[derive(Debug, Clone, Copy)]
+pub struct ArityEncOutputRef<'vir> {
+    pub arity: vir::FunctionIdn<'vir, vir::TyVal, vir::Int>,
+}
+
+impl<'vir> task_encoder::OutputRefAny for ArityEncOutputRef<'vir> {}
+
 fn arity_fn_ident<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
     vir::FunctionIdn::new(vir::ViperIdent::new("arity"), vir::TYPE_TYVAL, vir::TYPE_INT)
 }
@@ -18,6 +25,8 @@ impl TaskEncoder for ArityEnc {
 
     type TaskDescription<'vir> = RustTy<'vir>;
 
+    type OutputRef<'vir> = ArityEncOutputRef<'vir>;
+
     type OutputFullLocal<'vir> = vir::DomainAxiom<'vir>;
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
@@ -28,7 +37,12 @@ impl TaskEncoder for ArityEnc {
         task_key: &Self::TaskKey<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> EncodeFullResult<'vir, Self> {
-        deps.emit_output_ref(*task_key, ())?;
+        deps.emit_output_ref(
+            *task_key,
+            ArityEncOutputRef {
+                arity: arity_fn_ident(),
+            },
+        )?;
         let num_lifetimes = task_key.params.rust_params().regions().count();
         let ty_constructor = deps.require_ref::<TyConstructorEnc>(*task_key)?;
         let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
