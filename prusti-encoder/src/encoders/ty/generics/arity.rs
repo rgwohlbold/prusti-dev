@@ -1,7 +1,9 @@
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::{CastType, ViperIdent, vir_format};
+use vir::CastType;
 
-use crate::encoders::ty::{RustTy, generics::GenericParamsEnc, lifted::TyConstructorEnc};
+use crate::encoders::ty::{
+    RustTy, TySpecifics, generics::GenericParamsEnc, lifted::TyConstructorEnc,
+};
 
 pub struct ArityEnc;
 
@@ -34,11 +36,16 @@ impl TaskEncoder for ArityEnc {
             let arity_fn_ident = arity_fn_ident();
             let num_lifetimes = vcx.mk_const_expr(vir::ConstData::Int(num_lifetimes as u128)).downcast_ty();
             let instantiated_type = ty_constructor.ty_constructor.call()(params.ty_exprs(), params.const_exprs());
-            // L + arity(T_0) + ... + arity(T_{M-1})
-            let rhs = params.ty_exprs().iter().fold(num_lifetimes, |acc, ty_arg| {
-                vcx.mk_bin_op_expr(vir::BinOpKind::Add, acc, arity_fn_ident.call()(*ty_arg))
-                    .downcast_ty()
-            });
+            // shared references have no lifetime positions, they work with snapshots instead
+            let rhs = if matches!(task_key.specifics, TySpecifics::ImmRef(_)) {
+                vcx.mk_uint::<0>()
+            } else {
+                // L + arity(T_0) + ... + arity(T_{M-1})
+                params.ty_exprs().iter().fold(num_lifetimes, |acc, ty_arg| {
+                    vcx.mk_bin_op_expr(vir::BinOpKind::Add, acc, arity_fn_ident.call()(*ty_arg))
+                        .downcast_ty()
+                })
+            };
             let expr = vir::expr! { vcx;
                  forall ..[params.ty_decls()], ..[params.const_decls()] :: {[arity_fn_ident](instantiated_type)}
                     ([arity_fn_ident](instantiated_type)) == (rhs)
