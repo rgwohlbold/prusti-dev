@@ -6,6 +6,7 @@ mod args_ty;
 mod args;
 pub mod r#trait;
 pub mod sizedness;
+pub mod arity;
 pub mod trait_fn;
 pub mod trait_impls;
 mod ty_expr;
