@@ -2,6 +2,8 @@ use rustc_hash::FxHashMap;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, PredicateIdn};
 
+use crate::encoders::TyUseImpureEnc;
+
 use super::{
     RustTy, RustTyDecomposition,
     data::TySpecifics,
@@ -90,6 +92,47 @@ impl IndirectPredEnc {
                 .collect()
         })
     }
+
+    /// The conjuncts that pass the `subqueries` of a type on to the indirect
+    /// predicate of one of its components (a field, or the referent of a
+    /// reference) of type `field_ty` with the snapshot `field_snap`: one for
+    /// each occurrence of an own lifetime or type parameter in `field_ty`.
+    fn field_conjuncts<'vir>(
+        subqueries: &FxHashMap<LifetimePosition<'vir>, Subquery<'vir>>,
+        field_ty: RustTyDecomposition<'vir>,
+        field_snap: vir::ExprSnap<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
+        let field_positions = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        // A field without lifetime positions holds no permissions.
+        if field_positions.is_empty() {
+            return Ok(Vec::new());
+        }
+        let field_pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
+        let field_args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+        Ok(vir::with_vcx(|vcx| {
+            field_positions
+                .into_iter()
+                .filter_map(|(param, y)| {
+                    // Other lifetimes, such as `'static`, and alias types are
+                    // not parameters of the type.
+                    let subquery = subqueries.get(&param)?;
+                    let guard = subquery.guard;
+                    let start = add(y, subquery.start);
+                    let end = add(y, subquery.end);
+                    Some(vir::expr! { vcx;
+                        (guard) ==> (acc([field_pred](
+                            field_snap,
+                            [..[field_args.get_ty()]],
+                            [..[field_args.get_const()]],
+                            start,
+                            end
+                        )))
+                    })
+                })
+                .collect()
+        }))
+    }
 }
 
 impl TaskEncoder for IndirectPredEnc {
@@ -139,38 +182,41 @@ impl TaskEncoder for IndirectPredEnc {
                     let mut conjuncts = Vec::new();
                     for (field, pure_field) in &data.fields {
                         let field_ty = field.decompose(task_key.params);
-                        let field_positions = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
-                        // A field without lifetime positions holds no permissions.
-                        if field_positions.is_empty() {
-                            continue;
-                        }
-                        let field_pred =
-                            deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
-                        let field_args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
                         let field_snap = pure_field.read.call()(k.downcast_ty());
-                        for (param, y) in field_positions {
-                            // Other lifetimes, such as `'static`, and alias types
-                            // are not parameters of the struct.
-                            let Some(subquery) = subqueries.get(&param) else {
-                                continue;
-                            };
-                            let guard = subquery.guard;
-                            let start = add(y, subquery.start);
-                            let end = add(y, subquery.end);
-                            conjuncts.push(vir::expr! { vcx;
-                                (guard) ==> (acc([field_pred](
-                                    field_snap,
-                                    [..[field_args.get_ty()]],
-                                    [..[field_args.get_const()]],
-                                    start,
-                                    end
-                                )))
-                            });
-                        }
+                        conjuncts.extend(Self::field_conjuncts(
+                            &subqueries,
+                            field_ty,
+                            field_snap,
+                            deps,
+                        )?);
                     }
                     Some(vcx.mk_conj(&conjuncts))
                 }
-                // TODO: references, enums and the remaining types.
+                TySpecifics::MutRef((data, pure_data)) => {
+                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let referent_ty = data.referent.decompose(task_key.params);
+                    // The own lifetime of the reference gives access to the
+                    // referent.
+                    let lifetime = task_key.params.rust_params().regions().next().unwrap();
+                    let guard = subqueries[&LifetimePosition::Lifetime(lifetime)].guard;
+                    let referent = deps.require_dep::<TyUseImpureEnc>(referent_ty)?;
+                    let addr = pure_data.deref_access.call()(k.downcast_ty());
+                    let referent_pred = referent.ref_to_pred(vcx, addr, None);
+                    let mut conjuncts = vec![vir::expr! { vcx; (guard) ==> (referent_pred) }];
+                    // The positions of the referent's type are passed on to
+                    // the referent like those of a field.
+                    let referent_snap = pure_data.value_access.call()(k.downcast_ty());
+                    conjuncts.extend(Self::field_conjuncts(
+                        &subqueries,
+                        referent_ty,
+                        referent_snap.upcast_ty(),
+                        deps,
+                    )?);
+                    Some(vcx.mk_conj(&conjuncts))
+                }
+                // A shared reference has no lifetime positions.
+                TySpecifics::ImmRef(_) => Some(vcx.mk_bool::<true>()),
+                // TODO: enums and the remaining types.
                 _ => None,
             };
 
@@ -312,21 +358,36 @@ mod tests {
         );
     }
 
-    /// Immutable references have no body yet.
+    /// A shared reference has no lifetime positions, so its predicate holds
+    /// nothing.
     #[test]
     fn immutable_reference() {
         assert_eq!(
             indirect_pred("type X<'a, T> = &'a T;"),
-            "predicate p_Ref_immutable_ind(k: s_Ref_immutable, U$1: Type, lo: Int, hi: Int)",
+            dedent(
+                r#"
+                predicate p_Ref_immutable_ind(k: s_Ref_immutable, U$1: Type, lo: Int, hi: Int) {
+                  (true)
+                }
+                "#
+            ),
         );
     }
 
-    /// Mutable references have no body yet.
+    /// The own lifetime of a mutable reference gives access to the referent,
+    /// and the referent's positions are passed on to the referent.
     #[test]
     fn mutable_reference() {
         assert_eq!(
             indirect_pred("type X<'a, T> = &'a mut T;"),
-            "predicate p_Ref_mutable_ind(k: s_Ref_mutable, U$1: Type, lo: Int, hi: Int)",
+            dedent(
+                r#"
+                predicate p_Ref_mutable_ind(k: s_Ref_mutable, U$1: Type, lo: Int, hi: Int) {
+                  ((((lo) <= (0)) && ((0) < (hi))) ==> ((inhabited(U$1)) && (p_Param(k.s_Ref_mutable_0, U$1)))) &&
+                  (((clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))) ==> (p_Param_ind(k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
+                }
+                "#
+            ),
         );
     }
 
@@ -336,6 +397,29 @@ mod tests {
         assert_eq!(
             indirect_pred("type X<T> = T;"),
             "predicate p_Param_ind(k: s_Param, T$0: Type, lo: Int, hi: Int)",
+        );
+    }
+
+    /// `'a` occurs at positions 0 and 1 of the field, and 1 is inside the
+    /// referent of 0. Both field predicates are part of the one conjunct of
+    /// `'a`, so no caller can extend the snapshot in between: the second
+    /// should be on `ext_Ref_mutable(k.s_S_0, .., k.s_S_0, 0, 1)`, which is
+    /// not implemented yet.
+    #[test]
+    fn enclosed_occurrence() {
+        assert_eq!(
+            indirect_pred(
+                "struct S<'a>(&'a mut &'a mut i32);
+                 type X<'a> = S<'a>;"
+            ),
+            dedent(
+                r#"
+                predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
+                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1))) &&
+                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
+                }
+                "#
+            ),
         );
     }
 }
