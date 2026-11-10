@@ -72,7 +72,10 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
     ///  - `C(a_0, ..) == C(b_0, ..)` is `a_0 == b_0 && ..` since adt
     ///    constructors are injective, and `!=` is its negation; the
     ///    applications may be locals bound to them,
-    ///  - `0 + r` is `r`, and `l + 0` and `l - 0` are `l`.
+    ///  - `0 + r` is `r`, and `l + 0` and `l - 0` are `l`,
+    ///  - the sum and difference of two integer literals are evaluated, and
+    ///    `(e + k1) + k2` and `(k1 + e) + k2` are `e + (k1 + k2)` for integer
+    ///    literals `k1` and `k2`; results beyond `i128` are left as they are.
     fn fold_bin_op(
         &mut self,
         kind: BinOpKind,
@@ -83,6 +86,21 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
         match (kind, as_int(l), as_int(r)) {
             (Add, Some(0), _) => return Some(r),
             (Add | Sub, _, Some(0)) => return Some(l),
+            (Add, Some(a), Some(b)) => return a.checked_add(b).map(|v| self.int(v)),
+            (Sub, Some(a), Some(b)) => return a.checked_sub(b).map(|v| self.int(v)),
+            (Add, None, Some(k2)) => {
+                if let ExprKindGenData::BinOp(inner) = l.kind {
+                    if inner.kind == Add {
+                        let (e, k1) = match (as_int(inner.lhs), as_int(inner.rhs)) {
+                            (None, Some(k1)) => (inner.lhs, k1),
+                            (Some(k1), None) => (inner.rhs, k1),
+                            _ => return None,
+                        };
+                        let k = self.int(k1.checked_add(k2)?);
+                        return Some(self.bin_op(Add, e, k));
+                    }
+                }
+            }
             _ => {}
         }
         match (kind, as_bool(l), as_bool(r)) {
@@ -312,6 +330,22 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
 
     fn bool(&self, b: bool) -> ExprDyn<'vir> {
         self.node(ExprKindGenData::Const(self.vcx.alloc(ConstData::Bool(b))))
+    }
+
+    /// The integer literal `v`, a negative one written as the negation of its
+    /// absolute value (see `as_int`).
+    fn int(&self, v: i128) -> ExprDyn<'vir> {
+        let abs = self.node(ExprKindGenData::Const(
+            self.vcx.alloc(ConstData::Int(v.unsigned_abs())),
+        ));
+        if v < 0 {
+            self.node(ExprKindGenData::UnOp(self.vcx.alloc(UnOpGenData {
+                kind: UnOpKind::Neg,
+                expr: abs.inner_cast_ty(),
+            })))
+        } else {
+            abs
+        }
     }
 
     fn not(&mut self, e: ExprDyn<'vir>) -> ExprDyn<'vir> {
