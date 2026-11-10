@@ -329,4 +329,13 @@ mod tests {
             "predicate p_Ref_mutable_ind(k: s_Ref_mutable, U$1: Type, lo: Int, hi: Int)",
         );
     }
+
+    /// The predicate of a type parameter is abstract.
+    #[test]
+    fn type_param() {
+        assert_eq!(
+            indirect_pred("type X<T> = T;"),
+            "predicate p_Param_ind(k: s_Param, T$0: Type, lo: Int, hi: Int)",
+        );
+    }
 }
