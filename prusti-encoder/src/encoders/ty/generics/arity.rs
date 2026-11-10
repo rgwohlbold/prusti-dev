@@ -14,18 +14,9 @@ pub struct ArityEncOutputRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for ArityEncOutputRef<'vir> {}
 
-/// The sum `a + b`, leaving out an operand that is the literal 0.
-pub(super) fn add<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'vir> {
-    let is_zero = |e: vir::ExprInt<'vir>| {
-        matches!(e.kind, vir::ExprKindGenData::Const(vir::ConstData::Int(0)))
-    };
-    if is_zero(a) {
-        b
-    } else if is_zero(b) {
-        a
-    } else {
-        vir::with_vcx(|vcx| vcx.mk_bin_op_expr(vir::BinOpKind::Add, a, b).downcast_ty())
-    }
+/// The sum `a + b`.
+pub(crate) fn add<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'vir> {
+    vir::with_vcx(|vcx| vcx.mk_bin_op_expr(vir::BinOpKind::Add, a, b).downcast_ty())
 }
 
 fn arity_fn_ident<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
@@ -106,13 +97,21 @@ mod tests {
     use task_encoder::TaskEncoder;
 
     use super::ArityEnc;
-    use crate::encoders::ty::generics::test_util::with_type_alias;
+    use crate::encoders::ty::test_util::{dedent, simplified, with_type_alias};
 
     /// The expression of the arity axiom of the type constructor of the type alias `X` defined in `src`.
+    /// A quantified axiom shows its body on its own line.
     fn arity_axiom(src: &str) -> String {
         with_type_alias(src, |ty| {
             let (_, axiom, _) = ArityEnc::encode(ty.ty, true, DUMMY_SP).unwrap().unwrap();
-            format!("{:?}", axiom.expr)
+            let expr = simplified(axiom.expr);
+            let vir::ExprKindGenData::Forall(forall) = expr.kind else {
+                return format!("{expr:?}");
+            };
+            let body = format!("{:?}", forall.body);
+            let quantifier = format!("{expr:?}");
+            let quantifier = quantifier.strip_suffix(&body).unwrap().trim_end();
+            format!("{quantifier}\n  {body}")
         })
     }
 
@@ -120,8 +119,12 @@ mod tests {
     fn tuple() {
         assert_eq!(
             arity_axiom("type X<T, U> = (T, U);"),
-            "forall T$0: Type, U$1: Type :: {arity(s_2_Tuple_type(T$0, U$1))} \
-             (arity(s_2_Tuple_type(T$0, U$1))) == ((arity(T$0)) + (arity(U$1)))",
+            dedent(
+                r#"
+                forall T$0: Type, U$1: Type :: {arity(s_2_Tuple_type(T$0, U$1))}
+                  (arity(s_2_Tuple_type(T$0, U$1))) == ((arity(T$0)) + (arity(U$1)))
+                "#
+            ),
         );
     }
 
@@ -132,8 +135,12 @@ mod tests {
                 "struct S<'a, 'b, T>(&'a mut T, &'b mut T);
                  type X<'a, 'b, T> = S<'a, 'b, T>;"
             ),
-            "forall T$2: Type :: {arity(s_S_type(T$2))} \
-             (arity(s_S_type(T$2))) == ((2) + (arity(T$2)))",
+            dedent(
+                r#"
+                forall T$2: Type :: {arity(s_S_type(T$2))}
+                  (arity(s_S_type(T$2))) == ((2) + (arity(T$2)))
+                "#
+            ),
         );
     }
 
@@ -141,8 +148,12 @@ mod tests {
     fn shared_reference() {
         assert_eq!(
             arity_axiom("type X<'a, T> = &'a T;"),
-            "forall U$1: Type :: {arity(s_Ref_immutable_type(U$1))} \
-             (arity(s_Ref_immutable_type(U$1))) == (0)",
+            dedent(
+                r#"
+                forall U$1: Type :: {arity(s_Ref_immutable_type(U$1))}
+                  (arity(s_Ref_immutable_type(U$1))) == (0)
+                "#
+            ),
         );
     }
 
@@ -150,8 +161,12 @@ mod tests {
     fn mutable_reference() {
         assert_eq!(
             arity_axiom("type X<'a, T> = &'a mut T;"),
-            "forall U$1: Type :: {arity(s_Ref_mutable_type(U$1))} \
-             (arity(s_Ref_mutable_type(U$1))) == ((1) + (arity(U$1)))",
+            dedent(
+                r#"
+                forall U$1: Type :: {arity(s_Ref_mutable_type(U$1))}
+                  (arity(s_Ref_mutable_type(U$1))) == ((1) + (arity(U$1)))
+                "#
+            ),
         );
     }
 
@@ -178,8 +193,12 @@ mod tests {
     fn array() {
         assert_eq!(
             arity_axiom("type X<T, const N: usize> = [T; N];"),
-            "forall U$1: Type, M$0: s_UInt_usize :: {arity(s_Array_type(U$1, M$0))} \
-             (arity(s_Array_type(U$1, M$0))) == (arity(U$1))",
+            dedent(
+                r#"
+                forall U$1: Type, M$0: s_UInt_usize :: {arity(s_Array_type(U$1, M$0))}
+                  (arity(s_Array_type(U$1, M$0))) == (arity(U$1))
+                "#
+            ),
         );
     }
 
@@ -187,8 +206,12 @@ mod tests {
     fn raw_pointer() {
         assert_eq!(
             arity_axiom("type X<T> = *mut T;"),
-            "forall T$0: Type :: {arity(s_RawPtr_mutable_type(T$0))} \
-             (arity(s_RawPtr_mutable_type(T$0))) == (arity(T$0))",
+            dedent(
+                r#"
+                forall T$0: Type :: {arity(s_RawPtr_mutable_type(T$0))}
+                  (arity(s_RawPtr_mutable_type(T$0))) == (arity(T$0))
+                "#
+            ),
         );
     }
 
@@ -204,8 +227,12 @@ mod tests {
     fn boxed() {
         assert_eq!(
             arity_axiom("type X<T> = Box<T>;"),
-            "forall T$0: Type, A$1: Type :: {arity(s_Box_type(T$0, A$1))} \
-             (arity(s_Box_type(T$0, A$1))) == ((arity(T$0)) + (arity(A$1)))",
+            dedent(
+                r#"
+                forall T$0: Type, A$1: Type :: {arity(s_Box_type(T$0, A$1))}
+                  (arity(s_Box_type(T$0, A$1))) == ((arity(T$0)) + (arity(A$1)))
+                "#
+            ),
         );
     }
 }
