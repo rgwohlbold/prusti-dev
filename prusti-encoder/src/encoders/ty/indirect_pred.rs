@@ -1,4 +1,3 @@
-use rustc_hash::FxHashMap;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, PredicateIdn};
 
@@ -34,28 +33,23 @@ pub struct IndirectPredRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
-/// The part of the query `[lo, hi)` of an indirect predicate that falls into
-/// the positions of one own lifetime or type parameter of the type.
+// Lifetime query that corresponds to a lifetime position [lo, hi), either lifetime or type parameter
 #[derive(Clone, Copy)]
 struct Subquery<'vir> {
-    /// Whether the subquery is non-empty.
+    param: LifetimePosition<'vir>,
     guard: vir::ExprBool<'vir>,
-    /// The subquery is `[start, end)`, counted from the first position of the
-    /// parameter.
     start: vir::ExprInt<'vir>,
     end: vir::ExprInt<'vir>,
 }
 
 impl IndirectPredEnc {
-    /// The subqueries of the query `[lo, hi)` for own lifetimes and type parameters of `ty`.
-    ///
+    /// The subqueries of the query `[lo, hi)` for lifetime and type parameters of `ty`.
     fn subqueries<'vir>(
         ty: RustTy<'vir>,
         lo: vir::ExprInt<'vir>,
         hi: vir::ExprInt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
-    ) -> Result<FxHashMap<LifetimePosition<'vir>, Subquery<'vir>>, EncodeFullError<'vir, Self>>
-    {
+    ) -> Result<Vec<Subquery<'vir>>, EncodeFullError<'vir, Self>> {
         let arity = deps.require_ref::<ArityEnc>(ty)?.arity;
         let clamp = deps.require_dep::<ClampEnc>(())?;
         let own_positions =
@@ -67,9 +61,10 @@ impl IndirectPredEnc {
             own_positions
                 .into_iter()
                 .map(|(param, x)| {
-                    let subquery = match param {
+                    Ok(match param {
                         // An own lifetime has the single position `x`, which the query either contains or not.
                         LifetimePosition::Lifetime(_) => Subquery {
+                            param,
                             guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
                             start: vcx.mk_uint::<0>(),
                             end: vcx.mk_uint::<1>(),
@@ -81,57 +76,53 @@ impl IndirectPredEnc {
                             let start = clamp.call()(sub(lo, x), zero, w);
                             let end = clamp.call()(sub(hi, x), zero, w);
                             Subquery {
+                                param,
                                 guard: vir::expr! { vcx; (start) < (end) },
                                 start,
                                 end,
                             }
                         }
-                    };
-                    Ok((param, subquery))
+                    })
                 })
                 .collect()
         })
     }
 
-    /// The conjuncts that pass the `subqueries` of a type on to the indirect
-    /// predicate of one of its components (a field, or the referent of a
-    /// reference) of type `field_ty` with the snapshot `field_snap`: one for
-    /// each occurrence of an own lifetime or type parameter in `field_ty`.
-    fn field_conjuncts<'vir>(
-        subqueries: &FxHashMap<LifetimePosition<'vir>, Subquery<'vir>>,
+    /// The predicates of the field of type `field_ty` with the snapshot `field_snap` for `subquery`:
+    /// one for each occurrence of the subquery's parameter in the field type
+    fn field_preds<'vir>(
+        subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
-        let field_positions = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
-        // A field without lifetime positions holds no permissions.
-        if field_positions.is_empty() {
+        let occurrences = deps
+            .require_dep::<LifetimePositionEnc>(field_ty)?
+            .into_iter()
+            .filter(|&(param, _)| param == subquery.param)
+            .map(|(_, y)| y)
+            .collect::<Vec<_>>();
+        if occurrences.is_empty() {
             return Ok(Vec::new());
         }
-        let field_pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
-        let field_args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(vir::with_vcx(|vcx| {
-            field_positions
-                .into_iter()
-                .filter_map(|(param, y)| {
-                    // Other lifetimes, such as `'static`, and alias types are
-                    // not parameters of the type.
-                    let subquery = subqueries.get(&param)?;
-                    let guard = subquery.guard;
-                    let start = add(y, subquery.start);
-                    let end = add(y, subquery.end);
-                    Some(vir::expr! { vcx;
-                        (guard) ==> (acc([field_pred](
-                            field_snap,
-                            [..[field_args.get_ty()]],
-                            [..[field_args.get_const()]],
-                            start,
-                            end
-                        )))
-                    })
-                })
-                .collect()
-        }))
+        let pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
+        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+        Ok(occurrences
+            .into_iter()
+            .map(|y| {
+                let start = add(y, subquery.start);
+                let end = add(y, subquery.end);
+                vir::expr! {
+                    acc([pred](
+                        field_snap,
+                        [..[args.get_ty()]],
+                        [..[args.get_const()]],
+                        start,
+                        end
+                    ))
+                }
+            })
+            .collect())
     }
 }
 
@@ -178,40 +169,48 @@ impl TaskEncoder for IndirectPredEnc {
 
             let body = match &ty.specifics {
                 TySpecifics::StructLike(data) => {
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
                     let mut conjuncts = Vec::new();
-                    for (field, pure_field) in &data.fields {
-                        let field_ty = field.decompose(task_key.params);
-                        let field_snap = pure_field.read.call()(k.downcast_ty());
-                        conjuncts.extend(Self::field_conjuncts(
-                            &subqueries,
-                            field_ty,
-                            field_snap,
-                            deps,
-                        )?);
+                    for subquery in Self::subqueries(task_key, lo, hi, deps)? {
+                        let mut preds = Vec::new();
+                        for (field, pure_field) in &data.fields {
+                            let field_ty = field.decompose(task_key.params);
+                            let field_snap = pure_field.read.call()(k.downcast_ty());
+                            preds.extend(Self::field_preds(subquery, field_ty, field_snap, deps)?);
+                        }
+                        if !preds.is_empty() {
+                            let guard = subquery.guard;
+                            let preds = vcx.mk_conj(&preds);
+                            conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
+                        }
                     }
                     Some(vcx.mk_conj(&conjuncts))
                 }
                 TySpecifics::MutRef((data, pure_data)) => {
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
                     let referent_ty = data.referent.decompose(task_key.params);
-                    // The own lifetime of the reference gives access to the
-                    // referent.
-                    let lifetime = task_key.params.rust_params().regions().next().unwrap();
-                    let guard = subqueries[&LifetimePosition::Lifetime(lifetime)].guard;
                     let referent = deps.require_dep::<TyUseImpureEnc>(referent_ty)?;
                     let addr = pure_data.deref_access.call()(k.downcast_ty());
                     let referent_pred = referent.ref_to_pred(vcx, addr, None);
-                    let mut conjuncts = vec![vir::expr! { vcx; (guard) ==> (referent_pred) }];
-                    // The positions of the referent's type are passed on to
-                    // the referent like those of a field.
-                    let referent_snap = pure_data.value_access.call()(k.downcast_ty());
-                    conjuncts.extend(Self::field_conjuncts(
-                        &subqueries,
-                        referent_ty,
-                        referent_snap.upcast_ty(),
-                        deps,
-                    )?);
+                    let referent_snap = pure_data.value_access.call()(k.downcast_ty()).upcast_ty();
+                    let mut conjuncts = Vec::new();
+                    for subquery in Self::subqueries(task_key, lo, hi, deps)? {
+                        let mut preds = Vec::new();
+                        // The own lifetime of the reference gives access to the referent.
+                        if matches!(subquery.param, LifetimePosition::Lifetime(_)) {
+                            preds.push(referent_pred);
+                        }
+                        // The positions of the referent's type are passed on to the referent like those of a field.
+                        preds.extend(Self::field_preds(
+                            subquery,
+                            referent_ty,
+                            referent_snap,
+                            deps,
+                        )?);
+                        if !preds.is_empty() {
+                            let guard = subquery.guard;
+                            let preds = vcx.mk_conj(&preds);
+                            conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
+                        }
+                    }
                     Some(vcx.mk_conj(&conjuncts))
                 }
                 // A shared reference has no lifetime positions.
@@ -254,15 +253,31 @@ mod tests {
     use crate::encoders::ty::test_util::{dedent, simplified, with_type_alias};
 
     /// The indirect predicate of the type constructor of the type alias `X`
-    /// defined in `src`, with one conjunct of its body per line.
+    /// defined in `src`, with one conjunct of its body per line, and the
+    /// instances under a guard indented on the following lines.
     fn indirect_pred(src: &str) -> String {
-        fn conjuncts<'vir>(e: vir::ExprDyn<'vir>, out: &mut Vec<String>) {
+        fn conjuncts<'vir>(e: vir::ExprDyn<'vir>, out: &mut Vec<vir::ExprDyn<'vir>>) {
             match e.kind {
                 vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::And => {
                     conjuncts(b.lhs, out);
                     conjuncts(b.rhs, out);
                 }
-                _ => out.push(format!("  ({e:?})")),
+                _ => out.push(e),
+            }
+        }
+
+        fn show(e: vir::ExprDyn<'_>) -> String {
+            match e.kind {
+                vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::Implies => {
+                    let mut instances = Vec::new();
+                    conjuncts(b.rhs, &mut instances);
+                    let instances = instances
+                        .iter()
+                        .map(|instance| format!("    ({instance:?})"))
+                        .collect::<Vec<_>>();
+                    format!("  (({:?}) ==>\n{})", b.lhs, instances.join(" &&\n"))
+                }
+                _ => format!("  ({e:?})"),
             }
         }
 
@@ -278,6 +293,7 @@ mod tests {
             };
             let mut body_conjuncts = Vec::new();
             conjuncts(body.as_dyn(), &mut body_conjuncts);
+            let body_conjuncts = body_conjuncts.into_iter().map(show).collect::<Vec<_>>();
             format!("{signature} {{\n{}\n}}", body_conjuncts.join(" &&\n"))
         })
     }
@@ -292,8 +308,10 @@ mod tests {
             dedent(
                 r#"
                 predicate p_Pair_ind(k: s_Pair, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_Pair_0, s_Int_i32_type(), 0, 1))) &&
-                  ((((lo) <= (1)) && ((1) < (hi))) ==> (p_Ref_mutable_ind(k.s_Pair_1, s_Int_i32_type(), 0, 1)))
+                  ((((lo) <= (0)) && ((0) < (hi))) ==>
+                    (p_Ref_mutable_ind(k.s_Pair_0, s_Int_i32_type(), 0, 1))) &&
+                  ((((lo) <= (1)) && ((1) < (hi))) ==>
+                    (p_Ref_mutable_ind(k.s_Pair_1, s_Int_i32_type(), 0, 1)))
                 }
                 "#
             ),
@@ -316,9 +334,11 @@ mod tests {
             dedent(
                 r#"
                 predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
-                  ((((lo) <= (1)) && ((1) < (hi))) ==> (p_Pair_ind(k.s_S_0, 0, 1))) &&
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Pair_ind(k.s_S_0, 1, 2))) &&
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), 0, 1)))
+                  ((((lo) <= (0)) && ((0) < (hi))) ==>
+                    (p_Pair_ind(k.s_S_0, 1, 2)) &&
+                    (p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), 0, 1))) &&
+                  ((((lo) <= (1)) && ((1) < (hi))) ==>
+                    (p_Pair_ind(k.s_S_0, 0, 1)))
                 }
                 "#
             ),
@@ -335,8 +355,10 @@ mod tests {
             dedent(
                 r#"
                 predicate p_S_ind(k: s_S, T$1: Type, lo: Int, hi: Int) {
-                  (((clamp((lo) - (1), 0, arity(T$1))) < (clamp((hi) - (1), 0, arity(T$1)))) ==> (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), clamp((lo) - (1), 0, arity(T$1)), clamp((hi) - (1), 0, arity(T$1))))) &&
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), arity(T$1), (arity(T$1)) + (1))))
+                  ((((lo) <= (0)) && ((0) < (hi))) ==>
+                    (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), arity(T$1), (arity(T$1)) + (1)))) &&
+                  (((clamp((lo) - (1), 0, arity(T$1))) < (clamp((hi) - (1), 0, arity(T$1)))) ==>
+                    (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), clamp((lo) - (1), 0, arity(T$1)), clamp((hi) - (1), 0, arity(T$1)))))
                 }
                 "#
             ),
@@ -350,8 +372,10 @@ mod tests {
             dedent(
                 r#"
                 predicate p_2_Tuple_ind(k: s_2_Tuple, T$0: Type, U$1: Type, lo: Int, hi: Int) {
-                  (((clamp(lo, 0, arity(T$0))) < (clamp(hi, 0, arity(T$0)))) ==> (p_Param_ind(k.s_2_Tuple_0, T$0, clamp(lo, 0, arity(T$0)), clamp(hi, 0, arity(T$0))))) &&
-                  (((clamp((lo) - (arity(T$0)), 0, arity(U$1))) < (clamp((hi) - (arity(T$0)), 0, arity(U$1)))) ==> (p_Param_ind(k.s_2_Tuple_1, U$1, clamp((lo) - (arity(T$0)), 0, arity(U$1)), clamp((hi) - (arity(T$0)), 0, arity(U$1)))))
+                  (((clamp(lo, 0, arity(T$0))) < (clamp(hi, 0, arity(T$0)))) ==>
+                    (p_Param_ind(k.s_2_Tuple_0, T$0, clamp(lo, 0, arity(T$0)), clamp(hi, 0, arity(T$0))))) &&
+                  (((clamp((lo) - (arity(T$0)), 0, arity(U$1))) < (clamp((hi) - (arity(T$0)), 0, arity(U$1)))) ==>
+                    (p_Param_ind(k.s_2_Tuple_1, U$1, clamp((lo) - (arity(T$0)), 0, arity(U$1)), clamp((hi) - (arity(T$0)), 0, arity(U$1)))))
                 }
                 "#
             ),
@@ -383,8 +407,11 @@ mod tests {
             dedent(
                 r#"
                 predicate p_Ref_mutable_ind(k: s_Ref_mutable, U$1: Type, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> ((inhabited(U$1)) && (p_Param(k.s_Ref_mutable_0, U$1)))) &&
-                  (((clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))) ==> (p_Param_ind(k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
+                  ((((lo) <= (0)) && ((0) < (hi))) ==>
+                    (inhabited(U$1)) &&
+                    (p_Param(k.s_Ref_mutable_0, U$1))) &&
+                  (((clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))) ==>
+                    (p_Param_ind(k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
                 }
                 "#
             ),
@@ -415,8 +442,9 @@ mod tests {
             dedent(
                 r#"
                 predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1))) &&
-                  ((((lo) <= (0)) && ((0) < (hi))) ==> (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
+                  ((((lo) <= (0)) && ((0) < (hi))) ==>
+                    (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)) &&
+                    (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
                 }
                 "#
             ),
