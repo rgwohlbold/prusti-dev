@@ -8,9 +8,12 @@ pub mod r#trait;
 pub mod sizedness;
 pub mod arity;
 pub mod clamp;
+pub mod lifetime_position;
 pub mod trait_fn;
 pub mod trait_impls;
 mod ty_expr;
+#[cfg(test)]
+mod test_util;
 
 pub(crate) use param_typ::ParamTypEnc;
 
