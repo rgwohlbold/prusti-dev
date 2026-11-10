@@ -24,6 +24,7 @@ use crate::encoders::{
         generics::{
             GArgsCastEnc,
             arity::ArityEnc,
+            clamp::ClampEnc,
             sizedness::SizednessEnc,
             r#trait::TraitEnc,
             trait_fn::TraitFnEnc,
@@ -138,6 +139,7 @@ pub fn test_entrypoint<'tcx>(
     TraitEnc::emit_outputs(&mut program);
     SizednessEnc::emit_outputs(&mut program);
     ArityEnc::emit_outputs(&mut program);
+    ClampEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);
     TraitImplEnc::emit_outputs(&mut program);
     TraitImplConditionEnc::emit_outputs(&mut program);
