@@ -190,9 +190,22 @@ impl TaskEncoder for IndirectPredEnc {
                     let referent = deps.require_dep::<TyUseImpureEnc>(referent_ty)?;
                     let addr = pure_data.deref_access.call()(k.downcast_ty());
                     let referent_pred = referent.ref_to_pred(vcx, addr, None);
-                    let referent_snap = pure_data.value_access.call()(k.downcast_ty()).upcast_ty();
+                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    // If the query contains lifetime 0, we want to read the snapshot from the heap,
+                    // otherwise, the snapshot of the referent is stored in our snapshot 
+                    let in_query = subqueries
+                        .iter()
+                        .find(|subquery| matches!(subquery.param, LifetimePosition::Lifetime(_)))
+                        .unwrap()
+                        .guard;
+                    let current_snap = referent.ref_to_snap(addr);
+                    let stored_snap: vir::ExprSnap<'vir> =
+                        pure_data.value_access.call()(k.downcast_ty()).upcast_ty();
+                    let referent_snap = vir::expr! { vcx;
+                        (in_query) ? (current_snap) : (stored_snap)
+                    };
                     let mut conjuncts = Vec::new();
-                    for subquery in Self::subqueries(task_key, lo, hi, deps)? {
+                    for subquery in subqueries {
                         let mut preds = Vec::new();
                         // The own lifetime of the reference gives access to the referent.
                         if matches!(subquery.param, LifetimePosition::Lifetime(_)) {
@@ -266,6 +279,12 @@ mod tests {
             }
         }
 
+        /// The `Debug` output of `e`, which breaks ternaries over several
+        /// lines, on one line.
+        fn one_line(e: vir::ExprDyn<'_>) -> String {
+            format!("{e:?}").replace('\n', " ")
+        }
+
         fn show(e: vir::ExprDyn<'_>) -> String {
             match e.kind {
                 vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::Implies => {
@@ -273,11 +292,11 @@ mod tests {
                     conjuncts(b.rhs, &mut instances);
                     let instances = instances
                         .iter()
-                        .map(|instance| format!("    ({instance:?})"))
+                        .map(|instance| format!("    ({})", one_line(instance)))
                         .collect::<Vec<_>>();
-                    format!("  (({:?}) ==>\n{})", b.lhs, instances.join(" &&\n"))
+                    format!("  (({}) ==>\n{})", one_line(b.lhs), instances.join(" &&\n"))
                 }
-                _ => format!("  ({e:?})"),
+                _ => format!("  ({})", one_line(e)),
             }
         }
 
@@ -398,8 +417,6 @@ mod tests {
         );
     }
 
-    /// The own lifetime of a mutable reference gives access to the referent,
-    /// and the referent's positions are passed on to the referent.
     #[test]
     fn mutable_reference() {
         assert_eq!(
@@ -411,7 +428,7 @@ mod tests {
                     (inhabited(U$1)) &&
                     (p_Param(k.s_Ref_mutable_0, U$1))) &&
                   (((clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))) ==>
-                    (p_Param_ind(k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
+                    (p_Param_ind(((lo) <= (0)) && ((0) < (hi)) ? p_Param_snap(k.s_Ref_mutable_0, U$1) : k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
                 }
                 "#
             ),
