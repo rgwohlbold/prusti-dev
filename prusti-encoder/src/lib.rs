@@ -32,6 +32,7 @@ use crate::encoders::{
                 TraitImplConditionEnc, TraitImplDefaultFnEnc, TraitImplEnc, TraitImplItemEnc,
             },
         },
+        indirect_pred::IndirectPredEnc,
         interpretation::{bitvec::BitVecEnc, float_conv::FloatBitVecConvEnc},
         lifted::TyConstructorEnc,
     },
@@ -140,6 +141,7 @@ pub fn test_entrypoint<'tcx>(
     SizednessEnc::emit_outputs(&mut program);
     ArityEnc::emit_outputs(&mut program);
     ClampEnc::emit_outputs(&mut program);
+    IndirectPredEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);
     TraitImplEnc::emit_outputs(&mut program);
     TraitImplConditionEnc::emit_outputs(&mut program);

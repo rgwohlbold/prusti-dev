@@ -9,6 +9,7 @@ use prusti_rustc_interface::{
     session::config::Input,
     span::FileName,
 };
+use vir::{Foldable, simplify::SimplifyCtx};
 
 use crate::encoders::ty::RustTyDecomposition;
 
@@ -76,4 +77,28 @@ pub(super) fn with_type_alias<R: Send>(
     ];
     driver::run_compiler(&args.map(String::from), &mut callbacks);
     callbacks.result.unwrap()
+}
+
+/// The expression `e` as it appears in the final program, which is simplified.
+pub(super) fn simplified<'vir, E: Foldable<'vir, (), !> + Copy>(e: E) -> E {
+    vir::with_vcx(|vcx| vir::simplify::simplify(vcx, &SimplifyCtx::new(&[], &[], &[], &[]), e))
+}
+
+/// `s` without its first and last line and without the indentation that its
+/// lines have in common, so that expected output can be written as an
+/// indented raw string.
+pub(super) fn dedent(s: &str) -> String {
+    let lines = s.lines().collect::<Vec<_>>();
+    let lines = &lines[1..lines.len() - 1];
+    let indent = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| line.len() - line.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    lines
+        .iter()
+        .map(|line| line.get(indent..).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("\n")
 }

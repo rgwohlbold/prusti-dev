@@ -14,7 +14,7 @@ use crate::encoders::ty::{
 /// be a lifetime parameter on the type itself, or a type parameter involving an `arity` expression
 pub struct LifetimePositionEnc;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LifetimePosition<'tcx> {
     Lifetime(ty::Region<'tcx>),
     Param(RustTyDecomposition<'tcx>),
@@ -88,7 +88,7 @@ mod tests {
     use task_encoder::TaskEncoder;
 
     use super::{LifetimePosition, LifetimePositionEnc};
-    use crate::encoders::ty::generics::test_util::with_type_alias;
+    use crate::encoders::ty::test_util::{simplified, with_type_alias};
 
     /// The lifetime positions of the type alias `X` defined in `src`, as
     /// `occupant @ position`.
@@ -99,10 +99,13 @@ mod tests {
                 .unwrap();
             positions
                 .into_iter()
-                .map(|(occupant, position)| match occupant {
-                    LifetimePosition::Lifetime(region) => format!("{region} @ {position:?}"),
-                    LifetimePosition::Param(param) => {
-                        format!("{} @ {position:?}", param.args.args()[0])
+                .map(|(occupant, position)| {
+                    let position = simplified(position);
+                    match occupant {
+                        LifetimePosition::Lifetime(region) => format!("{region} @ {position:?}"),
+                        LifetimePosition::Param(param) => {
+                            format!("{} @ {position:?}", param.args.args()[0])
+                        }
                     }
                 })
                 .collect()
