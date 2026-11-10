@@ -62,7 +62,7 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
         }
     }
 
-    /// `l && r`, `l || r`, `l ==> r`, `l == r` and `l != r`:
+    /// `l && r`, `l || r`, `l ==> r`, `l == r`, `l != r`, `l + r` and `l - r`:
     ///  - `true && r` is `r` and `false && r` is `false`, `false || r` is `r`
     ///    and `true || r` is `true`, and likewise with the literal on the
     ///    right,
@@ -71,7 +71,8 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
     ///    are `!l`, and likewise with the literal on the left,
     ///  - `C(a_0, ..) == C(b_0, ..)` is `a_0 == b_0 && ..` since adt
     ///    constructors are injective, and `!=` is its negation; the
-    ///    applications may be locals bound to them.
+    ///    applications may be locals bound to them,
+    ///  - `0 + r` is `r`, and `l + 0` and `l - 0` are `l`.
     fn fold_bin_op(
         &mut self,
         kind: BinOpKind,
@@ -79,6 +80,11 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
         r: ExprDyn<'vir>,
     ) -> Option<ExprDyn<'vir>> {
         use BinOpKind::*;
+        match (kind, as_int(l), as_int(r)) {
+            (Add, Some(0), _) => return Some(r),
+            (Add | Sub, _, Some(0)) => return Some(l),
+            _ => {}
+        }
         match (kind, as_bool(l), as_bool(r)) {
             (And, Some(true), _) | (Or, Some(false), _) | (Implies, Some(true), _) => Some(r),
             (And, _, Some(true)) | (Or, _, Some(false)) => Some(l),

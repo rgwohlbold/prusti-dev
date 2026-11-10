@@ -190,6 +190,10 @@ fn bin_op() {
     check("!(b)", |c| c.bin(CmpEq, c.b("b"), c.ff()));
     check("b", |c| c.bin(CmpNe, c.ff(), c.b("b")));
     check("false", |c| c.bin(CmpEq, c.tt(), c.ff()));
+    check("x", |c| c.bin(Add, c.int(0), c.i("x")));
+    check("x", |c| c.bin(Add, c.i("x"), c.int(0)));
+    check("x", |c| c.bin(Sub, c.i("x"), c.int(0)));
+    check("(0) - (x)", |c| c.bin(Sub, c.int(0), c.i("x")));
     check("((x) == (z)) && ((y) == (w))", |c| {
         c.bin(
             CmpEq,
