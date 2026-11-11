@@ -9,6 +9,8 @@ use prusti_rustc_interface::{
     session::config::Input,
     span::FileName,
 };
+use std::{path::Path, process::Command};
+
 use vir::{Foldable, simplify::SimplifyCtx};
 
 use crate::encoders::ty::RustTyDecomposition;
@@ -101,4 +103,68 @@ pub(super) fn dedent(s: &str) -> String {
         .map(|line| line.get(indent..).unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Compiles `src`, which defines the type alias `X`, calls `encode` with the
+/// aliased type, and verifies the program of everything encoded, followed by
+/// the Viper code `viper`, with Silicon. Returns Silicon's output if the
+/// verification fails.
+///
+/// The program is kept in `target/viper-tests`, named after the test. Silicon
+/// gets it as text, while Prusti passes an AST, so a verdict could in
+/// principle differ from Prusti's.
+pub(super) fn verify(
+    src: &str,
+    encode: impl for<'tcx> FnOnce(RustTyDecomposition<'tcx>) + Send,
+    viper: &str,
+) -> Result<(), String> {
+    thread_local! {
+        static COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+    let program = with_type_alias(src, |ty| {
+        encode(ty);
+        let mut program = crate::emit_program();
+        program.simplify();
+        program.code()
+    });
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/viper-tests");
+    std::fs::create_dir_all(&dir).unwrap();
+    let test = std::thread::current()
+        .name()
+        .unwrap_or("test")
+        .replace("::", "-");
+    let count = COUNT.with(|count| count.replace(count.get() + 1));
+    let path = dir.join(format!("{test}-{count}.vpr"));
+    std::fs::write(&path, format!("{program}\n{viper}")).unwrap();
+    let env = |name: &str| {
+        std::env::var(name)
+            .unwrap_or_else(|_| panic!("{name} is not set, run the tests with ./x.py"))
+    };
+    // The arguments that Prusti passes to Silicon, see
+    // `prusti-server/src/verification_request.rs`.
+    let output = Command::new(Path::new(&env("JAVA_HOME")).join("bin/java"))
+        .args(["-Xss1024m", "-cp"])
+        .arg(Path::new(&env("VIPER_HOME")).join("viperserver.jar"))
+        .args(["viper.silicon.SiliconRunner", "--z3Exe"])
+        .arg(env("Z3_EXE"))
+        .args([
+            "--disableTerminationPlugin",
+            "--proverConfigArgs",
+            "smt.qi.eager_threshold=1000 model.partial=false smt.arith.solver=6",
+            "--logLevel",
+            "ERROR",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.contains("finished verification successfully") {
+        Ok(())
+    } else {
+        Err(format!(
+            "{stdout}{}(program: {})",
+            String::from_utf8_lossy(&output.stderr),
+            path.display()
+        ))
+    }
 }
