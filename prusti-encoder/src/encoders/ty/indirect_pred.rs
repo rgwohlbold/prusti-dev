@@ -10,7 +10,7 @@ use super::{
         GArgsTyEnc, GenericParamsEnc, TyExprEnc,
         arity::{ArityEnc, add},
         clamp::ClampEnc,
-        lifetime_position::{LifetimePosition, LifetimePositionEnc},
+        lifetime_position::{LifetimePosition, LifetimePositionEnc, Occurrence},
     },
     pure::TyPureEnc,
 };
@@ -75,114 +75,146 @@ impl IndirectPredEnc {
             };
             own_positions
                 .into_iter()
-                .map(|(param, x)| {
-                    Ok(match param {
-                        // An own lifetime has the single position `x`, which the query either contains or not.
-                        LifetimePosition::Lifetime(_) => Subquery {
-                            param,
-                            guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
-                            start: vcx.mk_uint::<0>(),
-                            end: vcx.mk_uint::<1>(),
-                        },
-                        // The subquery of an own type parameter at the positions `[x, x + w)` is `[clamp(lo - x, 0, w), clamp(hi - x, 0, w))`.
-                        LifetimePosition::Param(ty) => {
-                            let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
-                            let zero = vcx.mk_uint::<0>();
-                            let start = clamp.call()(sub(lo, x), zero, w);
-                            let end = clamp.call()(sub(hi, x), zero, w);
-                            Subquery {
+                .map(
+                    |Occurrence {
+                         param, start: x, ..
+                     }| {
+                        Ok(match param {
+                            // An own lifetime has the single position `x`, which the query either contains or not.
+                            LifetimePosition::Lifetime(_) => Subquery {
                                 param,
-                                guard: vir::expr! { vcx; (start) < (end) },
-                                start,
-                                end,
+                                guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
+                                start: vcx.mk_uint::<0>(),
+                                end: vcx.mk_uint::<1>(),
+                            },
+                            // The subquery of an own type parameter at the positions `[x, x + w)` is `[clamp(lo - x, 0, w), clamp(hi - x, 0, w))`.
+                            LifetimePosition::Param(ty) => {
+                                let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
+                                let zero = vcx.mk_uint::<0>();
+                                let start = clamp.call()(sub(lo, x), zero, w);
+                                let end = clamp.call()(sub(hi, x), zero, w);
+                                Subquery {
+                                    param,
+                                    guard: vir::expr! { vcx; (start) < (end) },
+                                    start,
+                                    end,
+                                }
                             }
-                        }
-                    })
-                })
+                        })
+                    },
+                )
                 .collect()
         })
     }
 
-    /// The first positions of the occurrences of the subquery's parameter in
-    /// the field type `field_ty`.
-    fn occurrences<'vir>(
-        subquery: Subquery<'vir>,
+    /// The snapshot on which the field predicate of the occurrence `index`
+    /// in the field type `field_ty` is defined: `field_snap`, extended by the
+    /// enclosing occurrences whose parameters the query contains, outermost
+    /// first. The caller has already extended `field_snap` by the enclosing
+    /// occurrences of the other parameters.
+    fn occurrence_snap<'vir>(
+        subqueries: &[Subquery<'vir>],
         field_ty: RustTyDecomposition<'vir>,
+        occurrences: &[Occurrence<'vir>],
+        index: usize,
+        field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
-    ) -> Result<Vec<vir::ExprInt<'vir>>, EncodeFullError<'vir, Self>> {
-        Ok(deps
-            .require_dep::<LifetimePositionEnc>(field_ty)?
-            .into_iter()
-            .filter(|&(param, _)| param == subquery.param)
-            .map(|(_, y)| y)
-            .collect())
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
+        let mut snap = field_snap;
+        for &enclosing in &occurrences[index].enclosing {
+            let occurrence = &occurrences[enclosing];
+            let Some(&subquery) = subqueries.iter().find(|s| s.param == occurrence.param) else {
+                continue;
+            };
+            let key = Self::occurrence_snap(
+                subqueries,
+                field_ty,
+                occurrences,
+                enclosing,
+                field_snap,
+                deps,
+            )?;
+            let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
+            let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+            let guard = subquery.guard;
+            let start = add(occurrence.start, subquery.start);
+            let end = add(occurrence.start, subquery.end);
+            let extended = ext.call()(snap, args.get_ty(), args.get_const(), key, start, end);
+            // An enclosing occurrence of the same parameter is in the query
+            // whenever the occurrence `index` is.
+            snap = if occurrence.param == occurrences[index].param {
+                extended
+            } else {
+                vir::expr! { (guard) ? (extended) : (snap) }
+            };
+        }
+        Ok(snap)
     }
 
-    /// The predicates of the field of type `field_ty` with the snapshot `field_snap` for `subquery`:
-    /// one for each occurrence of the subquery's parameter in the field type
+    /// The predicates of the field of type `field_ty` with the snapshot
+    /// `field_snap` for `subquery`: one for each occurrence of the subquery's
+    /// parameter in the field type.
     fn field_preds<'vir>(
+        subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
-        let occurrences = Self::occurrences(subquery, field_ty, deps)?;
-        if occurrences.is_empty() {
-            return Ok(Vec::new());
+        let occurrences = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        let mut preds = Vec::new();
+        for (index, occurrence) in occurrences.iter().enumerate() {
+            if occurrence.param != subquery.param {
+                continue;
+            }
+            let pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
+            let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+            let snap =
+                Self::occurrence_snap(subqueries, field_ty, &occurrences, index, field_snap, deps)?;
+            let start = add(occurrence.start, subquery.start);
+            let end = add(occurrence.start, subquery.end);
+            preds.push(vir::expr! {
+                acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], start, end))
+            });
         }
-        let pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
-        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(occurrences
-            .into_iter()
-            .map(|y| {
-                let start = add(y, subquery.start);
-                let end = add(y, subquery.end);
-                vir::expr! {
-                    acc([pred](
-                        field_snap,
-                        [..[args.get_ty()]],
-                        [..[args.get_const()]],
-                        start,
-                        end
-                    ))
-                }
-            })
-            .collect())
+        Ok(preds)
     }
 
     /// The snapshot `field_snap` of the field of type `field_ty`, extended by
     /// `subquery` at each occurrence of the subquery's parameter in the field
-    /// type. The field predicates holding the permissions are defined on
-    /// `field_pred`.
+    /// type, if the subquery is non-empty. The field predicates holding the
+    /// permissions are defined on `field_pred`, extended as in
+    /// `occurrence_snap`.
     fn field_ext<'vir>(
+        subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
         field_snap: vir::ExprSnap<'vir>,
         field_pred: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
-        let occurrences = Self::occurrences(subquery, field_ty, deps)?;
-        if occurrences.is_empty() {
+        let occurrences = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        if occurrences
+            .iter()
+            .all(|occurrence| occurrence.param != subquery.param)
+        {
             return Ok(field_snap);
         }
-        let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
-        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(vir::with_vcx(|vcx| {
-            occurrences.into_iter().fold(field_snap, |snap, y| {
-                let guard = subquery.guard;
-                let start = add(y, subquery.start);
-                let end = add(y, subquery.end);
-                let extended = ext.call()(
-                    snap,
-                    args.get_ty(),
-                    args.get_const(),
-                    field_pred,
-                    start,
-                    end,
-                );
-                vir::expr! { vcx; (guard) ? (extended) : (snap) }
-            })
-        }))
+        let mut snap = field_snap;
+        for (index, occurrence) in occurrences.iter().enumerate() {
+            if occurrence.param != subquery.param {
+                continue;
+            }
+            let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
+            let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+            let key =
+                Self::occurrence_snap(subqueries, field_ty, &occurrences, index, field_pred, deps)?;
+            let start = add(occurrence.start, subquery.start);
+            let end = add(occurrence.start, subquery.end);
+            snap = ext.call()(snap, args.get_ty(), args.get_const(), key, start, end);
+        }
+        let guard = subquery.guard;
+        Ok(vir::expr! { (guard) ? (snap) : (field_snap) })
     }
 }
 
@@ -253,7 +285,13 @@ impl TaskEncoder for IndirectPredEnc {
                         for (field, pure_field) in &data.fields {
                             let field_ty = field.decompose(task_key.params);
                             let field_snap = pure_field.read.call()(k.downcast_ty());
-                            preds.extend(Self::field_preds(subquery, field_ty, field_snap, deps)?);
+                            preds.extend(Self::field_preds(
+                                &subqueries,
+                                subquery,
+                                field_ty,
+                                field_snap,
+                                deps,
+                            )?);
                         }
                         if !preds.is_empty() {
                             let guard = subquery.guard;
@@ -269,8 +307,14 @@ impl TaskEncoder for IndirectPredEnc {
                         let mut field_snap = pure_field.read.call()(ext_snapshot.downcast_ty());
                         let field_pred = pure_field.read.call()(ext_pred.downcast_ty());
                         for &subquery in &subqueries {
-                            field_snap =
-                                Self::field_ext(subquery, field_ty, field_snap, field_pred, deps)?;
+                            field_snap = Self::field_ext(
+                                &subqueries,
+                                subquery,
+                                field_ty,
+                                field_snap,
+                                field_pred,
+                                deps,
+                            )?;
                         }
                         field_snaps.push(field_snap);
                     }
@@ -305,6 +349,7 @@ impl TaskEncoder for IndirectPredEnc {
                         }
                         // The positions of the referent's type are passed on to the referent like those of a field.
                         preds.extend(Self::field_preds(
+                            &subqueries,
                             subquery,
                             referent_ty,
                             referent_snap,
@@ -330,6 +375,7 @@ impl TaskEncoder for IndirectPredEnc {
                     let mut extended_stored = stored_snap;
                     for &subquery in &subqueries {
                         extended_current = Self::field_ext(
+                            &subqueries,
                             subquery,
                             referent_ty,
                             extended_current,
@@ -337,6 +383,7 @@ impl TaskEncoder for IndirectPredEnc {
                             deps,
                         )?;
                         extended_stored = Self::field_ext(
+                            &subqueries,
                             subquery,
                             referent_ty,
                             extended_stored,
@@ -709,9 +756,8 @@ mod tests {
 
     /// `'a` occurs at positions 0 and 1 of the field, and 1 is inside the
     /// referent of 0. Both field predicates are part of the one conjunct of
-    /// `'a`, so no caller can extend the snapshot in between: the second
-    /// should be on `ext_Ref_mutable(k.s_S_0, .., k.s_S_0, 0, 1)`, which is
-    /// not implemented yet.
+    /// `'a`, so no caller can extend the snapshot in between: the second is
+    /// on the field snapshot extended by the first.
     #[test]
     fn enclosed_occurrence() {
         assert_eq!(
@@ -724,19 +770,15 @@ mod tests {
                 predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
                   ((((lo) <= (0)) && ((0) < (hi))) ==>
                     (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)) &&
-                    (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
+                    (p_Ref_mutable_ind(ext_Ref_mutable(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), k.s_S_0, 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
                 }
 
                 function ext_S(snapshot: s_S, pred: s_S, lo: Int, hi: Int): s_S
                   requires p_S_ind(pred, lo, hi)
                 {
                   unfolding p_S_ind(pred, lo, hi) in (s_S_cons(((lo) <= (0)) && ((0) < (hi))
-                  ? ext_Ref_mutable(((lo) <= (0)) && ((0) < (hi))
-                    ? ext_Ref_mutable(snapshot.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1)
-                    : snapshot.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 1, 2)
-                  : ((lo) <= (0)) && ((0) < (hi))
-                    ? ext_Ref_mutable(snapshot.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1)
-                    : snapshot.s_S_0))
+                  ? ext_Ref_mutable(ext_Ref_mutable(snapshot.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1), s_Ref_mutable_type(s_Int_i32_type()), ext_Ref_mutable(pred.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1), 1, 2)
+                  : snapshot.s_S_0))
                 }
                 "#
             ),

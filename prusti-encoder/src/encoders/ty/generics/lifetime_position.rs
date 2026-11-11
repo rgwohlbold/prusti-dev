@@ -20,12 +20,23 @@ pub enum LifetimePosition<'tcx> {
     Param(RustTyDecomposition<'tcx>),
 }
 
+/// An occurrence of a lifetime or type parameter in a type.
+#[derive(Debug, Clone)]
+pub struct Occurrence<'vir> {
+    pub param: LifetimePosition<'vir>,
+    /// The first lifetime position of the occurrence.
+    pub start: vir::ExprInt<'vir>,
+    /// The indices of the occurrences of lifetimes whose mutable references
+    /// this occurrence lies behind, outermost first.
+    pub enclosing: Vec<usize>,
+}
+
 impl TaskEncoder for LifetimePositionEnc {
     task_encoder::encoder_cache!(LifetimePositionEnc);
     const ENCODER_NAME: &'static str = "lifetime position encoder";
 
     type TaskDescription<'vir> = RustTyDecomposition<'vir>;
-    type OutputFullDependency<'vir> = Vec<(LifetimePosition<'vir>, vir::ExprInt<'vir>)>;
+    type OutputFullDependency<'vir> = Vec<Occurrence<'vir>>;
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -38,24 +49,45 @@ impl TaskEncoder for LifetimePositionEnc {
         deps.emit_output_ref(*task_key, ())?;
         let positions = match task_key.ty.specifics {
             TySpecifics::ImmRef(_) => Vec::new(),
-            TySpecifics::Param(RustParamData::Generic) => vec![(
-                LifetimePosition::Param(*task_key),
-                vir::with_vcx(|vcx| vcx.mk_uint::<0>()),
-            )],
+            TySpecifics::Param(RustParamData::Generic) => vec![Occurrence {
+                param: LifetimePosition::Param(*task_key),
+                start: vir::with_vcx(|vcx| vcx.mk_uint::<0>()),
+                enclosing: Vec::new(),
+            }],
             _ => {
                 let args = task_key.args.args();
                 let mut positions = args
                     .iter()
                     .filter_map(|arg| arg.as_region())
                     .enumerate()
-                    .map(|(j, region)| (LifetimePosition::Lifetime(region), int(j)))
+                    .map(|(j, region)| Occurrence {
+                        param: LifetimePosition::Lifetime(region),
+                        start: int(j),
+                        enclosing: Vec::new(),
+                    })
                     .collect::<Vec<_>>();
+                // Everything in the referent of a mutable reference lies
+                // behind its lifetime, the occurrence 0.
+                let behind = match task_key.ty.specifics {
+                    TySpecifics::MutRef(_) => vec![0],
+                    _ => Vec::new(),
+                };
                 let mut offset = int(positions.len());
                 let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
                 for arg_ty in args.iter().filter_map(|arg| arg.as_type()) {
                     let arg_ty = RustTyDecomposition::from_ty(arg_ty, task_key.args.context());
-                    for (occupant, at) in deps.require_dep::<Self>(arg_ty)? {
-                        positions.push((occupant, add(offset, at)));
+                    let base = positions.len();
+                    for occurrence in deps.require_dep::<Self>(arg_ty)? {
+                        let enclosing = behind
+                            .iter()
+                            .copied()
+                            .chain(occurrence.enclosing.iter().map(|index| base + index))
+                            .collect();
+                        positions.push(Occurrence {
+                            param: occurrence.param,
+                            start: add(offset, occurrence.start),
+                            enclosing,
+                        });
                     }
                     // The arity of a type constructor is given by an axiom,
                     // which a type parameter does not have.
@@ -90,8 +122,9 @@ mod tests {
     use super::{LifetimePosition, LifetimePositionEnc};
     use crate::encoders::ty::test_util::{simplified, with_type_alias};
 
-    /// The lifetime positions of the type alias `X` defined in `src`, as
-    /// `occupant @ position`.
+    /// The occurrences in the type alias `X` defined in `src`, as
+    /// `param @ position`, followed by `behind [i, ..]` with the indices of
+    /// the occurrences enclosing it, if any.
     fn positions(src: &str) -> Vec<String> {
         with_type_alias(src, |ty| {
             let (_, _, positions) = LifetimePositionEnc::encode(ty, true, DUMMY_SP)
@@ -99,13 +132,16 @@ mod tests {
                 .unwrap();
             positions
                 .into_iter()
-                .map(|(occupant, position)| {
-                    let position = simplified(position);
-                    match occupant {
-                        LifetimePosition::Lifetime(region) => format!("{region} @ {position:?}"),
-                        LifetimePosition::Param(param) => {
-                            format!("{} @ {position:?}", param.args.args()[0])
-                        }
+                .map(|occurrence| {
+                    let position = simplified(occurrence.start);
+                    let param = match occurrence.param {
+                        LifetimePosition::Lifetime(region) => format!("{region}"),
+                        LifetimePosition::Param(param) => format!("{}", param.args.args()[0]),
+                    };
+                    if occurrence.enclosing.is_empty() {
+                        format!("{param} @ {position:?}")
+                    } else {
+                        format!("{param} @ {position:?} behind {:?}", occurrence.enclosing)
                     }
                 })
                 .collect()
@@ -157,9 +193,9 @@ mod tests {
             positions("type X<'a, T> = (&'a mut T, &'a mut T);"),
             [
                 "'a @ 0",
-                "T @ 1",
+                "T @ 1 behind [0]",
                 "'a @ arity(s_Ref_mutable_type(T$1))",
-                "T @ (arity(s_Ref_mutable_type(T$1))) + (1)",
+                "T @ (arity(s_Ref_mutable_type(T$1))) + (1) behind [2]",
             ],
         );
     }
@@ -168,7 +204,7 @@ mod tests {
     fn nested_mutable_references() {
         assert_eq!(
             positions("type X<'a, 'b> = &'a mut &'b mut i32;"),
-            ["'a @ 0", "'b @ 1"],
+            ["'a @ 0", "'b @ 1 behind [0]"],
         );
     }
 
@@ -176,7 +212,7 @@ mod tests {
     fn static_lifetime() {
         assert_eq!(
             positions("type X<T> = &'static mut T;"),
-            ["'static @ 0", "T @ 1"],
+            ["'static @ 0", "T @ 1 behind [0]"],
         );
     }
 
@@ -184,7 +220,7 @@ mod tests {
     fn array() {
         assert_eq!(
             positions("type X<'a, T, const N: usize> = [&'a mut T; N];"),
-            ["'a @ 0", "T @ 1"],
+            ["'a @ 0", "T @ 1 behind [0]"],
         );
     }
 }
