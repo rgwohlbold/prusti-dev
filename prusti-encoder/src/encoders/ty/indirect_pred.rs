@@ -570,7 +570,9 @@ mod verification_tests {
     use task_encoder::TaskEncoder;
 
     use super::IndirectPredEnc;
-    use crate::encoders::ty::test_util::verify;
+    use crate::encoders::ty::{
+        RustTyDecomposition, generics::IndirectCastersEnc, test_util::verify,
+    };
 
     /// Verifies the Viper code `viper` together with the indirect predicate
     /// of the type alias `X` defined in `src`.
@@ -579,6 +581,28 @@ mod verification_tests {
             src,
             |ty| {
                 IndirectPredEnc::encode(ty.ty, true, DUMMY_SP).unwrap();
+            },
+            viper,
+        )
+    }
+
+    /// Verifies the Viper code `viper` together with the indirect predicate
+    /// of the type alias `X` defined in `src` and the casts of the
+    /// predicates of its type arguments.
+    fn verify_with_casts(src: &str, viper: &str) -> Result<(), String> {
+        verify(
+            src,
+            |ty| {
+                IndirectPredEnc::encode(ty.ty, true, DUMMY_SP).unwrap();
+                for arg in ty.args.args() {
+                    let arg = RustTyDecomposition::from_ty(arg.expect_ty(), ty.args.context());
+                    IndirectCastersEnc::encode(
+                        (RustTyDecomposition::param(), arg.ty),
+                        true,
+                        DUMMY_SP,
+                    )
+                    .unwrap();
+                }
             },
             viper,
         )
@@ -1082,5 +1106,76 @@ mod verification_tests {
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
         );
+    }
+
+    /// The casts exchange the predicate of `&'a mut U` and that of a type
+    /// parameter instantiated with it, which lets `Option<&'a mut U>`'s
+    /// predicate be unfolded down to the referent.
+    #[test]
+    fn casts() {
+        let src = "type X<'a, T> = Option<&'a mut T>;";
+        let result = verify_with_casts(
+            src,
+            r#"
+            // The snapshot of the field of `Some` is that of a reference
+            // once its type is known.
+            method unfold_option(k: s_Option, U: Type)
+              requires p_Option_ind(k, s_Ref_mutable_type(U), 0, 1) && k.iss_Option_1_cons
+              requires s_Param_typ(k.s_Option_1_0) == s_Ref_mutable_type(U)
+              ensures p_Param(k.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, U)
+            {
+              unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
+              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+              unfold p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+            }
+
+            // Casting back and forth keeps the extension.
+            method round_trip(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1)
+              ensures p_Ref_mutable_ind(k, U, 0, 1)
+              ensures ext_Ref_mutable(k, U, k, 0, 1) == old(ext_Ref_mutable(k, U, k, 0, 1))
+            {
+              make_generic_ind_Ref_mutable(k, U, 0, 1)
+              make_concrete_ind_Ref_mutable(k, U, 0, 1)
+            }
+
+            // The extension of the option is that of the reference.
+            method extend_option(k: s_Option, U: Type)
+              requires p_Option_ind(k, s_Ref_mutable_type(U), 0, 1) && k.iss_Option_1_cons
+              requires s_Param_typ(k.s_Option_1_0) == s_Ref_mutable_type(U)
+              ensures p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+              ensures old(ext_Option(k, s_Ref_mutable_type(U), k, 0, 1)).s_Option_1_0 ==
+                make_generic_s_Ref_mutable(ext_Ref_mutable(
+                  k.s_Option_1_0.make_concrete_s_Ref_mutable, U,
+                  k.s_Option_1_0.make_concrete_s_Ref_mutable, 0, 1), U)
+            {
+              unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
+              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+            }
+            "#,
+        );
+        if let Err(output) = result {
+            panic!("verification failed:\n{output}");
+        }
+        // The casts do not make the state inconsistent.
+        let result = verify_with_casts(
+            src,
+            r#"
+            method test(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1)
+            {
+              make_generic_ind_Ref_mutable(k, U, 0, 1)
+              make_concrete_ind_Ref_mutable(k, U, 0, 1)
+              assert false
+            }
+            "#,
+        );
+        match result {
+            Ok(()) => panic!("verification succeeded"),
+            Err(output) => assert!(
+                output.contains("Assert might fail"),
+                "verification failed differently:\n{output}"
+            ),
+        }
     }
 }

@@ -22,7 +22,7 @@ use crate::encoders::{
     custom::{PairUseEnc, ReadPermEnc},
     ty::{
         generics::{
-            GArgsCastEnc,
+            GArgsCastEnc, IndirectCastersEnc,
             arity::ArityEnc,
             clamp::ClampEnc,
             sizedness::SizednessEnc,
@@ -173,6 +173,7 @@ pub(crate) fn emit_program<'vir>() -> task_encoder::Program<'vir> {
     ArityEnc::emit_outputs(&mut program);
     ClampEnc::emit_outputs(&mut program);
     IndirectPredEnc::emit_outputs(&mut program);
+    IndirectCastersEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);
     TraitImplEnc::emit_outputs(&mut program);
     TraitImplConditionEnc::emit_outputs(&mut program);
