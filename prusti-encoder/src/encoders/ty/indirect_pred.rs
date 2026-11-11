@@ -467,325 +467,6 @@ impl TaskEncoder for IndirectPredEnc {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use prusti_rustc_interface::span::DUMMY_SP;
-    use task_encoder::TaskEncoder;
-    use vir::CastType;
-
-    use super::IndirectPredEnc;
-    use crate::encoders::ty::test_util::{dedent, simplified, with_type_alias};
-
-    fn indirect_pred(src: &str) -> String {
-        fn conjuncts<'vir>(e: vir::ExprDyn<'vir>, out: &mut Vec<vir::ExprDyn<'vir>>) {
-            match e.kind {
-                vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::And => {
-                    conjuncts(b.lhs, out);
-                    conjuncts(b.rhs, out);
-                }
-                _ => out.push(e),
-            }
-        }
-
-        fn one_line(e: vir::ExprDyn<'_>) -> String {
-            format!("{e:?}").replace('\n', " ")
-        }
-
-        fn show(e: vir::ExprDyn<'_>) -> String {
-            match e.kind {
-                vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::Implies => {
-                    let mut instances = Vec::new();
-                    conjuncts(b.rhs, &mut instances);
-                    let instances = instances
-                        .iter()
-                        .map(|instance| format!("    ({})", one_line(instance)))
-                        .collect::<Vec<_>>();
-                    format!("  (({}) ==>\n{})", one_line(b.lhs), instances.join(" &&\n"))
-                }
-                _ => format!("  ({})", one_line(e)),
-            }
-        }
-
-        fn show_predicate(predicate: vir::Predicate<'_>) -> String {
-            let debug = format!("{predicate:?}");
-            let signature = debug.lines().next().unwrap().trim_end_matches('{');
-            let Some(body) = predicate.expr else {
-                return signature.to_string();
-            };
-            let mut body_conjuncts = Vec::new();
-            conjuncts(body.as_dyn(), &mut body_conjuncts);
-            let body_conjuncts = body_conjuncts.into_iter().map(show).collect::<Vec<_>>();
-            format!("{signature} {{\n{}\n}}", body_conjuncts.join(" &&\n"))
-        }
-
-        fn show_function(function: vir::Function<'_>) -> String {
-            let args = function
-                .args
-                .iter()
-                .map(|arg| format!("{arg:?}"))
-                .collect::<Vec<_>>();
-            let mut lines = vec![format!(
-                "function {}({}): {:?}",
-                function.name,
-                args.join(", "),
-                function.ret
-            )];
-            lines.extend(
-                function
-                    .pres
-                    .iter()
-                    .map(|pre| format!("  requires {}", one_line(pre.as_dyn()))),
-            );
-            if let Some(body) = function.expr {
-                lines.push("{".to_string());
-                lines.extend(format!("{body:?}").lines().map(|line| format!("  {line}")));
-                lines.push("}".to_string());
-            }
-            lines.join("\n")
-        }
-
-        with_type_alias(src, |ty| {
-            let (_, (predicate, ext), _) = IndirectPredEnc::encode(ty.ty, true, DUMMY_SP)
-                .unwrap()
-                .unwrap();
-            format!(
-                "{}\n\n{}",
-                show_predicate(simplified(predicate)),
-                show_function(simplified(ext))
-            )
-        })
-    }
-
-    #[test]
-    fn lifetimes() {
-        assert_eq!(
-            indirect_pred(
-                "struct Pair<'a, 'b>(&'a mut i32, &'b mut i32);
-                 type X<'a, 'b> = Pair<'a, 'b>;"
-            ),
-            dedent(
-                r#"
-                predicate p_Pair_ind(k: s_Pair, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==>
-                    (p_Ref_mutable_ind(k.s_Pair_0, s_Int_i32_type(), 0, 1))) &&
-                  ((((lo) <= (1)) && ((1) < (hi))) ==>
-                    (p_Ref_mutable_ind(k.s_Pair_1, s_Int_i32_type(), 0, 1)))
-                }
-
-                function ext_Pair(snapshot: s_Pair, pred: s_Pair, lo: Int, hi: Int): s_Pair
-                  requires p_Pair_ind(pred, lo, hi)
-                {
-                  unfolding p_Pair_ind(pred, lo, hi) in (s_Pair_cons(((lo) <= (0)) && ((0) < (hi))
-                  ? ext_Ref_mutable(snapshot.s_Pair_0, s_Int_i32_type(), pred.s_Pair_0, 0, 1)
-                  : snapshot.s_Pair_0, ((lo) <= (1)) && ((1) < (hi))
-                  ? ext_Ref_mutable(snapshot.s_Pair_1, s_Int_i32_type(), pred.s_Pair_1, 0, 1)
-                  : snapshot.s_Pair_1))
-                }
-                "#
-            ),
-        );
-    }
-
-    #[test]
-    fn nested() {
-        assert_eq!(
-            indirect_pred(
-                "struct Pair<'a, 'b>(&'a mut i32, &'b mut i32);
-                 struct S<'c, 'd> {
-                     p: Pair<'d, 'c>,
-                     q: &'c mut i32,
-                     r: &'d i32,
-                     s: &'static mut i32,
-                 }
-                 type X<'c, 'd> = S<'c, 'd>;"
-            ),
-            dedent(
-                r#"
-                predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==>
-                    (p_Pair_ind(k.s_S_0, 1, 2)) &&
-                    (p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), 0, 1))) &&
-                  ((((lo) <= (1)) && ((1) < (hi))) ==>
-                    (p_Pair_ind(k.s_S_0, 0, 1)))
-                }
-
-                function ext_S(snapshot: s_S, pred: s_S, lo: Int, hi: Int): s_S
-                  requires p_S_ind(pred, lo, hi)
-                {
-                  unfolding p_S_ind(pred, lo, hi) in (s_S_cons(((lo) <= (1)) && ((1) < (hi))
-                  ? ext_Pair(((lo) <= (0)) && ((0) < (hi))
-                    ? ext_Pair(snapshot.s_S_0, pred.s_S_0, 1, 2)
-                    : snapshot.s_S_0, pred.s_S_0, 0, 1)
-                  : ((lo) <= (0)) && ((0) < (hi))
-                    ? ext_Pair(snapshot.s_S_0, pred.s_S_0, 1, 2)
-                    : snapshot.s_S_0, ((lo) <= (0)) && ((0) < (hi))
-                  ? ext_Ref_mutable(snapshot.s_S_1, s_Int_i32_type(), pred.s_S_1, 0, 1)
-                  : snapshot.s_S_1, snapshot.s_S_2, snapshot.s_S_3))
-                }
-                "#
-            ),
-        );
-    }
-
-    #[test]
-    fn after_type_param() {
-        assert_eq!(
-            indirect_pred(
-                "struct S<'a, T> { f: (T, &'a mut i32) }
-                 type X<'a, T> = S<'a, T>;"
-            ),
-            dedent(
-                r#"
-                predicate p_S_ind(k: s_S, T$1: Type, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==>
-                    (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), arity(T$1), (arity(T$1)) + (1)))) &&
-                  (((clamp((lo) - (1), 0, arity(T$1))) < (clamp((hi) - (1), 0, arity(T$1)))) ==>
-                    (p_2_Tuple_ind(k.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), clamp((lo) - (1), 0, arity(T$1)), clamp((hi) - (1), 0, arity(T$1)))))
-                }
-
-                function ext_S(snapshot: s_S, T$1: Type, pred: s_S, lo: Int, hi: Int): s_S
-                  requires p_S_ind(pred, T$1, lo, hi)
-                {
-                  unfolding p_S_ind(pred, T$1, lo, hi) in (s_S_cons((clamp((lo) - (1), 0, arity(T$1))) < (clamp((hi) - (1), 0, arity(T$1)))
-                  ? ext_2_Tuple(((lo) <= (0)) && ((0) < (hi))
-                    ? ext_2_Tuple(snapshot.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, arity(T$1), (arity(T$1)) + (1))
-                    : snapshot.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, clamp((lo) - (1), 0, arity(T$1)), clamp((hi) - (1), 0, arity(T$1)))
-                  : ((lo) <= (0)) && ((0) < (hi))
-                    ? ext_2_Tuple(snapshot.s_S_0, T$1, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, arity(T$1), (arity(T$1)) + (1))
-                    : snapshot.s_S_0))
-                }
-                "#
-            ),
-        );
-    }
-
-    #[test]
-    fn tuple() {
-        assert_eq!(
-            indirect_pred("type X<T, U> = (T, U);"),
-            dedent(
-                r#"
-                predicate p_2_Tuple_ind(k: s_2_Tuple, T$0: Type, U$1: Type, lo: Int, hi: Int) {
-                  (((clamp(lo, 0, arity(T$0))) < (clamp(hi, 0, arity(T$0)))) ==>
-                    (p_Param_ind(k.s_2_Tuple_0, T$0, clamp(lo, 0, arity(T$0)), clamp(hi, 0, arity(T$0))))) &&
-                  (((clamp((lo) - (arity(T$0)), 0, arity(U$1))) < (clamp((hi) - (arity(T$0)), 0, arity(U$1)))) ==>
-                    (p_Param_ind(k.s_2_Tuple_1, U$1, clamp((lo) - (arity(T$0)), 0, arity(U$1)), clamp((hi) - (arity(T$0)), 0, arity(U$1)))))
-                }
-
-                function ext_2_Tuple(snapshot: s_2_Tuple, T$0: Type, U$1: Type, pred: s_2_Tuple, lo: Int, hi: Int): s_2_Tuple
-                  requires p_2_Tuple_ind(pred, T$0, U$1, lo, hi)
-                {
-                  unfolding p_2_Tuple_ind(pred, T$0, U$1, lo, hi) in (s_2_Tuple_cons((clamp(lo, 0, arity(T$0))) < (clamp(hi, 0, arity(T$0)))
-                  ? ext_Param(snapshot.s_2_Tuple_0, T$0, pred.s_2_Tuple_0, clamp(lo, 0, arity(T$0)), clamp(hi, 0, arity(T$0)))
-                  : snapshot.s_2_Tuple_0, (clamp((lo) - (arity(T$0)), 0, arity(U$1))) < (clamp((hi) - (arity(T$0)), 0, arity(U$1)))
-                  ? ext_Param(snapshot.s_2_Tuple_1, U$1, pred.s_2_Tuple_1, clamp((lo) - (arity(T$0)), 0, arity(U$1)), clamp((hi) - (arity(T$0)), 0, arity(U$1)))
-                  : snapshot.s_2_Tuple_1))
-                }
-                "#
-            ),
-        );
-    }
-
-    /// A shared reference has no lifetime positions, so its predicate holds
-    /// nothing.
-    #[test]
-    fn immutable_reference() {
-        assert_eq!(
-            indirect_pred("type X<'a, T> = &'a T;"),
-            dedent(
-                r#"
-                predicate p_Ref_immutable_ind(k: s_Ref_immutable, U$1: Type, lo: Int, hi: Int) {
-                  (true)
-                }
-
-                function ext_Ref_immutable(snapshot: s_Ref_immutable, U$1: Type, pred: s_Ref_immutable, lo: Int, hi: Int): s_Ref_immutable
-                  requires p_Ref_immutable_ind(pred, U$1, lo, hi)
-                {
-                  unfolding p_Ref_immutable_ind(pred, U$1, lo, hi) in (snapshot)
-                }
-                "#
-            ),
-        );
-    }
-
-    #[test]
-    fn mutable_reference() {
-        assert_eq!(
-            indirect_pred("type X<'a, T> = &'a mut T;"),
-            dedent(
-                r#"
-                predicate p_Ref_mutable_ind(k: s_Ref_mutable, U$1: Type, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==>
-                    (inhabited(U$1)) &&
-                    (p_Param(k.s_Ref_mutable_0, U$1))) &&
-                  (((clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))) ==>
-                    (p_Param_ind(((lo) <= (0)) && ((0) < (hi)) ? p_Param_snap(k.s_Ref_mutable_0, U$1) : k.s_Ref_mutable_2, U$1, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))))
-                }
-
-                function ext_Ref_mutable(snapshot: s_Ref_mutable, U$1: Type, pred: s_Ref_mutable, lo: Int, hi: Int): s_Ref_mutable
-                  requires p_Ref_mutable_ind(pred, U$1, lo, hi)
-                {
-                  unfolding p_Ref_mutable_ind(pred, U$1, lo, hi) in (s_Ref_mutable_cons(snapshot.s_Ref_mutable_0, snapshot.s_Ref_mutable_1, ((lo) <= (0)) && ((0) < (hi))
-                  ? (clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))
-                    ? ext_Param(p_Param_snap(pred.s_Ref_mutable_0, U$1), U$1, p_Param_snap(pred.s_Ref_mutable_0, U$1), clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))
-                    : p_Param_snap(pred.s_Ref_mutable_0, U$1)
-                  : (clamp((lo) - (1), 0, arity(U$1))) < (clamp((hi) - (1), 0, arity(U$1)))
-                    ? ext_Param(snapshot.s_Ref_mutable_2, U$1, pred.s_Ref_mutable_2, clamp((lo) - (1), 0, arity(U$1)), clamp((hi) - (1), 0, arity(U$1)))
-                    : snapshot.s_Ref_mutable_2))
-                }
-                "#
-            ),
-        );
-    }
-
-    /// The predicate of a type parameter is abstract.
-    #[test]
-    fn type_param() {
-        assert_eq!(
-            indirect_pred("type X<T> = T;"),
-            dedent(
-                r#"
-                predicate p_Param_ind(k: s_Param, T$0: Type, lo: Int, hi: Int)
-
-                function ext_Param(snapshot: s_Param, T$0: Type, pred: s_Param, lo: Int, hi: Int): s_Param
-                  requires p_Param_ind(pred, T$0, lo, hi)
-                "#
-            ),
-        );
-    }
-
-    /// `'a` occurs at positions 0 and 1 of the field, and 1 is inside the
-    /// referent of 0. Both field predicates are part of the one conjunct of
-    /// `'a`, so no caller can extend the snapshot in between: the second is
-    /// on the field snapshot extended by the first.
-    #[test]
-    fn enclosed_occurrence() {
-        assert_eq!(
-            indirect_pred(
-                "struct S<'a>(&'a mut &'a mut i32);
-                 type X<'a> = S<'a>;"
-            ),
-            dedent(
-                r#"
-                predicate p_S_ind(k: s_S, lo: Int, hi: Int) {
-                  ((((lo) <= (0)) && ((0) < (hi))) ==>
-                    (p_Ref_mutable_ind(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)) &&
-                    (p_Ref_mutable_ind(ext_Ref_mutable(k.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), k.s_S_0, 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)))
-                }
-
-                function ext_S(snapshot: s_S, pred: s_S, lo: Int, hi: Int): s_S
-                  requires p_S_ind(pred, lo, hi)
-                {
-                  unfolding p_S_ind(pred, lo, hi) in (s_S_cons(((lo) <= (0)) && ((0) < (hi))
-                  ? ext_Ref_mutable(ext_Ref_mutable(snapshot.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1), s_Ref_mutable_type(s_Int_i32_type()), ext_Ref_mutable(pred.s_S_0, s_Ref_mutable_type(s_Int_i32_type()), pred.s_S_0, 0, 1), 1, 2)
-                  : snapshot.s_S_0))
-                }
-                "#
-            ),
-        );
-    }
-}
-
 /// Tests that verify Viper code using the indirect predicates with Silicon.
 #[cfg(test)]
 mod verification_tests {
@@ -824,18 +505,62 @@ mod verification_tests {
         }
     }
 
-    /// The own lifetime of a mutable reference gives access to the referent.
+    /// `&'a mut U`: position 0 is `'a`, the referent's positions are
+    /// `[1, 1 + arity(U))`.
     #[test]
-    fn mutable_reference_gives_referent() {
+    fn mutable_reference() {
         let src = "type X<'a, T> = &'a mut T;";
         assert_verifies(
             src,
             r#"
-            method test(k: s_Ref_mutable, U: Type)
+            // 'a holds the referent.
+            method lifetime(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1)
               ensures p_Param(k.s_Ref_mutable_0, U)
             {
               unfold p_Ref_mutable_ind(k, U, 0, 1)
+            }
+
+            // The referent's positions hold those of the referent, on the
+            // snapshot stored in `k`.
+            method referent_positions(k: s_Ref_mutable, U: Type)
+              requires 0 < arity(U)
+              requires p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
+              ensures p_Param_ind(k.s_Ref_mutable_2, U, 0, arity(U))
+            {
+              unfold p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
+            }
+
+            // With 'a, they are on the referent's current snapshot.
+            method all_positions(k: s_Ref_mutable, U: Type)
+              requires 0 < arity(U)
+              requires p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+              ensures p_Param(k.s_Ref_mutable_0, U)
+              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, 0, arity(U))
+            {
+              unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+            }
+
+            // Extending by 'a reads the referent's snapshot and keeps the address.
+            method extend(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1)
+              ensures p_Ref_mutable_ind(k, U, 0, 1)
+              ensures ext_Ref_mutable(k, U, k, 0, 1).s_Ref_mutable_0 == k.s_Ref_mutable_0
+              ensures ext_Ref_mutable(k, U, k, 0, 1).s_Ref_mutable_2 ==
+                (unfolding p_Ref_mutable_ind(k, U, 0, 1) in p_Param_snap(k.s_Ref_mutable_0, U))
+            {
+            }
+
+            // Split off 'a, the referent's positions are on the snapshot
+            // extended by 'a.
+            method split(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+              ensures p_Ref_mutable_ind(k, U, 0, 1)
+              ensures p_Ref_mutable_ind(ext_Ref_mutable(k, U, k, 0, 1), U, 1, 1 + arity(U))
+            {
+              unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+              fold p_Ref_mutable_ind(k, U, 0, 1)
+              fold p_Ref_mutable_ind(ext_Ref_mutable(k, U, k, 0, 1), U, 1, 1 + arity(U))
             }
             "#,
         );
@@ -852,33 +577,15 @@ mod verification_tests {
             "#,
             "insufficient permission to access p_Param",
         );
-    }
-
-    /// The positions of the referent's type give the referent's indirect
-    /// predicate, on the snapshot stored in the reference.
-    #[test]
-    fn mutable_reference_gives_referent_positions() {
-        let src = "type X<'a, T> = &'a mut T;";
-        assert_verifies(
-            src,
-            r#"
-            method test(k: s_Ref_mutable, U: Type)
-              requires 0 < arity(U)
-              requires p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
-              ensures p_Param_ind(k.s_Ref_mutable_2, U, 0, arity(U))
-            {
-              unfold p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
-            }
-            "#,
-        );
-        // The own lifetime does not hold the referent's positions.
+        // 'a does not hold the referent's positions.
         assert_fails(
             src,
             r#"
             method test(k: s_Ref_mutable, U: Type)
               requires 0 < arity(U)
               requires p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Param_ind(k.s_Ref_mutable_2, U, 0, arity(U))
+              ensures p_Param(k.s_Ref_mutable_0, U)
+              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, 0, arity(U))
             {
               unfold p_Ref_mutable_ind(k, U, 0, 1)
             }
@@ -887,97 +594,256 @@ mod verification_tests {
         );
     }
 
-    /// A struct passes its positions on to the mutable reference in its field.
+    /// `&'a U` has no positions: its predicate holds nothing.
     #[test]
-    fn struct_with_mutable_reference() {
-        let src = "struct S<'a, T> { r: &'a mut T }
-                   type X<'a, T> = S<'a, T>;";
+    fn shared_reference() {
+        let src = "type X<'a, T> = &'a T;";
         assert_verifies(
             src,
             r#"
-            method lifetime(k: s_S, T: Type)
-              requires p_S_ind(k, T, 0, 1)
-              ensures p_Param(k.s_S_0.s_Ref_mutable_0, T)
+            method test(k: s_Ref_immutable, U: Type)
+              ensures p_Ref_immutable_ind(k, U, 0, 1)
+              ensures ext_Ref_immutable(k, U, k, 0, 1) == k
             {
-              unfold p_S_ind(k, T, 0, 1)
-              unfold p_Ref_mutable_ind(k.s_S_0, T, 0, 1)
-            }
-
-            method type_param(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Param_ind(k.s_S_0.s_Ref_mutable_2, T, 0, arity(T))
-            {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
-              unfold p_Ref_mutable_ind(k.s_S_0, T, 1, 1 + arity(T))
+              fold p_Ref_immutable_ind(k, U, 0, 1)
             }
             "#,
         );
-        // The type parameter's positions do not hold the referent.
         assert_fails(
             src,
             r#"
-            method test(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Param(k.s_S_0.s_Ref_mutable_0, T)
+            method test(k: s_Ref_immutable, U: Type)
+              requires p_Ref_immutable_ind(k, U, 0, 1)
             {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
-              unfold p_Ref_mutable_ind(k.s_S_0, T, 1, 1 + arity(T))
+              unfold p_Ref_immutable_ind(k, U, 0, 1)
+              assert false
             }
             "#,
-            "insufficient permission to access p_Param",
+            "Assert might fail",
         );
     }
 
-    /// The permissions of a struct can be split into, and merged from, those
-    /// of its positions.
+    /// `'static` is not a position of a struct: no position holds the
+    /// referent of a `&'static mut`.
     #[test]
-    fn split_and_merge() {
-        let src = "struct Pair<'a, 'b>(&'a mut i32, &'b mut i32);
-                   type X<'a, 'b> = Pair<'a, 'b>;";
+    fn static_mutable_reference() {
+        let src = "struct S<'a> { s: &'static mut i32, t: &'a mut i32 }
+                   type X<'a> = S<'a>;";
         assert_verifies(
             src,
             r#"
-            method split(k: s_Pair)
-              requires p_Pair_ind(k, 0, 2)
-              ensures p_Pair_ind(k, 0, 1) && p_Pair_ind(k, 1, 2)
+            method test(k: s_S)
+              requires p_S_ind(k, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), 0, 1)
             {
-              unfold p_Pair_ind(k, 0, 2)
-              fold p_Pair_ind(k, 0, 1)
-              fold p_Pair_ind(k, 1, 2)
-            }
-
-            method merge(k: s_Pair)
-              requires p_Pair_ind(k, 0, 1) && p_Pair_ind(k, 1, 2)
-              ensures p_Pair_ind(k, 0, 2)
-            {
-              unfold p_Pair_ind(k, 0, 1)
-              unfold p_Pair_ind(k, 1, 2)
-              fold p_Pair_ind(k, 0, 2)
+              unfold p_S_ind(k, 0, 1)
             }
             "#,
         );
-        // One position does not hold the other.
         assert_fails(
             src,
             r#"
-            method test(k: s_Pair)
-              requires p_Pair_ind(k, 0, 1)
-              ensures p_Pair_ind(k, 1, 2)
+            method test(k: s_S)
+              requires p_S_ind(k, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
             {
-              unfold p_Pair_ind(k, 0, 1)
-              fold p_Pair_ind(k, 1, 2)
+              unfold p_S_ind(k, 0, 1)
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
         );
     }
 
-    /// The position of `'b` lies behind the reference of `'a`. Split off
-    /// `'a`, it is held on the snapshot extended by `'a`.
+    /// A struct passes its positions on to its fields: `'a @ 0` and
+    /// `T @ [1, 1 + arity(T))`.
     #[test]
-    fn nested_references() {
+    fn struct_fields() {
+        let src = "struct S<'a, T> { x: &'a mut i32, y: T }
+                   type X<'a, T> = S<'a, T>;";
+        assert_verifies(
+            src,
+            r#"
+            method lifetime(k: s_S, T: Type)
+              requires p_S_ind(k, T, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
+            {
+              unfold p_S_ind(k, T, 0, 1)
+            }
+
+            method type_param(k: s_S, T: Type)
+              requires 0 < arity(T)
+              requires p_S_ind(k, T, 1, 1 + arity(T))
+              ensures p_Param_ind(k.s_S_1, T, 0, arity(T))
+            {
+              unfold p_S_ind(k, T, 1, 1 + arity(T))
+            }
+
+            method split(k: s_S, T: Type)
+              requires p_S_ind(k, T, 0, 1 + arity(T))
+              ensures p_S_ind(k, T, 0, 1) && p_S_ind(k, T, 1, 1 + arity(T))
+            {
+              unfold p_S_ind(k, T, 0, 1 + arity(T))
+              fold p_S_ind(k, T, 0, 1)
+              fold p_S_ind(k, T, 1, 1 + arity(T))
+            }
+
+            method merge(k: s_S, T: Type)
+              requires p_S_ind(k, T, 0, 1) && p_S_ind(k, T, 1, 1 + arity(T))
+              ensures p_S_ind(k, T, 0, 1 + arity(T))
+            {
+              unfold p_S_ind(k, T, 0, 1)
+              unfold p_S_ind(k, T, 1, 1 + arity(T))
+              fold p_S_ind(k, T, 0, 1 + arity(T))
+            }
+            "#,
+        );
+        // The positions of T do not hold `x`.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_S, T: Type)
+              requires p_S_ind(k, T, 1, 1 + arity(T))
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
+            {
+              unfold p_S_ind(k, T, 1, 1 + arity(T))
+            }
+            "#,
+            "insufficient permission to access p_Ref_mutable_ind",
+        );
+        // 'a does not hold `y`.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_S, T: Type)
+              requires 0 < arity(T)
+              requires p_S_ind(k, T, 0, 1)
+              ensures p_Param_ind(k.s_S_1, T, 0, arity(T))
+            {
+              unfold p_S_ind(k, T, 0, 1)
+            }
+            "#,
+            "insufficient permission to access p_Param_ind",
+        );
+    }
+
+    /// The positions of a tuple are those of its elements in turn.
+    #[test]
+    fn tuple() {
+        let src = "type X<T, U> = (T, U);";
+        assert_verifies(
+            src,
+            r#"
+            method elements(k: s_2_Tuple, T: Type, U: Type)
+              requires 0 < arity(T) && 0 < arity(U)
+              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+              ensures p_Param_ind(k.s_2_Tuple_0, T, 0, arity(T))
+              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
+            {
+              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+            }
+
+            method split(k: s_2_Tuple, T: Type, U: Type)
+              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+              ensures p_2_Tuple_ind(k, T, U, 0, arity(T))
+              ensures p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
+            {
+              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+              fold p_2_Tuple_ind(k, T, U, 0, arity(T))
+              fold p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
+            }
+            "#,
+        );
+        // The positions of T do not hold those of U.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_2_Tuple, T: Type, U: Type)
+              requires 0 < arity(U)
+              requires p_2_Tuple_ind(k, T, U, 0, arity(T))
+              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
+            {
+              unfold p_2_Tuple_ind(k, T, U, 0, arity(T))
+            }
+            "#,
+            "insufficient permission to access p_Param_ind",
+        );
+    }
+
+    /// In the field type `Three<'a, 'b, 'a>`, `'a` occurs at positions 0
+    /// and 2, with `'b` in between.
+    #[test]
+    fn duplicate_lifetimes() {
+        let src = "struct Three<'x, 'y, 'z>(&'x mut i32, &'y mut i32, &'z mut i32);
+                   struct S<'a, 'b> { f: Three<'a, 'b, 'a> }
+                   type X<'a, 'b> = S<'a, 'b>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(k: s_S)
+              requires p_S_ind(k, 0, 1)
+              ensures p_Three_ind(k.s_S_0, 0, 1) && p_Three_ind(k.s_S_0, 2, 3)
+            {
+              unfold p_S_ind(k, 0, 1)
+            }
+            "#,
+        );
+        // 'a does not hold the position of 'b.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_S)
+              requires p_S_ind(k, 0, 1)
+              ensures p_Three_ind(k.s_S_0, 1, 2)
+            {
+              unfold p_S_ind(k, 0, 1)
+            }
+            "#,
+            "insufficient permission to access p_Three_ind",
+        );
+    }
+
+    /// In the field type `(T, U, T)`, `T` occurs twice, with `U` in between.
+    #[test]
+    fn duplicate_type_params() {
+        let src = "struct S<T, U> { f: (T, U, T) }
+                   type X<T, U> = S<T, U>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(k: s_S, T: Type, U: Type)
+              requires 0 < arity(T)
+              requires p_S_ind(k, T, U, 0, arity(T))
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_0, T, 0, arity(T))
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_2, T, 0, arity(T))
+            {
+              unfold p_S_ind(k, T, U, 0, arity(T))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, 0, arity(T))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, arity(T) + arity(U), 2 * arity(T) + arity(U))
+            }
+            "#,
+        );
+        // The positions of T do not hold those of U.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_S, T: Type, U: Type)
+              requires 0 < arity(T) && 0 < arity(U)
+              requires p_S_ind(k, T, U, 0, arity(T))
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_1, U, 0, arity(U))
+            {
+              unfold p_S_ind(k, T, U, 0, arity(T))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, 0, arity(T))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, arity(T) + arity(U), 2 * arity(T) + arity(U))
+            }
+            "#,
+            "insufficient permission to access p_Param_ind",
+        );
+    }
+
+    /// In `&'a mut &'b mut i32`, the position of `'b` lies behind `'a`. Split
+    /// off `'a`, it is on the snapshot extended by `'a`.
+    #[test]
+    fn nested_mutable_references() {
         let src = "struct S<'a, 'b> { r: &'a mut &'b mut i32 }
                    type X<'a, 'b> = S<'a, 'b>;";
         assert_verifies(
@@ -1010,91 +876,37 @@ mod verification_tests {
         );
     }
 
-    /// The positions of a tuple are split into those of its elements.
+    /// In `&'a mut &'a mut i32`, both positions belong to `'a`, so the
+    /// predicate itself puts the inner one on the field snapshot extended by
+    /// the outer one.
     #[test]
-    fn tuple() {
-        let src = "type X<T, U> = (T, U);";
+    fn nested_mutable_references_same_lifetime() {
+        let src = "struct E<'a>(&'a mut &'a mut i32);
+                   type X<'a> = E<'a>;";
         assert_verifies(
             src,
             r#"
-            method split(k: s_2_Tuple, T: Type, U: Type)
-              requires 0 <= arity(T) && 0 <= arity(U)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              ensures p_2_Tuple_ind(k, T, U, 0, arity(T))
-              ensures p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
+            method test(k: s_E)
+              requires p_E_ind(k, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+              ensures p_Ref_mutable_ind(ext_Ref_mutable(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), k.s_E_0, 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
             {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              fold p_2_Tuple_ind(k, T, U, 0, arity(T))
-              fold p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
-            }
-
-            method elements(k: s_2_Tuple, T: Type, U: Type)
-              requires 0 < arity(T) && 0 < arity(U)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              ensures p_Param_ind(k.s_2_Tuple_0, T, 0, arity(T))
-              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
-            {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+              unfold p_E_ind(k, 0, 1)
             }
             "#,
         );
-        // The positions of `T` do not hold those of `U`.
+        // Not on the field snapshot that is not extended.
         assert_fails(
             src,
             r#"
-            method test(k: s_2_Tuple, T: Type, U: Type)
-              requires 0 < arity(T) && 0 < arity(U)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T))
-              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
+            method test(k: s_E)
+              requires p_E_ind(k, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
             {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T))
+              unfold p_E_ind(k, 0, 1)
             }
             "#,
-            "insufficient permission to access p_Param_ind",
-        );
-    }
-
-    /// In `(T, &'a mut i32)`, `'a` lies after the positions of `T`.
-    #[test]
-    fn lifetime_after_type_param() {
-        let src = "struct S<'a, T> { f: (T, &'a mut i32) }
-                   type X<'a, T> = S<'a, T>;";
-        assert_verifies(
-            src,
-            r#"
-            method lifetime(k: s_S, T: Type)
-              requires 0 <= arity(T)
-              requires p_S_ind(k, T, 0, 1)
-              ensures p_Param_ind(k.s_S_0.s_2_Tuple_1, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            {
-              unfold p_S_ind(k, T, 0, 1)
-              unfold p_2_Tuple_ind(k.s_S_0, T, s_Ref_mutable_type(s_Int_i32_type()), arity(T), arity(T) + 1)
-            }
-
-            method type_param(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Param_ind(k.s_S_0.s_2_Tuple_0, T, 0, arity(T))
-            {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
-              unfold p_2_Tuple_ind(k.s_S_0, T, s_Ref_mutable_type(s_Int_i32_type()), 0, arity(T))
-            }
-            "#,
-        );
-        // The positions of `T` do not hold `'a`.
-        assert_fails(
-            src,
-            r#"
-            method test(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Param_ind(k.s_S_0.s_2_Tuple_1, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
-              unfold p_2_Tuple_ind(k.s_S_0, T, s_Ref_mutable_type(s_Int_i32_type()), 0, arity(T))
-            }
-            "#,
-            "insufficient permission to access p_Param_ind",
+            "insufficient permission to access p_Ref_mutable_ind",
         );
     }
 }
