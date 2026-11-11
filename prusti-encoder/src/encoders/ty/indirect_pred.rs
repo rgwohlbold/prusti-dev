@@ -10,7 +10,9 @@ use super::{
         GArgsTyEnc, GenericParamsEnc, TyExprEnc,
         arity::{ArityEnc, add},
         clamp::ClampEnc,
-        lifetime_position::{LifetimePosition, LifetimePositionEnc, Occurrence},
+        lifetime_position::{
+            EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
+        },
     },
     pure::TyPureEnc,
 };
@@ -48,10 +50,10 @@ pub struct IndirectPredRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
-// Lifetime query that corresponds to a lifetime position [lo, hi), either lifetime or type parameter
+// Lifetime query that corresponds to a lifetime position [lo, hi), of a region or of the regions in a type parameter
 #[derive(Clone, Copy)]
 struct Subquery<'vir> {
-    param: LifetimePosition<'vir>,
+    lifetime: GeneralizedLifetime<'vir>,
     guard: vir::ExprBool<'vir>,
     start: vir::ExprInt<'vir>,
     end: vir::ExprInt<'vir>,
@@ -73,82 +75,74 @@ impl IndirectPredEnc {
     ) -> Result<Vec<Subquery<'vir>>, EncodeFullError<'vir, Self>> {
         let arity = deps.require_ref::<ArityEnc>(ty)?.arity;
         let clamp = deps.require_dep::<ClampEnc>(())?;
-        let own_positions =
-            deps.require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(ty))?;
+        let graph = deps.require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(ty))?;
         vir::with_vcx(|vcx| {
             let sub = |a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>| -> vir::ExprInt<'vir> {
                 vcx.mk_bin_op_expr(vir::BinOpKind::Sub, a, b).downcast_ty()
             };
-            own_positions
-                .into_iter()
-                .map(
-                    |Occurrence {
-                         param, start: x, ..
-                     }| {
-                        Ok(match param {
-                            // An own lifetime has the single position `x`, which the query either contains or not.
-                            LifetimePosition::Lifetime(_) => Subquery {
-                                param,
-                                guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
-                                start: vcx.mk_uint::<0>(),
-                                end: vcx.mk_uint::<1>(),
-                            },
-                            // The subquery of an own type parameter at the positions `[x, x + w)` is `[clamp(lo - x, 0, w), clamp(hi - x, 0, w))`.
-                            LifetimePosition::Param(ty) => {
-                                let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
-                                let zero = vcx.mk_uint::<0>();
-                                let start = clamp.call()(sub(lo, x), zero, w);
-                                let end = clamp.call()(sub(hi, x), zero, w);
-                                Subquery {
-                                    param,
-                                    guard: vir::expr! { vcx; (start) < (end) },
-                                    start,
-                                    end,
-                                }
+            graph
+                .positions()
+                .map(|p| {
+                    let lifetime = graph.lifetime(p);
+                    let (x, _) = graph.interval(p);
+                    Ok(match lifetime {
+                        // An own lifetime has the single position `x`, which the query either contains or not.
+                        GeneralizedLifetime::Region(_) => Subquery {
+                            lifetime,
+                            guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
+                            start: vcx.mk_uint::<0>(),
+                            end: vcx.mk_uint::<1>(),
+                        },
+                        // The subquery of an own type parameter at the positions `[x, x + w)` is `[clamp(lo - x, 0, w), clamp(hi - x, 0, w))`.
+                        GeneralizedLifetime::RegionsIn(ty) => {
+                            let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
+                            let zero = vcx.mk_uint::<0>();
+                            let start = clamp.call()(sub(lo, x), zero, w);
+                            let end = clamp.call()(sub(hi, x), zero, w);
+                            Subquery {
+                                lifetime,
+                                guard: vir::expr! { vcx; (start) < (end) },
+                                start,
+                                end,
                             }
-                        })
-                    },
-                )
+                        }
+                    })
+                })
                 .collect()
         })
     }
 
-    /// The snapshot on which the field predicate of the occurrence `index`
-    /// in the field type `field_ty` is defined: `field_snap`, extended by the
-    /// enclosing occurrences whose parameters the query contains, outermost
-    /// first. The caller has already extended `field_snap` by the enclosing
-    /// occurrences of the other parameters.
-    fn occurrence_snap<'vir>(
+    /// The snapshot on which the field predicate of the position `p` in the
+    /// field type `field_ty`, whose enclosure graph is `graph`, is defined:
+    /// `field_snap`, extended by the enclosing positions whose lifetimes the
+    /// query contains, outermost first. The caller has already extended
+    /// `field_snap` by the enclosing positions of the other lifetimes.
+    fn position_snap<'vir>(
         subqueries: &[Subquery<'vir>],
         field_ty: RustTyDecomposition<'vir>,
-        occurrences: &[Occurrence<'vir>],
-        index: usize,
+        graph: &EnclosureGraph<'vir>,
+        p: LifetimePosition,
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
         let mut snap = field_snap;
-        for &enclosing in &occurrences[index].enclosing {
-            let occurrence = &occurrences[enclosing];
-            let Some(&subquery) = subqueries.iter().find(|s| s.param == occurrence.param) else {
+        for &enclosing in graph.ancestors(p) {
+            let lifetime = graph.lifetime(enclosing);
+            let Some(&subquery) = subqueries.iter().find(|s| s.lifetime == lifetime) else {
                 continue;
             };
-            let key = Self::occurrence_snap(
-                subqueries,
-                field_ty,
-                occurrences,
-                enclosing,
-                field_snap,
-                deps,
-            )?;
+            let key =
+                Self::position_snap(subqueries, field_ty, graph, enclosing, field_snap, deps)?;
             let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
             let guard = subquery.guard;
-            let start = add(occurrence.start, subquery.start);
-            let end = add(occurrence.start, subquery.end);
+            let (x, _) = graph.interval(enclosing);
+            let start = add(x, subquery.start);
+            let end = add(x, subquery.end);
             let extended = ext.call()(snap, args.get_ty(), args.get_const(), key, start, end);
-            // An enclosing occurrence of the same parameter is in the query
-            // whenever the occurrence `index` is.
-            snap = if occurrence.param == occurrences[index].param {
+            // An enclosing position of the same lifetime is in the query
+            // whenever `p` is.
+            snap = if lifetime == graph.lifetime(p) {
                 extended
             } else {
                 vir::expr! { (guard) ? (extended) : (snap) }
@@ -158,8 +152,8 @@ impl IndirectPredEnc {
     }
 
     /// The predicates of the field of type `field_ty` with the snapshot
-    /// `field_snap` for `subquery`: one for each occurrence of the subquery's
-    /// parameter in the field type.
+    /// `field_snap` for `subquery`: one for each position of the subquery's
+    /// lifetime in the field type.
     fn field_preds<'vir>(
         subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
@@ -167,18 +161,18 @@ impl IndirectPredEnc {
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
-        let occurrences = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        let graph = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
         let mut preds = Vec::new();
-        for (index, occurrence) in occurrences.iter().enumerate() {
-            if occurrence.param != subquery.param {
+        for p in graph.positions() {
+            if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
             let pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            let snap =
-                Self::occurrence_snap(subqueries, field_ty, &occurrences, index, field_snap, deps)?;
-            let start = add(occurrence.start, subquery.start);
-            let end = add(occurrence.start, subquery.end);
+            let snap = Self::position_snap(subqueries, field_ty, &graph, p, field_snap, deps)?;
+            let (x, _) = graph.interval(p);
+            let start = add(x, subquery.start);
+            let end = add(x, subquery.end);
             preds.push(vir::expr! {
                 acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], start, end))
             });
@@ -187,10 +181,10 @@ impl IndirectPredEnc {
     }
 
     /// The snapshot `field_snap` of the field of type `field_ty`, extended by
-    /// `subquery` at each occurrence of the subquery's parameter in the field
+    /// `subquery` at each position of the subquery's lifetime in the field
     /// type, if the subquery is non-empty. The field predicates holding the
     /// permissions are defined on `field_pred`, extended as in
-    /// `occurrence_snap`.
+    /// `position_snap`.
     fn field_ext<'vir>(
         subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
@@ -199,24 +193,24 @@ impl IndirectPredEnc {
         field_pred: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
-        let occurrences = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
-        if occurrences
-            .iter()
-            .all(|occurrence| occurrence.param != subquery.param)
+        let graph = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        if graph
+            .positions()
+            .all(|p| graph.lifetime(p) != subquery.lifetime)
         {
             return Ok(field_snap);
         }
         let mut snap = field_snap;
-        for (index, occurrence) in occurrences.iter().enumerate() {
-            if occurrence.param != subquery.param {
+        for p in graph.positions() {
+            if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
             let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            let key =
-                Self::occurrence_snap(subqueries, field_ty, &occurrences, index, field_pred, deps)?;
-            let start = add(occurrence.start, subquery.start);
-            let end = add(occurrence.start, subquery.end);
+            let key = Self::position_snap(subqueries, field_ty, &graph, p, field_pred, deps)?;
+            let (x, _) = graph.interval(p);
+            let start = add(x, subquery.start);
+            let end = add(x, subquery.end);
             snap = ext.call()(snap, args.get_ty(), args.get_const(), key, start, end);
         }
         let guard = subquery.guard;
@@ -427,7 +421,9 @@ impl TaskEncoder for IndirectPredEnc {
                     // otherwise, the snapshot of the referent is stored in our snapshot
                     let in_query = subqueries
                         .iter()
-                        .find(|subquery| matches!(subquery.param, LifetimePosition::Lifetime(_)))
+                        .find(|subquery| {
+                            matches!(subquery.lifetime, GeneralizedLifetime::Region(_))
+                        })
                         .unwrap()
                         .guard;
                     let current_snap = referent.ref_to_snap(addr);
@@ -440,7 +436,7 @@ impl TaskEncoder for IndirectPredEnc {
                     for &subquery in &subqueries {
                         let mut preds = Vec::new();
                         // The own lifetime of the reference gives access to the referent.
-                        if matches!(subquery.param, LifetimePosition::Lifetime(_)) {
+                        if matches!(subquery.lifetime, GeneralizedLifetime::Region(_)) {
                             preds.push(referent_pred);
                         }
                         // The positions of the referent's type are passed on to the referent like those of a field.
