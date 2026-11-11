@@ -2,7 +2,7 @@ use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::CastType;
 
 use crate::encoders::ty::{
-    RustTy, TySpecifics, generics::GenericParamsEnc, lifted::TyConstructorEnc,
+    RustParamData, RustTy, TySpecifics, generics::GenericParamsEnc, lifted::TyConstructorEnc,
 };
 
 pub struct ArityEnc;
@@ -32,7 +32,7 @@ impl TaskEncoder for ArityEnc {
 
     type OutputRef<'vir> = ArityEncOutputRef<'vir>;
 
-    type OutputFullLocal<'vir> = vir::DomainAxiom<'vir>;
+    type OutputFullLocal<'vir> = Option<vir::DomainAxiom<'vir>>;
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -48,6 +48,11 @@ impl TaskEncoder for ArityEnc {
                 arity: arity_fn_ident(),
             },
         )?;
+        // A type parameter has the arity of the type it is instantiated with,
+        // which the axiom of that type's constructor gives.
+        if let TySpecifics::Param(RustParamData::Generic) = task_key.specifics {
+            return Ok((None, ()));
+        }
         let num_lifetimes = task_key.params.rust_params().regions().count();
         let ty_constructor = deps.require_ref::<TyConstructorEnc>(*task_key)?;
         let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
@@ -71,12 +76,15 @@ impl TaskEncoder for ArityEnc {
             let axiom = vcx.mk_domain_axiom(
                 vir::vir_format_identifier!(vcx, "arity_{}", task_key.name())
             , expr);
-            Ok((axiom, ()))
+            Ok((Some(axiom), ()))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        let mut axioms = Self::all_outputs_local_no_errors(program);
+        let mut axioms = Self::all_outputs_local_no_errors(program)
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
         let domain = vir::with_vcx(|vcx| {
             // Every type has a non-negative number of lifetime positions,
             // which follows from the axioms of the type constructors.
@@ -116,7 +124,7 @@ mod tests {
     fn arity_axiom(src: &str) -> String {
         with_type_alias(src, |ty| {
             let (_, axiom, _) = ArityEnc::encode(ty.ty, true, DUMMY_SP).unwrap().unwrap();
-            let expr = simplified(axiom.expr);
+            let expr = simplified(axiom.unwrap().expr);
             let vir::ExprKindGenData::Forall(forall) = expr.kind else {
                 return format!("{expr:?}");
             };

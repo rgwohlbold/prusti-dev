@@ -1,5 +1,8 @@
-use prusti_rustc_interface::middle::ty;
-use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
+use prusti_rustc_interface::{
+    index::{Idx, IndexVec},
+    middle::ty,
+};
+use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::CastType;
 
 use crate::encoders::ty::{
@@ -10,33 +13,79 @@ use crate::encoders::ty::{
     },
 };
 
-/// Encodes the lifetime positions of a type as an integer expression. Lifetime positions can either
-/// be a lifetime parameter on the type itself, or a type parameter involving an `arity` expression
+/// Encodes the lifetime positions of a type and which of them enclose which.
 pub struct LifetimePositionEnc;
 
+/// Single lifetime, or all lifetimes in a type parameter (similar to `GeneralizedLifetime` in the PCG)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LifetimePosition<'tcx> {
-    Lifetime(ty::Region<'tcx>),
-    Param(RustTyDecomposition<'tcx>),
+pub enum GeneralizedLifetime<'tcx> {
+    Region(ty::Region<'tcx>),
+    RegionsIn(RustTyDecomposition<'tcx>),
 }
 
-/// An occurrence of a lifetime or type parameter in a type.
-#[derive(Debug, Clone)]
-pub struct Occurrence<'vir> {
-    pub param: LifetimePosition<'vir>,
-    /// The first lifetime position of the occurrence.
-    pub start: vir::ExprInt<'vir>,
-    /// The indices of the occurrences of lifetimes whose mutable references
-    /// this occurrence lies behind, outermost first.
-    pub enclosing: Vec<usize>,
+/// A lifetime position of a type, or the block of positions of a type
+/// parameter: the n-th generalized lifetime of the type, in the order of the
+/// positions. It is only meaningful in the graph it comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LifetimePosition(usize);
+
+impl Idx for LifetimePosition {
+    fn new(index: usize) -> Self {
+        LifetimePosition(index)
+    }
+
+    fn index(self) -> usize {
+        self.0
+    }
 }
+
+/// The lifetime positions of a type, in order, and which of them enclose
+/// which, read off the outlives requirements that rustc infers.
+#[derive(Debug, Clone)]
+pub struct EnclosureGraph<'vir> {
+    lifetimes: IndexVec<LifetimePosition, GeneralizedLifetime<'vir>>,
+    intervals: IndexVec<LifetimePosition, (vir::ExprInt<'vir>, vir::ExprInt<'vir>)>,
+    /// For each position, the positions enclosing it, transitively, outermost first.
+    ancestors: IndexVec<LifetimePosition, Vec<LifetimePosition>>,
+}
+
+impl<'vir> EnclosureGraph<'vir> {
+    pub fn positions(&self) -> impl Iterator<Item = LifetimePosition> {
+        self.lifetimes.indices()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lifetimes.is_empty()
+    }
+
+    pub fn lifetime(&self, p: LifetimePosition) -> GeneralizedLifetime<'vir> {
+        self.lifetimes[p]
+    }
+
+    /// The lifetime position numbers that `p` covers: `[x, x + 1)` for a
+    /// region, `[x, x + arity(T))` for the regions in a type parameter `T`.
+    pub fn interval(&self, p: LifetimePosition) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
+        self.intervals[p]
+    }
+
+    /// The positions enclosing `p`, transitively, outermost first.
+    pub fn ancestors(&self, p: LifetimePosition) -> &[LifetimePosition] {
+        &self.ancestors[p]
+    }
+}
+
+/// The enclosure graph of a type has a cycle between distinct positions, e.g.
+/// for `struct S<'a, 'b>(&'a mut &'b mut i32, &'b mut &'a mut i32)`.
+#[derive(Debug, Clone)]
+pub struct CyclicEnclosure;
 
 impl TaskEncoder for LifetimePositionEnc {
     task_encoder::encoder_cache!(LifetimePositionEnc);
     const ENCODER_NAME: &'static str = "lifetime position encoder";
 
     type TaskDescription<'vir> = RustTyDecomposition<'vir>;
-    type OutputFullDependency<'vir> = Vec<Occurrence<'vir>>;
+    type OutputFullDependency<'vir> = EnclosureGraph<'vir>;
+    type EncodingError = CyclicEnclosure;
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -47,64 +96,151 @@ impl TaskEncoder for LifetimePositionEnc {
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> EncodeFullResult<'vir, Self> {
         deps.emit_output_ref(*task_key, ())?;
-        let positions = match task_key.ty.specifics {
-            TySpecifics::ImmRef(_) => Vec::new(),
-            TySpecifics::Param(RustParamData::Generic) => vec![Occurrence {
-                param: LifetimePosition::Param(*task_key),
-                start: vir::with_vcx(|vcx| vcx.mk_uint::<0>()),
-                enclosing: Vec::new(),
-            }],
-            _ => {
-                let args = task_key.args.args();
-                let mut positions = args
-                    .iter()
-                    .filter_map(|arg| arg.as_region())
-                    .enumerate()
-                    .map(|(j, region)| Occurrence {
-                        param: LifetimePosition::Lifetime(region),
-                        start: int(j),
-                        enclosing: Vec::new(),
-                    })
-                    .collect::<Vec<_>>();
-                // Everything in the referent of a mutable reference lies
-                // behind its lifetime, the occurrence 0.
-                let behind = match task_key.ty.specifics {
-                    TySpecifics::MutRef(_) => vec![0],
-                    _ => Vec::new(),
-                };
-                let mut offset = int(positions.len());
+        let mut lifetimes = IndexVec::new();
+        let mut intervals = IndexVec::new();
+        let mut direct: IndexVec<LifetimePosition, Vec<LifetimePosition>> = IndexVec::new();
+        match task_key.ty.specifics {
+            TySpecifics::ImmRef(_) => {}
+            TySpecifics::Param(RustParamData::Generic) => {
                 let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
-                for arg_ty in args.iter().filter_map(|arg| arg.as_type()) {
-                    let arg_ty = RustTyDecomposition::from_ty(arg_ty, task_key.args.context());
-                    let base = positions.len();
-                    for occurrence in deps.require_dep::<Self>(arg_ty)? {
-                        let enclosing = behind
-                            .iter()
-                            .copied()
-                            .chain(occurrence.enclosing.iter().map(|index| base + index))
-                            .collect();
-                        positions.push(Occurrence {
-                            param: occurrence.param,
-                            start: add(offset, occurrence.start),
-                            enclosing,
-                        });
-                    }
-                    // The arity of a type constructor is given by an axiom,
-                    // which a type parameter does not have.
-                    if !matches!(
-                        arg_ty.ty.specifics,
-                        TySpecifics::Param(RustParamData::Generic)
-                    ) {
-                        deps.require_ref::<ArityEnc>(arg_ty.ty)?;
-                    }
-                    let arg_ty = deps.require_dep::<TyExprEnc>(arg_ty)?;
-                    offset = add(offset, arity.call()(arg_ty));
-                }
-                positions
+                let ty = deps.require_dep::<TyExprEnc>(*task_key)?;
+                lifetimes.push(GeneralizedLifetime::RegionsIn(*task_key));
+                intervals.push((int(0), arity.call()(ty)));
+                direct.push(Vec::new());
             }
-        };
-        Ok(((), positions))
+            _ => {
+                // The positions of each generic argument, by its index.
+                let mut arg_positions = Vec::new();
+                let mut offset = int(0);
+                let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
+                for arg in task_key.args.args() {
+                    let base = direct.len();
+                    match arg.kind() {
+                        ty::GenericArgKind::Lifetime(region) => {
+                            lifetimes.push(GeneralizedLifetime::Region(region));
+                            intervals.push((offset, add(offset, int(1))));
+                            direct.push(Vec::new());
+                            offset = add(offset, int(1));
+                        }
+                        ty::GenericArgKind::Type(arg_ty) => {
+                            let arg_ty =
+                                RustTyDecomposition::from_ty(arg_ty, task_key.args.context());
+                            let arg_graph = deps.require_dep::<Self>(arg_ty)?;
+                            let shift =
+                                |p: LifetimePosition| LifetimePosition::new(base + p.index());
+                            for p in arg_graph.positions() {
+                                let (lo, hi) = arg_graph.interval(p);
+                                lifetimes.push(arg_graph.lifetime(p));
+                                intervals.push((add(offset, lo), add(offset, hi)));
+                                direct.push(
+                                    arg_graph.ancestors(p).iter().copied().map(shift).collect(),
+                                );
+                            }
+                            // The arity of the argument is given by the axiom
+                            // of its type constructor.
+                            deps.require_ref::<ArityEnc>(arg_ty.ty)?;
+                            let arg_ty = deps.require_dep::<TyExprEnc>(arg_ty)?;
+                            offset = add(offset, arity.call()(arg_ty));
+                        }
+                        ty::GenericArgKind::Const(_) => {}
+                    }
+                    arg_positions.push(
+                        (base..direct.len())
+                            .map(LifetimePosition::new)
+                            .collect::<Vec<_>>(),
+                    );
+                }
+                // If a generic argument outlives another one, the positions of
+                // the latter enclose those of the former.
+                for (longer, shorter) in outlives(*task_key) {
+                    for &p in &arg_positions[longer] {
+                        direct[p].extend(arg_positions[shorter].iter().copied());
+                    }
+                }
+            }
+        }
+        let ancestors = transitive_closure(direct)
+            .map_err(|error| EncodeFullError::EncodingError(error, None))?;
+        Ok((
+            (),
+            EnclosureGraph {
+                lifetimes,
+                intervals,
+                ancestors,
+            },
+        ))
     }
+}
+
+/// The pairs `(longer, shorter)` of generic argument indices of `ty` where `longer` outlives `shorter`.
+fn outlives(ty: RustTyDecomposition<'_>) -> Vec<(usize, usize)> {
+    // The referent of `&'a mut T` outlives `'a`.
+    if let TySpecifics::MutRef(_) = ty.ty.specifics {
+        return vec![(1, 0)];
+    }
+    let Some(adt) = ty.ty.data.adt else {
+        return Vec::new();
+    };
+    // An ADT's parameter indices are its argument indices.
+    vir::with_vcx(|vcx| {
+        vcx.tcx()
+            .inferred_outlives_of(adt)
+            .iter()
+            .filter_map(|(clause, _)| {
+                let (longer, shorter) = match clause.kind().skip_binder() {
+                    ty::ClauseKind::RegionOutlives(ty::OutlivesClause(longer, shorter)) => {
+                        (early_param_index(longer)?, early_param_index(shorter)?)
+                    }
+                    ty::ClauseKind::TypeOutlives(ty::OutlivesClause(longer, shorter)) => {
+                        let ty::Param(longer) = longer.kind() else {
+                            return None;
+                        };
+                        (longer.index as usize, early_param_index(shorter)?)
+                    }
+                    _ => return None,
+                };
+                // A lifetime outlives itself, e.g. `'a` in a field of type `&'a mut Node<'a>`.
+                (longer != shorter).then_some((longer, shorter))
+            })
+            .collect()
+    })
+}
+
+fn early_param_index(region: ty::Region<'_>) -> Option<usize> {
+    match region.kind() {
+        ty::ReEarlyParam(param) => Some(param.index as usize),
+        _ => None,
+    }
+}
+
+/// The transitive closure of the direct enclosers `direct` of each position, outermost first.
+fn transitive_closure(
+    direct: IndexVec<LifetimePosition, Vec<LifetimePosition>>,
+) -> Result<IndexVec<LifetimePosition, Vec<LifetimePosition>>, CyclicEnclosure> {
+    let mut ancestors = IndexVec::new();
+    for p in direct.indices() {
+        let mut reached = Vec::new();
+        let mut stack = direct[p].clone();
+        while let Some(q) = stack.pop() {
+            if !reached.contains(&q) {
+                reached.push(q);
+                stack.extend(direct[q].iter().copied());
+            }
+        }
+        if reached.contains(&p) {
+            return Err(CyclicEnclosure);
+        }
+        ancestors.push(reached);
+    }
+    // Sort outermost first: a position has fewer ancestors than the positions it encloses.
+    let counts = ancestors
+        .iter()
+        .map(Vec::len)
+        .collect::<IndexVec<LifetimePosition, _>>();
+    for list in ancestors.iter_mut() {
+        list.sort_by_key(|&q| (counts[q], q));
+    }
+    Ok(ancestors)
 }
 
 fn int<'vir>(n: usize) -> vir::ExprInt<'vir> {
@@ -117,34 +253,54 @@ fn int<'vir>(n: usize) -> vir::ExprInt<'vir> {
 #[cfg(test)]
 mod tests {
     use prusti_rustc_interface::span::DUMMY_SP;
-    use task_encoder::TaskEncoder;
+    use task_encoder::{TaskEncoder, TaskEncoderError};
 
-    use super::{LifetimePosition, LifetimePositionEnc};
+    use prusti_rustc_interface::index::Idx;
+
+    use super::{CyclicEnclosure, GeneralizedLifetime, LifetimePositionEnc};
     use crate::encoders::ty::test_util::{simplified, with_type_alias};
 
-    /// The occurrences in the type alias `X` defined in `src`, as
-    /// `param @ position`, followed by `behind [i, ..]` with the indices of
-    /// the occurrences enclosing it, if any.
+    /// The positions of the type alias `X` defined in `src`, as
+    /// `lifetime @ position`, followed by `behind [i, ..]` with the indices
+    /// of the positions enclosing it, if any.
     fn positions(src: &str) -> Vec<String> {
         with_type_alias(src, |ty| {
-            let (_, _, positions) = LifetimePositionEnc::encode(ty, true, DUMMY_SP)
+            let (_, _, graph) = LifetimePositionEnc::encode(ty, true, DUMMY_SP)
                 .unwrap()
                 .unwrap();
-            positions
-                .into_iter()
-                .map(|occurrence| {
-                    let position = simplified(occurrence.start);
-                    let param = match occurrence.param {
-                        LifetimePosition::Lifetime(region) => format!("{region}"),
-                        LifetimePosition::Param(param) => format!("{}", param.args.args()[0]),
+            graph
+                .positions()
+                .map(|p| {
+                    let position = simplified(graph.interval(p).0);
+                    let lifetime = match graph.lifetime(p) {
+                        GeneralizedLifetime::Region(region) => format!("{region}"),
+                        GeneralizedLifetime::RegionsIn(param) => {
+                            format!("{}", param.args.args()[0])
+                        }
                     };
-                    if occurrence.enclosing.is_empty() {
-                        format!("{param} @ {position:?}")
+                    let ancestors = graph
+                        .ancestors(p)
+                        .iter()
+                        .map(|q| q.index())
+                        .collect::<Vec<_>>();
+                    if ancestors.is_empty() {
+                        format!("{lifetime} @ {position:?}")
                     } else {
-                        format!("{param} @ {position:?} behind {:?}", occurrence.enclosing)
+                        format!("{lifetime} @ {position:?} behind {ancestors:?}")
                     }
                 })
                 .collect()
+        })
+    }
+
+    /// Whether the positions of the type alias `X` defined in `src` enclose
+    /// each other.
+    fn is_cyclic(src: &str) -> bool {
+        with_type_alias(src, |ty| {
+            matches!(
+                LifetimePositionEnc::encode(ty, true, DUMMY_SP),
+                Err(TaskEncoderError::EncodingError(CyclicEnclosure))
+            )
         })
     }
 
@@ -222,5 +378,77 @@ mod tests {
             positions("type X<'a, T, const N: usize> = [&'a mut T; N];"),
             ["'a @ 0", "T @ 1 behind [0]"],
         );
+    }
+
+    /// A lifetime encloses another one through the definition of a struct.
+    #[test]
+    fn enclosure_through_definition() {
+        assert_eq!(
+            positions(
+                "struct Node<'a, 'b> { v: &'b mut i32, next: Option<&'a mut Node<'a, 'b>> }
+                 type X<'a, 'b> = Node<'a, 'b>;"
+            ),
+            ["'a @ 0", "'b @ 1 behind [0]"],
+        );
+    }
+
+    /// An enclosed lifetime may come first.
+    #[test]
+    fn enclosed_lifetime_first() {
+        assert_eq!(
+            positions(
+                "struct Node<'b, 'a> { v: &'b mut i32, next: Option<&'a mut Node<'b, 'a>> }
+                 type X<'a, 'b> = Node<'b, 'a>;"
+            ),
+            ["'b @ 0 behind [1]", "'a @ 1"],
+        );
+    }
+
+    /// The enclosure in a type argument combines with that of the type.
+    #[test]
+    fn enclosure_in_type_argument() {
+        assert_eq!(
+            positions(
+                "struct Node<'a, 'b> { v: &'b mut i32, next: Option<&'a mut Node<'a, 'b>> }
+                 type X<'a, 'b> = Option<&'a mut Node<'a, 'b>>;"
+            ),
+            ["'a @ 0", "'a @ 1 behind [0]", "'b @ 2 behind [0, 1]"],
+        );
+    }
+
+    /// A struct's enclosure is not that of the structs it contains.
+    #[test]
+    fn enclosure_of_field() {
+        let src = "struct A<'a, 'b>(&'a mut i32, &'b mut i32);
+                   struct B<'a, 'b>(A<'a, 'b>, &'a mut &'b mut i32);";
+        assert_eq!(
+            positions(&format!("{src} type X<'a, 'b> = A<'a, 'b>;")),
+            ["'a @ 0", "'b @ 1"],
+        );
+        assert_eq!(
+            positions(&format!("{src} type X<'a, 'b> = B<'a, 'b>;")),
+            ["'a @ 0", "'b @ 1 behind [0]"],
+        );
+    }
+
+    /// A lifetime that outlives another one because of a shared reference is
+    /// enclosed by it as well, although no mutable reference encloses it.
+    #[test]
+    fn shared_reference_outlives() {
+        assert_eq!(
+            positions(
+                "struct S<'a, 'b>(&'a mut i32, &'b mut i32, &'a &'b i32);
+                 type X<'a, 'b> = S<'a, 'b>;"
+            ),
+            ["'a @ 0", "'b @ 1 behind [0]"],
+        );
+    }
+
+    #[test]
+    fn cyclic_enclosure() {
+        assert!(is_cyclic(
+            "struct S<'a, 'b>(&'a mut &'b mut i32, &'b mut &'a mut i32);
+             type X<'a, 'b> = S<'a, 'b>;"
+        ));
     }
 }

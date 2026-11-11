@@ -1,7 +1,13 @@
 use std::ops::Deref;
 
 use prusti_interface::environment::EnvQuery;
-use prusti_rustc_interface::{abi, hir::attrs::LangItem, index, middle::ty, span::symbol};
+use prusti_rustc_interface::{
+    abi,
+    hir::attrs::LangItem,
+    index,
+    middle::ty,
+    span::{def_id::DefId, symbol},
+};
 
 use super::{
     data::*,
@@ -75,6 +81,7 @@ impl<'tcx> RustTyDecomposition<'tcx> {
             params: GParams::empty_env(gty),
             special: RustTySpecial::None,
             sizedness: RustTySizedness::None,
+            adt: None,
         };
         let specifics = TySpecifics::Param(RustParamData::Generic);
         TyData::<RustTyDatas>::new(data, specifics).alloc()
@@ -271,6 +278,8 @@ pub struct RustTyData<'tcx> {
     pub params: GParams<'tcx>,
     pub special: RustTySpecial,
     pub sizedness: RustTySizedness<'tcx>,
+    /// The definition of the type, if it is an ADT.
+    pub adt: Option<DefId>,
 }
 
 /// Which of the sizedness traits (`Sized`, `MetaSized`, `PointeeSized`) the
@@ -430,6 +439,7 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             params,
             special: RustTySpecial::from_ty(ty),
             sizedness: RustTySizedness::from_ty(ty),
+            adt: ty.ty_adt_def().map(|adt| adt.did()),
         };
         RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
     }
@@ -443,6 +453,7 @@ impl<'tcx> TyData<'tcx, RustTyDatas> {
             params,
             special: RustTySpecial::None,
             sizedness: RustTySizedness::from_ty(ty),
+            adt: None,
         };
         let specifics = TySpecifics::from_prim_ty(ty);
         RustTyDecomposition::new(Self::new(data, specifics).alloc(), args)
