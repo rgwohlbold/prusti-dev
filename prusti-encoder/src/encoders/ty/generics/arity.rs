@@ -76,9 +76,21 @@ impl TaskEncoder for ArityEnc {
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        let axioms = Self::all_outputs_local_no_errors(program);
+        let mut axioms = Self::all_outputs_local_no_errors(program);
         let domain = vir::with_vcx(|vcx| {
-            let arity_fn = vcx.mk_domain_function(arity_fn_ident(), false, None);
+            // Every type has a non-negative number of lifetime positions,
+            // which follows from the axioms of the type constructors.
+            let arity = arity_fn_ident();
+            let ty_decl = vcx.mk_local_decl("T", vir::TYPE_TYVAL);
+            let ty = vcx.mk_local_ex(ty_decl);
+            let zero = vcx.mk_uint::<0>();
+            axioms.push(vcx.mk_domain_axiom(
+                vir::ViperIdent::new("arity_non_negative"),
+                vir::expr! { vcx;
+                    forall ..[&[ty_decl]] :: {[arity](ty)} (zero) <= ([arity](ty))
+                },
+            ));
+            let arity_fn = vcx.mk_domain_function(arity, false, None);
             vcx.mk_domain(
                 vir::ViperIdent::new("Arity"),
                 &[],
