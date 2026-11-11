@@ -57,6 +57,12 @@ struct Subquery<'vir> {
     end: vir::ExprInt<'vir>,
 }
 
+/// A field of a struct or of an enum variant: its type and its reader.
+type Field<'vir> = (
+    RustTyDecomposition<'vir>,
+    vir::AdtDestructor<'vir, vir::CSnap, vir::Snap>,
+);
+
 impl IndirectPredEnc {
     /// The subqueries of the query `[lo, hi)` for lifetime and type parameters of `ty`.
     fn subqueries<'vir>(
@@ -216,6 +222,48 @@ impl IndirectPredEnc {
         let guard = subquery.guard;
         Ok(vir::expr! { (guard) ? (snap) : (field_snap) })
     }
+
+    /// The field predicates of the fields `fields`, given by their types and
+    /// readers, of the snapshot `k` for `subquery`.
+    fn fields_preds<'vir>(
+        subqueries: &[Subquery<'vir>],
+        subquery: Subquery<'vir>,
+        fields: &[Field<'vir>],
+        k: vir::ExprSnap<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
+        let mut preds = Vec::new();
+        for &(field_ty, read) in fields {
+            let field_snap = read.call()(k.downcast_ty());
+            preds.extend(Self::field_preds(
+                subqueries, subquery, field_ty, field_snap, deps,
+            )?);
+        }
+        Ok(preds)
+    }
+
+    /// The fields `fields`, given by their types and readers, of `snapshot`,
+    /// each extended by all `subqueries`. The field predicates holding the
+    /// permissions are on the fields of `pred`.
+    fn fields_ext<'vir>(
+        subqueries: &[Subquery<'vir>],
+        fields: &[Field<'vir>],
+        snapshot: vir::ExprSnap<'vir>,
+        pred: vir::ExprSnap<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<Vec<vir::ExprSnap<'vir>>, EncodeFullError<'vir, Self>> {
+        let mut field_snaps = Vec::new();
+        for &(field_ty, read) in fields {
+            let mut field_snap = read.call()(snapshot.downcast_ty());
+            let field_pred = read.call()(pred.downcast_ty());
+            for &subquery in subqueries {
+                field_snap =
+                    Self::field_ext(subqueries, subquery, field_ty, field_snap, field_pred, deps)?;
+            }
+            field_snaps.push(field_snap);
+        }
+        Ok(field_snaps)
+    }
 }
 
 impl TaskEncoder for IndirectPredEnc {
@@ -279,20 +327,16 @@ impl TaskEncoder for IndirectPredEnc {
             let (body, ext_body) = match &ty.specifics {
                 TySpecifics::StructLike(data) => {
                     let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let fields = data
+                        .fields
+                        .iter()
+                        .map(|(field, pure_field)| {
+                            (field.decompose(task_key.params), pure_field.read)
+                        })
+                        .collect::<Vec<_>>();
                     let mut conjuncts = Vec::new();
                     for &subquery in &subqueries {
-                        let mut preds = Vec::new();
-                        for (field, pure_field) in &data.fields {
-                            let field_ty = field.decompose(task_key.params);
-                            let field_snap = pure_field.read.call()(k.downcast_ty());
-                            preds.extend(Self::field_preds(
-                                &subqueries,
-                                subquery,
-                                field_ty,
-                                field_snap,
-                                deps,
-                            )?);
-                        }
+                        let preds = Self::fields_preds(&subqueries, subquery, &fields, k, deps)?;
                         if !preds.is_empty() {
                             let guard = subquery.guard;
                             let preds = vcx.mk_conj(&preds);
@@ -301,24 +345,76 @@ impl TaskEncoder for IndirectPredEnc {
                     }
                     // Each field is extended at the occurrences of the
                     // parameters in its type.
-                    let mut field_snaps = Vec::new();
-                    for (field, pure_field) in &data.fields {
-                        let field_ty = field.decompose(task_key.params);
-                        let mut field_snap = pure_field.read.call()(ext_snapshot.downcast_ty());
-                        let field_pred = pure_field.read.call()(ext_pred.downcast_ty());
-                        for &subquery in &subqueries {
-                            field_snap = Self::field_ext(
-                                &subqueries,
-                                subquery,
-                                field_ty,
-                                field_snap,
-                                field_pred,
-                                deps,
-                            )?;
-                        }
-                        field_snaps.push(field_snap);
-                    }
+                    let field_snaps =
+                        Self::fields_ext(&subqueries, &fields, ext_snapshot, ext_pred, deps)?;
                     let ext_body = data.data.1.field_snaps_to_snap.call()(&field_snaps).upcast_ty();
+                    (Some(vcx.mk_conj(&conjuncts)), Some(ext_body))
+                }
+                TySpecifics::EnumLike(data) => {
+                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let discr = data.data.1.snap_to_discr_snap;
+                    // The variants whose fields have lifetime positions, with
+                    // their discriminants, fields and constructors.
+                    let mut variants = Vec::new();
+                    for variant in &data.variants {
+                        let fields = variant
+                            .inner
+                            .fields
+                            .iter()
+                            .map(|(field, pure_field)| {
+                                (field.decompose(task_key.params), pure_field.read)
+                            })
+                            .collect::<Vec<_>>();
+                        let mut has_positions = false;
+                        for &(field_ty, _) in &fields {
+                            has_positions |= !deps
+                                .require_dep::<LifetimePositionEnc>(field_ty)?
+                                .is_empty();
+                        }
+                        if has_positions {
+                            let cons = variant.inner.data.1.field_snaps_to_snap;
+                            variants.push((variant.data.1.discr, fields, cons));
+                        }
+                    }
+                    // The field predicates of each variant are guarded by its
+                    // discriminant.
+                    let mut conjuncts = Vec::new();
+                    for &subquery in &subqueries {
+                        let mut preds = Vec::new();
+                        for (variant_discr, fields, _) in &variants {
+                            let variant_preds =
+                                Self::fields_preds(&subqueries, subquery, fields, k, deps)?;
+                            if !variant_preds.is_empty() {
+                                let in_variant =
+                                    vcx.mk_eq_expr(discr.call()(k.downcast_ty()), *variant_discr);
+                                let variant_preds = vcx.mk_conj(&variant_preds);
+                                preds.push(vir::expr! { vcx; (in_variant) ==> (variant_preds) });
+                            }
+                        }
+                        if !preds.is_empty() {
+                            let guard = subquery.guard;
+                            let preds = vcx.mk_conj(&preds);
+                            conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
+                        }
+                    }
+                    // The fields of a variant are extended if both snapshots
+                    // are of that variant: the field predicates are guarded by
+                    // the discriminant of `pred`, and the variant of
+                    // `snapshot` must not change. Otherwise, `snapshot` stays
+                    // as it is.
+                    let mut ext_body = ext_snapshot;
+                    for (variant_discr, fields, cons) in variants.iter().rev() {
+                        let field_snaps =
+                            Self::fields_ext(&subqueries, fields, ext_snapshot, ext_pred, deps)?;
+                        let extended: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
+                        let snapshot_in_variant = vcx
+                            .mk_eq_expr(discr.call()(ext_snapshot.downcast_ty()), *variant_discr);
+                        let pred_in_variant =
+                            vcx.mk_eq_expr(discr.call()(ext_pred.downcast_ty()), *variant_discr);
+                        ext_body = vir::expr! { vcx;
+                            ((snapshot_in_variant) && (pred_in_variant)) ? (extended) : (ext_body)
+                        };
+                    }
                     (Some(vcx.mk_conj(&conjuncts)), Some(ext_body))
                 }
                 TySpecifics::MutRef((data, pure_data)) => {
@@ -403,7 +499,7 @@ impl TaskEncoder for IndirectPredEnc {
                 }
                 // A shared reference has no lifetime positions.
                 TySpecifics::ImmRef(_) => (Some(vcx.mk_bool::<true>()), Some(ext_snapshot)),
-                // TODO: enums and the remaining types.
+                // TODO: the remaining types.
                 _ => (None, None),
             };
 
@@ -904,6 +1000,84 @@ mod verification_tests {
               ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
             {
               unfold p_E_ind(k, 0, 1)
+            }
+            "#,
+            "insufficient permission to access p_Ref_mutable_ind",
+        );
+    }
+
+    /// An enum passes its positions on to the fields of the variant it is
+    /// in: `'a @ 0` to variant `A`, `T @ [1, 1 + arity(T))` to variant `B`.
+    #[test]
+    fn enum_variants() {
+        let src = "enum E<'a, T> { A(&'a mut i32), B(T), C }
+                   type X<'a, T> = E<'a, T>;";
+        assert_verifies(
+            src,
+            r#"
+            method variant_a(k: s_E, T: Type)
+              requires p_E_ind(k, T, 0, 1) && k.iss_E_0_cons
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+            {
+              unfold p_E_ind(k, T, 0, 1)
+            }
+
+            method variant_b(k: s_E, T: Type)
+              requires 0 < arity(T)
+              requires p_E_ind(k, T, 1, 1 + arity(T)) && k.iss_E_1_cons
+              ensures p_Param_ind(k.s_E_1_0, T, 0, arity(T))
+            {
+              unfold p_E_ind(k, T, 1, 1 + arity(T))
+            }
+
+            // Variant `C` holds nothing.
+            method variant_c(k: s_E, T: Type)
+              requires k.iss_E_2_cons
+              ensures p_E_ind(k, T, 0, 1 + arity(T))
+            {
+              fold p_E_ind(k, T, 0, 1 + arity(T))
+            }
+
+            // Extension keeps the variant.
+            method extend(k: s_E, T: Type)
+              requires p_E_ind(k, T, 0, 1)
+              ensures p_E_ind(k, T, 0, 1)
+              ensures s_E_discr(ext_E(k, T, k, 0, 1)) == s_E_discr(k)
+            {
+            }
+
+            method split(k: s_E, T: Type)
+              requires p_E_ind(k, T, 0, 1 + arity(T))
+              ensures p_E_ind(k, T, 0, 1) && p_E_ind(k, T, 1, 1 + arity(T))
+            {
+              unfold p_E_ind(k, T, 0, 1 + arity(T))
+              fold p_E_ind(k, T, 0, 1)
+              fold p_E_ind(k, T, 1, 1 + arity(T))
+            }
+            "#,
+        );
+        // Without knowing the variant, the field is not held.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_E, T: Type)
+              requires p_E_ind(k, T, 0, 1)
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+            {
+              unfold p_E_ind(k, T, 0, 1)
+            }
+            "#,
+            "insufficient permission to access p_Ref_mutable_ind",
+        );
+        // In variant `B`, 'a holds nothing.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_E, T: Type)
+              requires p_E_ind(k, T, 0, 1) && k.iss_E_1_cons
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+            {
+              unfold p_E_ind(k, T, 0, 1)
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
