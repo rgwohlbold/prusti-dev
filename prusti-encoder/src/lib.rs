@@ -25,6 +25,7 @@ use crate::encoders::{
             GArgsCastEnc, IndirectCastersEnc,
             arity::ArityEnc,
             clamp::ClampEnc,
+            set_helper::SetHelperEnc,
             sizedness::SizednessEnc,
             r#trait::TraitEnc,
             trait_fn::TraitFnEnc,
@@ -172,6 +173,7 @@ pub(crate) fn emit_program<'vir>() -> task_encoder::Program<'vir> {
     SizednessEnc::emit_outputs(&mut program);
     ArityEnc::emit_outputs(&mut program);
     ClampEnc::emit_outputs(&mut program);
+    SetHelperEnc::emit_outputs(&mut program);
     IndirectPredEnc::emit_outputs(&mut program);
     IndirectCastersEnc::emit_outputs(&mut program);
     TraitFnEnc::emit_outputs(&mut program);

@@ -13,7 +13,9 @@ use super::{
         lifetime_position::{
             EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
         },
+        set_helper::SetHelperEnc,
     },
+    impure::TyImpureEnc,
     pure::TyPureEnc,
 };
 
@@ -31,9 +33,8 @@ pub struct IndirectPredRef<'vir> {
             vir::Int,
         ),
     >,
-    /// snapshot extension function `ext_X(snapshot, T_0, ..., pred, lo, hi)` which extends
-    /// `snapshot` by the lifetime positions `[lo, hi)`, whose permissions are held
-    /// by `p_X_ind(pred, T_0, ..., lo, hi)`.
+    /// `ext_X(snapshot, T.., pred, lo, hi)`: `snapshot` extended by `[lo, hi)`, whose
+    /// permissions `p_X_ind(pred, T.., lo, hi)` holds.
     pub ext: FunctionIdn<
         'vir,
         (
@@ -46,14 +47,20 @@ pub struct IndirectPredRef<'vir> {
         ),
         vir::Snap,
     >,
+    /// `restrict_X(snapshot, T.., keep)`: `snapshot` with the references at positions
+    /// not in `keep` reset to their unextended state.
+    pub restrict:
+        FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Set), vir::Snap>,
 }
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
-// Lifetime query that corresponds to a lifetime position [lo, hi), of a region or of the regions in a type parameter
+/// The part of a query `[lo, hi)` at one own position.
 #[derive(Clone, Copy)]
 struct Subquery<'vir> {
     lifetime: GeneralizedLifetime<'vir>,
+    /// The lifetimes of the own positions enclosing this one.
+    enclosing: &'vir [GeneralizedLifetime<'vir>],
     guard: vir::ExprBool<'vir>,
     start: vir::ExprInt<'vir>,
     end: vir::ExprInt<'vir>,
@@ -84,16 +91,22 @@ impl IndirectPredEnc {
                 .positions()
                 .map(|p| {
                     let lifetime = graph.lifetime(p);
+                    let enclosing = graph
+                        .ancestors(p)
+                        .iter()
+                        .map(|&q| graph.lifetime(q))
+                        .collect::<Vec<_>>();
+                    let enclosing = vcx.alloc_slice(&enclosing);
                     let (x, _) = graph.interval(p);
                     Ok(match lifetime {
-                        // An own lifetime has the single position `x`, which the query either contains or not.
+                        // An own lifetime is a single position, either in the query or not.
                         GeneralizedLifetime::Region(_) => Subquery {
                             lifetime,
+                            enclosing,
                             guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
                             start: vcx.mk_uint::<0>(),
                             end: vcx.mk_uint::<1>(),
                         },
-                        // The subquery of an own type parameter at the positions `[x, x + w)` is `[clamp(lo - x, 0, w), clamp(hi - x, 0, w))`.
                         GeneralizedLifetime::RegionsIn(ty) => {
                             let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
                             let zero = vcx.mk_uint::<0>();
@@ -101,6 +114,7 @@ impl IndirectPredEnc {
                             let end = clamp.call()(sub(hi, x), zero, w);
                             Subquery {
                                 lifetime,
+                                enclosing,
                                 guard: vir::expr! { vcx; (start) < (end) },
                                 start,
                                 end,
@@ -112,33 +126,32 @@ impl IndirectPredEnc {
         })
     }
 
-    /// The snapshot on which the field predicate of the position `p` in the
-    /// field type `field_ty`, whose enclosure graph is `graph`, is defined:
-    /// `field_snap`, extended by the enclosing positions whose lifetimes the
-    /// query contains, outermost first. The caller has already extended
-    /// `field_snap` by the enclosing positions of the other lifetimes.
+    /// The snapshot of the field predicate of `p` for `subquery`: `field_snap`, restricted,
+    /// then extended by `p`'s ancestors in the query; the caller extended it by the others.
     fn position_snap<'vir>(
         subqueries: &[Subquery<'vir>],
+        subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
         graph: &EnclosureGraph<'vir>,
         p: LifetimePosition,
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
-        let mut snap = field_snap;
+        let mut snap = Self::restricted_snap(subquery, field_ty, graph, p, field_snap, deps)?;
         for &enclosing in graph.ancestors(p) {
             let lifetime = graph.lifetime(enclosing);
-            let Some(&subquery) = subqueries.iter().find(|s| s.lifetime == lifetime) else {
+            let Some(&outer) = subqueries.iter().find(|s| s.lifetime == lifetime) else {
                 continue;
             };
-            let key =
-                Self::position_snap(subqueries, field_ty, graph, enclosing, field_snap, deps)?;
+            let key = Self::position_snap(
+                subqueries, outer, field_ty, graph, enclosing, field_snap, deps,
+            )?;
             let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            let guard = subquery.guard;
+            let guard = outer.guard;
             let (x, _) = graph.interval(enclosing);
-            let start = add(x, subquery.start);
-            let end = add(x, subquery.end);
+            let start = add(x, outer.start);
+            let end = add(x, outer.end);
             let extended = ext.call()(snap, args.get_ty(), args.get_const(), key, start, end);
             // An enclosing position of the same lifetime is in the query
             // whenever `p` is.
@@ -151,9 +164,88 @@ impl IndirectPredEnc {
         Ok(snap)
     }
 
-    /// The predicates of the field of type `field_ty` with the snapshot
-    /// `field_snap` for `subquery`: one for each position of the subquery's
-    /// lifetime in the field type.
+    /// `field_snap` restricted to `p`'s ancestors in `field_ty` and `p`'s block before the
+    /// subquery, if the container may have extended other positions of `field_ty`.
+    fn restricted_snap<'vir>(
+        subquery: Subquery<'vir>,
+        field_ty: RustTyDecomposition<'vir>,
+        graph: &EnclosureGraph<'vir>,
+        p: LifetimePosition,
+        field_snap: vir::ExprSnap<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
+        let spurious = graph.positions().any(|q| {
+            subquery.enclosing.contains(&graph.lifetime(q)) && !graph.ancestors(p).contains(&q)
+        });
+        if !spurious {
+            return Ok(field_snap);
+        }
+        let set_helper = deps.require_ref::<SetHelperEnc>(())?;
+        let restrict = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.restrict;
+        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+        let mut keep = graph
+            .ancestors(p)
+            .iter()
+            .map(|&q| {
+                let (lo, hi) = graph.interval(q);
+                set_helper.interval.call()(lo, hi)
+            })
+            .collect::<Vec<_>>();
+        if let GeneralizedLifetime::RegionsIn(_) = graph.lifetime(p) {
+            let (lo, _) = graph.interval(p);
+            keep.push(set_helper.interval.call()(lo, add(lo, subquery.start)));
+        }
+        Ok(restrict.call()(
+            field_snap,
+            args.get_ty(),
+            args.get_const(),
+            union(keep),
+        ))
+    }
+
+    /// `field_snap` restricted to the own positions `keep`.
+    fn field_restrict<'vir>(
+        own: &EnclosureGraph<'vir>,
+        field_ty: RustTyDecomposition<'vir>,
+        field_snap: vir::ExprSnap<'vir>,
+        keep: vir::ExprSet<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
+        let graph = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
+        if graph.is_empty() {
+            return Ok(field_snap);
+        }
+        let set_helper = deps.require_ref::<SetHelperEnc>(())?;
+        let restrict = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.restrict;
+        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+        // `keep` shifted from the own position to the field position, cut to its block.
+        let keep = vir::with_vcx(|vcx| {
+            union(graph.positions().filter_map(|q| {
+                let own_q = own
+                    .positions()
+                    .find(|&o| own.lifetime(o) == graph.lifetime(q))?;
+                let (x_own, _) = own.interval(own_q);
+                let (lo, hi) = graph.interval(q);
+                let offset = vcx
+                    .mk_bin_op_expr(vir::BinOpKind::Sub, x_own, lo)
+                    .downcast_ty();
+                let shifted = set_helper.shift.call()(keep, offset);
+                let block = set_helper.interval.call()(lo, hi);
+                Some(
+                    vcx.mk_anyset_op_expr(vir::CollectionBinOpKind::Intersection, shifted, block)
+                        .downcast_ty(),
+                )
+            }))
+        });
+        Ok(restrict.call()(
+            field_snap,
+            args.get_ty(),
+            args.get_const(),
+            keep,
+        ))
+    }
+
+    /// The field predicates for `subquery`: one per position of its lifetime in `field_ty`.
     fn field_preds<'vir>(
         subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
@@ -169,7 +261,8 @@ impl IndirectPredEnc {
             }
             let pred = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.predicate;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            let snap = Self::position_snap(subqueries, field_ty, &graph, p, field_snap, deps)?;
+            let snap =
+                Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_snap, deps)?;
             let (x, _) = graph.interval(p);
             let start = add(x, subquery.start);
             let end = add(x, subquery.end);
@@ -180,11 +273,8 @@ impl IndirectPredEnc {
         Ok(preds)
     }
 
-    /// The snapshot `field_snap` of the field of type `field_ty`, extended by
-    /// `subquery` at each position of the subquery's lifetime in the field
-    /// type, if the subquery is non-empty. The field predicates holding the
-    /// permissions are defined on `field_pred`, extended as in
-    /// `position_snap`.
+    /// `field_snap` extended by `subquery` at each position of its lifetime in `field_ty`;
+    /// the field predicates are on `field_pred`.
     fn field_ext<'vir>(
         subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
@@ -207,7 +297,8 @@ impl IndirectPredEnc {
             }
             let ext = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.ext;
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            let key = Self::position_snap(subqueries, field_ty, &graph, p, field_pred, deps)?;
+            let key =
+                Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_pred, deps)?;
             let (x, _) = graph.interval(p);
             let start = add(x, subquery.start);
             let end = add(x, subquery.end);
@@ -260,6 +351,18 @@ impl IndirectPredEnc {
     }
 }
 
+/// The union of the sets `sets`, or the empty set if there are none.
+fn union<'vir>(sets: impl IntoIterator<Item = vir::ExprSet<'vir>>) -> vir::ExprSet<'vir> {
+    vir::with_vcx(|vcx| {
+        sets.into_iter()
+            .reduce(|a, b| {
+                vcx.mk_anyset_op_expr(vir::CollectionBinOpKind::Union, a, b)
+                    .downcast_ty()
+            })
+            .unwrap_or_else(|| vcx.mk_set_literal_expr(&[], vir::TYPE_INT))
+    })
+}
+
 impl TaskEncoder for IndirectPredEnc {
     task_encoder::encoder_cache!(IndirectPredEnc);
     const ENCODER_NAME: &'static str = "indirect predicate encoder";
@@ -267,7 +370,11 @@ impl TaskEncoder for IndirectPredEnc {
     type TaskDescription<'vir> = RustTy<'vir>;
 
     type OutputRef<'vir> = IndirectPredRef<'vir>;
-    type OutputFullLocal<'vir> = (vir::Predicate<'vir>, vir::Function<'vir>);
+    type OutputFullLocal<'vir> = (
+        vir::Predicate<'vir>,
+        vir::Function<'vir>,
+        vir::Function<'vir>,
+    );
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -304,7 +411,20 @@ impl TaskEncoder for IndirectPredEnc {
                 ),
                 snapshot,
             );
-            deps.emit_output_ref(*task_key, IndirectPredRef { predicate, ext })?;
+            let set = vcx.mk_ty_set(vir::TYPE_INT);
+            let restrict = FunctionIdn::new(
+                vir::ViperIdent::new(vir::vir_format!(vcx, "restrict_{}", task_key.name())),
+                (snapshot, params.ty_args(), params.const_args(), set),
+                snapshot,
+            );
+            deps.emit_output_ref(
+                *task_key,
+                IndirectPredRef {
+                    predicate,
+                    ext,
+                    restrict,
+                },
+            )?;
 
             let k_decl = vcx.mk_local_decl("k", snapshot);
             let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
@@ -317,8 +437,11 @@ impl TaskEncoder for IndirectPredEnc {
             let pred_decl = vcx.mk_local_decl("pred", snapshot);
             let ext_snapshot: vir::ExprSnap<'vir> = vcx.mk_local_ex(snapshot_decl);
             let ext_pred: vir::ExprSnap<'vir> = vcx.mk_local_ex(pred_decl);
+            // The positions argument of the snapshot restriction function.
+            let keep_decl = vcx.mk_local_decl("keep", set);
+            let keep: vir::ExprSet<'vir> = vcx.mk_local_ex(keep_decl);
 
-            let (body, ext_body) = match &ty.specifics {
+            let (body, ext_body, restrict_body) = match &ty.specifics {
                 TySpecifics::StructLike(data) => {
                     let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
                     let fields = data
@@ -337,18 +460,31 @@ impl TaskEncoder for IndirectPredEnc {
                             conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
                         }
                     }
-                    // Each field is extended at the occurrences of the
-                    // parameters in its type.
                     let field_snaps =
                         Self::fields_ext(&subqueries, &fields, ext_snapshot, ext_pred, deps)?;
                     let ext_body = data.data.1.field_snaps_to_snap.call()(&field_snaps).upcast_ty();
-                    (Some(vcx.mk_conj(&conjuncts)), Some(ext_body))
+                    let own = deps.require_dep::<LifetimePositionEnc>(
+                        RustTyDecomposition::identity(task_key),
+                    )?;
+                    let mut field_snaps = Vec::new();
+                    for &(field_ty, read) in &fields {
+                        let field_snap = read.call()(ext_snapshot.downcast_ty());
+                        field_snaps.push(Self::field_restrict(
+                            &own, field_ty, field_snap, keep, deps,
+                        )?);
+                    }
+                    let restrict_body =
+                        data.data.1.field_snaps_to_snap.call()(&field_snaps).upcast_ty();
+                    (
+                        Some(vcx.mk_conj(&conjuncts)),
+                        Some(ext_body),
+                        Some(restrict_body),
+                    )
                 }
                 TySpecifics::EnumLike(data) => {
                     let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
                     let discr = data.data.1.snap_to_discr_snap;
-                    // The variants whose fields have lifetime positions, with
-                    // their discriminants, fields and constructors.
+                    // The variants with lifetime positions.
                     let mut variants = Vec::new();
                     for variant in &data.variants {
                         let fields = variant
@@ -391,11 +527,8 @@ impl TaskEncoder for IndirectPredEnc {
                             conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
                         }
                     }
-                    // The fields of a variant are extended if both snapshots
-                    // are of that variant: the field predicates are guarded by
-                    // the discriminant of `pred`, and the variant of
-                    // `snapshot` must not change. Otherwise, `snapshot` stays
-                    // as it is.
+                    // Extend only if both snapshots have the variant: `pred`'s guards the field
+                    // predicates, and `snapshot`'s must not change.
                     let mut ext_body = ext_snapshot;
                     for (variant_discr, fields, cons) in variants.iter().rev() {
                         let field_snaps =
@@ -409,7 +542,30 @@ impl TaskEncoder for IndirectPredEnc {
                             ((snapshot_in_variant) && (pred_in_variant)) ? (extended) : (ext_body)
                         };
                     }
-                    (Some(vcx.mk_conj(&conjuncts)), Some(ext_body))
+                    let own = deps.require_dep::<LifetimePositionEnc>(
+                        RustTyDecomposition::identity(task_key),
+                    )?;
+                    let mut restrict_body = ext_snapshot;
+                    for (variant_discr, fields, cons) in variants.iter().rev() {
+                        let mut field_snaps = Vec::new();
+                        for &(field_ty, read) in fields {
+                            let field_snap = read.call()(ext_snapshot.downcast_ty());
+                            field_snaps.push(Self::field_restrict(
+                                &own, field_ty, field_snap, keep, deps,
+                            )?);
+                        }
+                        let restricted: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
+                        let in_variant = vcx
+                            .mk_eq_expr(discr.call()(ext_snapshot.downcast_ty()), *variant_discr);
+                        restrict_body = vir::expr! { vcx;
+                            (in_variant) ? (restricted) : (restrict_body)
+                        };
+                    }
+                    (
+                        Some(vcx.mk_conj(&conjuncts)),
+                        Some(ext_body),
+                        Some(restrict_body),
+                    )
                 }
                 TySpecifics::MutRef((data, pure_data)) => {
                     let referent_ty = data.referent.decompose(task_key.params);
@@ -417,8 +573,8 @@ impl TaskEncoder for IndirectPredEnc {
                     let addr = pure_data.deref_access.call()(k.downcast_ty());
                     let referent_pred = referent.ref_to_pred(vcx, addr, None);
                     let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
-                    // If the query contains lifetime 0, we want to read the snapshot from the heap,
-                    // otherwise, the snapshot of the referent is stored in our snapshot
+                    // With 'a in the query, the referent's snapshot is read from the heap,
+                    // otherwise it is the stored one.
                     let in_query = subqueries
                         .iter()
                         .find(|subquery| {
@@ -439,7 +595,7 @@ impl TaskEncoder for IndirectPredEnc {
                         if matches!(subquery.lifetime, GeneralizedLifetime::Region(_)) {
                             preds.push(referent_pred);
                         }
-                        // The positions of the referent's type are passed on to the referent like those of a field.
+                        // The referent's positions are passed on like a field's.
                         preds.extend(Self::field_preds(
                             &subqueries,
                             subquery,
@@ -453,10 +609,8 @@ impl TaskEncoder for IndirectPredEnc {
                             conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
                         }
                     }
-                    // The value is filled in with the referent's current
-                    // snapshot if the query contains the own lifetime, and
-                    // the stored value is kept otherwise. Either is then
-                    // extended at the positions of the referent's type.
+                    // The value is read from the heap if the query contains 'a and stored
+                    // otherwise; either is extended at the referent's positions.
                     let pred_addr = pure_data.deref_access.call()(ext_pred.downcast_ty());
                     let current_snap = referent.ref_to_snap(pred_addr);
                     let stored_snap: vir::ExprSnap<'vir> =
@@ -491,12 +645,47 @@ impl TaskEncoder for IndirectPredEnc {
                         pure_data.metadata_access.call()(ext_snapshot.downcast_ty()),
                         value.downcast_ty(),
                     );
-                    (Some(vcx.mk_conj(&conjuncts)), Some(ext_body.upcast_ty()))
+                    // With 'a kept, the referent is restricted like a field; otherwise the
+                    // reference is reset to its direct predicate's snapshot.
+                    let own = deps.require_dep::<LifetimePositionEnc>(
+                        RustTyDecomposition::identity(task_key),
+                    )?;
+                    let lifetime = own
+                        .positions()
+                        .find(|&p| matches!(own.lifetime(p), GeneralizedLifetime::Region(_)))
+                        .unwrap();
+                    let (lifetime, _) = own.interval(lifetime);
+                    let addr = pure_data.deref_access.call()(ext_snapshot.downcast_ty());
+                    let metadata = pure_data.metadata_access.call()(ext_snapshot.downcast_ty());
+                    let value: vir::ExprSnap<'vir> =
+                        pure_data.value_access.call()(ext_snapshot.downcast_ty()).upcast_ty();
+                    let value = Self::field_restrict(&own, referent_ty, value, keep, deps)?;
+                    let kept: vir::ExprSnap<'vir> =
+                        pure_data.prim_to_snap.call()(addr, metadata, value.downcast_ty())
+                            .upcast_ty();
+                    let arbitrary_value = deps
+                        .require_dep::<TyImpureEnc>(*task_key)?
+                        .expect_mutref()
+                        .arbitrary_value;
+                    let unextended: vir::ExprSnap<'vir> =
+                        arbitrary_value(addr, metadata, params.ty_exprs(), params.const_exprs())
+                            .upcast_ty();
+                    let in_keep = vcx.mk_set_in_expr(lifetime, keep);
+                    let restrict_body = vir::expr! { vcx; (in_keep) ? (kept) : (unextended) };
+                    (
+                        Some(vcx.mk_conj(&conjuncts)),
+                        Some(ext_body.upcast_ty()),
+                        Some(restrict_body),
+                    )
                 }
                 // A shared reference has no lifetime positions.
-                TySpecifics::ImmRef(_) => (Some(vcx.mk_bool::<true>()), Some(ext_snapshot)),
+                TySpecifics::ImmRef(_) => (
+                    Some(vcx.mk_bool::<true>()),
+                    Some(ext_snapshot),
+                    Some(ext_snapshot),
+                ),
                 // TODO: the remaining types.
-                _ => (None, None),
+                _ => (None, None, None),
             };
 
             let predicate_decl = vcx.mk_predicate(
@@ -547,14 +736,29 @@ impl TaskEncoder for IndirectPredEnc {
                 ext_body,
             );
 
-            Ok(((predicate_decl, ext_decl), ()))
+            let restrict_decl = vcx.mk_function(
+                restrict,
+                (
+                    snapshot_decl,
+                    params.ty_decls(),
+                    params.const_decls(),
+                    keep_decl,
+                ),
+                &[],
+                &[],
+                None,
+                restrict_body,
+            );
+
+            Ok(((predicate_decl, ext_decl, restrict_decl), ()))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for (predicate, ext) in Self::all_outputs_local_no_errors(program) {
+        for (predicate, ext, restrict) in Self::all_outputs_local_no_errors(program) {
             program.add_predicate(predicate);
             program.add_function(ext);
+            program.add_function(restrict);
         }
     }
 }
@@ -582,9 +786,7 @@ mod verification_tests {
         )
     }
 
-    /// Verifies the Viper code `viper` together with the indirect predicate
-    /// of the type alias `X` defined in `src` and the casts of the
-    /// predicates of its type arguments.
+    /// Like `verify_with_pred`, also with the casts of `X`'s type arguments.
     fn verify_with_casts(src: &str, viper: &str) -> Result<(), String> {
         verify(
             src,
@@ -992,9 +1194,8 @@ mod verification_tests {
         );
     }
 
-    /// In `&'a mut &'a mut i32`, both positions belong to `'a`, so the
-    /// predicate itself puts the inner one on the field snapshot extended by
-    /// the outer one.
+    /// In `&'a mut &'a mut i32`, the predicate puts the inner `'a` on the
+    /// snapshot extended by the outer one.
     #[test]
     fn nested_mutable_references_same_lifetime() {
         let src = "struct E<'a>(&'a mut &'a mut i32);
@@ -1104,9 +1305,8 @@ mod verification_tests {
         );
     }
 
-    /// The casts exchange the predicate of `&'a mut U` and that of a type
-    /// parameter instantiated with it, which lets `Option<&'a mut U>`'s
-    /// predicate be unfolded down to the referent.
+    /// The casts let `Option<&'a mut U>`'s predicate be unfolded down to the
+    /// referent.
     #[test]
     fn casts() {
         let src = "type X<'a, T> = Option<&'a mut T>;";
@@ -1123,6 +1323,15 @@ mod verification_tests {
               unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
               make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
               unfold p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+            }
+
+            // Restricting is the same on both sides of a cast.
+            method restrict(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1)
+            {
+              make_generic_ind_Ref_mutable(k, U, 0, 1)
+              assert restrict_Param(make_generic_s_Ref_mutable(k, U), s_Ref_mutable_type(U), Set(0)) ==
+                make_generic_s_Ref_mutable(restrict_Ref_mutable(k, U, Set(0)), U)
             }
 
             // Casting back and forth keeps the extension.
@@ -1173,5 +1382,89 @@ mod verification_tests {
                 "verification failed differently:\n{output}"
             ),
         }
+    }
+
+    /// 'a encloses 'b in `B` but not in `A`, so `A`'s predicate for 'b is on
+    /// the field snapshot with the extension by 'a removed.
+    #[test]
+    fn field_with_fewer_enclosing_positions() {
+        let src = "struct A<'a, 'b>(&'a mut i32, &'b mut i32);
+                   struct B<'a, 'b>(A<'a, 'b>, &'a mut &'b mut i32);
+                   type X<'a, 'b> = B<'a, 'b>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(k: s_B)
+              requires p_B_ind(k, 0, 1)
+              requires p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+              ensures p_A_ind(restrict_A(k.s_B_0, Set[Int]()), 1, 2)
+            {
+              unfold p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+            }
+            "#,
+        );
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_B)
+              requires p_B_ind(k, 0, 1)
+              requires p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+            {
+              unfold p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+              assert false
+            }
+            "#,
+            "Assert might fail",
+        );
+        // The field's snapshot itself may carry other extensions.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_B)
+              requires p_B_ind(k, 0, 1)
+              requires p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+              ensures p_A_ind(k.s_B_0, 1, 2)
+            {
+              unfold p_B_ind(ext_B(k, k, 0, 1), 1, 2)
+            }
+            "#,
+            "insufficient permission to access p_A_ind",
+        );
+    }
+
+    /// Restricting a mutable reference without its lifetime resets it to
+    /// the snapshot its direct predicate gives it.
+    #[test]
+    fn restrict_mutable_reference() {
+        let src = "type X<'a, T> = &'a mut T;";
+        assert_verifies(
+            src,
+            r#"
+            method unextended(a: Ref, m: s_Param, U: Type)
+              ensures restrict_Ref_mutable(p_Ref_mutable_arbitrary_value(a, m, U), U, Set[Int]()) ==
+                p_Ref_mutable_arbitrary_value(a, m, U)
+            {
+            }
+
+            method extended(k: s_Ref_mutable, U: Type)
+              requires p_Ref_mutable_ind(k, U, 0, 1)
+              ensures p_Ref_mutable_ind(k, U, 0, 1)
+              ensures restrict_Ref_mutable(ext_Ref_mutable(k, U, k, 0, 1), U, Set[Int]()) ==
+                restrict_Ref_mutable(k, U, Set[Int]())
+            {
+            }
+            "#,
+        );
+        // An arbitrary snapshot need not be unextended.
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_Ref_mutable, U: Type)
+              ensures restrict_Ref_mutable(k, U, Set[Int]()) == k
+            {
+            }
+            "#,
+            "Postcondition of test might not hold",
+        );
     }
 }

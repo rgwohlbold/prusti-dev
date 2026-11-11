@@ -23,9 +23,7 @@ pub enum GeneralizedLifetime<'tcx> {
     RegionsIn(RustTyDecomposition<'tcx>),
 }
 
-/// A lifetime position of a type, or the block of positions of a type
-/// parameter: the n-th generalized lifetime of the type, in the order of the
-/// positions. It is only meaningful in the graph it comes from.
+/// The n-th generalized lifetime of a type, in position order; only meaningful in its graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LifetimePosition(usize);
 
