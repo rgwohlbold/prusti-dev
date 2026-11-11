@@ -425,10 +425,8 @@ impl TaskEncoder for CastersEnc<Impure> {
     }
 }
 
-/// The casts between the indirect predicate `p_X_ind(k, ts.., lo, hi)` of the
-/// most generic version of a Rust type `X` and the indirect predicate
-/// `p_Param_ind(make_generic_s_X(k, ts..), X_type(ts..), lo, hi)` of a type
-/// parameter instantiated with it.
+/// The casts between `p_X_ind(k, ts.., lo, hi)` and
+/// `p_Param_ind(make_generic_s_X(k, ts..), X_type(ts..), lo, hi)`.
 #[derive(Debug, Clone, Copy)]
 pub struct IndirectCasters<'vir> {
     pub make_generic: IndirectCastIdn<'vir>,
@@ -448,12 +446,8 @@ pub type IndirectCastIdn<'vir> = MethodIdn<
 
 impl<'vir> task_encoder::OutputRefAny for IndirectCasters<'vir> {}
 
-/// Encodes the trusted methods `make_generic_ind_X` and `make_concrete_ind_X`
-/// for the most generic version of a Rust type `X`, given together with the
-/// type parameter to cast to (as for [`CastersEnc`]). A cast exchanges the
-/// two predicates, which hold the same permissions, and relates the snapshot
-/// extension functions of both sides: extending any snapshot `s` with the
-/// predicate on `k` is the same before and after the cast.
+/// Trusted methods exchanging a type's indirect predicate with that of a type parameter;
+/// extending or restricting any snapshot gives the same result on both sides.
 pub struct IndirectCastersEnc;
 
 impl TaskEncoder for IndirectCastersEnc {
@@ -532,10 +526,7 @@ impl TaskEncoder for IndirectCastersEnc {
             };
             let concrete_ext = concrete_ind.ext.call()(s, tys, consts, k, lo, hi);
             let generic_ext = param_ind.ext.call()(generic(s), &[ty], no_consts, generic_k, lo, hi);
-            // The extension of the side that is held after the cast equals
-            // that of the side that was held before it, for every snapshot.
-            // The quantifier is triggered by the extension function of the
-            // side held after the cast.
+            // Extending is the same on both sides; triggered by the side held after the cast.
             let same_ext = |trigger: vir::ExprSnap<'vir>,
                             after: vir::ExprSnap<'vir>,
                             before: vir::ExprSnap<'vir>| {
@@ -545,6 +536,19 @@ impl TaskEncoder for IndirectCastersEnc {
                     vcx.mk_eq_expr(after, vcx.mk_old_expr(before)),
                 )
             };
+            // Restricting does not depend on the heap, so it is the same on both sides.
+            let keep_decl = vcx.mk_local_decl("keep", vcx.mk_ty_set(vir::TYPE_INT));
+            let keep = vcx.mk_local_ex(keep_decl);
+            let concrete_restrict = concrete_ind.restrict.call()(s, tys, consts, keep);
+            let generic_restrict = param_ind.restrict.call()(generic(s), &[ty], no_consts, keep);
+            let same_restrict = vcx.mk_forall_expr(
+                vcx.alloc_slice(&[s_decl.as_dyn(), keep_decl.as_dyn()]),
+                vcx.alloc_slice(&[
+                    vcx.mk_trigger(&[generic_restrict]),
+                    vcx.mk_trigger(&[concrete_restrict]),
+                ]),
+                vcx.mk_eq_expr(generic_restrict, generic(concrete_restrict)),
+            );
 
             let decls = (
                 k_decl,
@@ -561,6 +565,7 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[
                     generic_pred,
                     same_ext(generic_ext, generic_ext, generic(concrete_ext)),
+                    same_restrict,
                 ]),
                 None,
             );
@@ -572,6 +577,7 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[
                     concrete_pred,
                     same_ext(concrete_ext, generic(concrete_ext), generic_ext),
+                    same_restrict,
                 ]),
                 None,
             );

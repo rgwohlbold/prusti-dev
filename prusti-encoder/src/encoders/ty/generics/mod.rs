@@ -8,6 +8,7 @@ pub mod r#trait;
 pub mod sizedness;
 pub mod arity;
 pub mod clamp;
+pub mod set_helper;
 pub mod lifetime_position;
 pub mod trait_fn;
 pub mod trait_impls;
