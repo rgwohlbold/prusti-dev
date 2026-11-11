@@ -149,6 +149,7 @@ fn main() {
             ]),
             // Silver
             java_class!("viper.silver.frontend.SilFrontend", vec![
+                method!("execute"),
                 method!("init"),
                 method!("setVerifier"),
                 method!("verification"),

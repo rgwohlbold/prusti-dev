@@ -9,7 +9,7 @@ use prusti_rustc_interface::{
     session::config::Input,
     span::FileName,
 };
-use std::{path::Path, process::Command};
+use std::{path::Path, sync::OnceLock};
 
 use vir::{Foldable, simplify::SimplifyCtx};
 
@@ -107,17 +107,18 @@ pub(super) fn dedent(s: &str) -> String {
 
 /// Compiles `src`, which defines the type alias `X`, calls `encode` with the
 /// aliased type, and verifies the program of everything encoded, followed by
-/// the Viper code `viper`, with Silicon. Returns Silicon's output if the
-/// verification fails.
+/// the Viper code `viper`, with Silicon. Returns Silicon's error messages if
+/// the verification fails.
 ///
-/// The program is kept in `target/viper-tests`, named after the test. Silicon
-/// gets it as text, while Prusti passes an AST, so a verdict could in
-/// principle differ from Prusti's.
+/// All tests share one JVM. The program is kept in `target/viper-tests`,
+/// named after the test. Silicon gets it as text, while Prusti passes an
+/// AST, so a verdict could in principle differ from Prusti's.
 pub(super) fn verify(
     src: &str,
     encode: impl for<'tcx> FnOnce(RustTyDecomposition<'tcx>) + Send,
     viper: &str,
 ) -> Result<(), String> {
+    static VIPER: OnceLock<viper::Viper> = OnceLock::new();
     thread_local! {
         static COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     }
@@ -136,35 +137,23 @@ pub(super) fn verify(
     let count = COUNT.with(|count| count.replace(count.get() + 1));
     let path = dir.join(format!("{test}-{count}.vpr"));
     std::fs::write(&path, format!("{program}\n{viper}")).unwrap();
-    let env = |name: &str| {
-        std::env::var(name)
-            .unwrap_or_else(|_| panic!("{name} is not set, run the tests with ./x.py"))
-    };
+    let z3 = std::env::var("Z3_EXE").expect("Z3_EXE is not set, run the tests with ./x.py");
     // The arguments that Prusti passes to Silicon, see
     // `prusti-server/src/verification_request.rs`.
-    let output = Command::new(Path::new(&env("JAVA_HOME")).join("bin/java"))
-        .args(["-Xss1024m", "-cp"])
-        .arg(Path::new(&env("VIPER_HOME")).join("viperserver.jar"))
-        .args(["viper.silicon.SiliconRunner", "--z3Exe"])
-        .arg(env("Z3_EXE"))
-        .args([
-            "--disableTerminationPlugin",
-            "--proverConfigArgs",
-            "smt.qi.eager_threshold=1000 model.partial=false smt.arith.solver=6",
-            "--logLevel",
-            "ERROR",
-        ])
-        .arg(&path)
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if stdout.contains("finished verification successfully") {
-        Ok(())
-    } else {
-        Err(format!(
-            "{stdout}{}(program: {})",
-            String::from_utf8_lossy(&output.stderr),
-            path.display()
-        ))
-    }
+    let args = [
+        "--z3Exe",
+        &z3,
+        "--disableTerminationPlugin",
+        "--proverConfigArgs",
+        "smt.qi.eager_threshold=1000 model.partial=false smt.arith.solver=6",
+        "--logLevel",
+        "ERROR",
+        path.to_str().unwrap(),
+    ]
+    .map(String::from);
+    VIPER
+        .get_or_init(viper::Viper::new_for_tests)
+        .attach_current_thread()
+        .verify_file_with_silicon(&args)
+        .map_err(|errors| format!("{}\n(program: {})", errors.join("\n"), path.display()))
 }
