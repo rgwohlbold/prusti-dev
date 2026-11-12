@@ -1532,38 +1532,38 @@ mod verification_tests {
     }
 
     /// Like `field_with_fewer_enclosing_positions`, with a recursive field
-    /// type: the field of an unextended snapshot gets `L`'s predicate for 'b
-    /// on its own snapshot, though the predicate is on the field reset by
+    /// type: the field of an unextended snapshot gets `List`'s predicate for
+    /// 'b on its own snapshot, though the predicate is on the field reset by
     /// `base` after fetching through 'a.
     #[test]
     fn recursive_field_with_fewer_enclosing_positions() {
-        let src = "struct L<'a, 'b> {
+        let src = "struct List<'a, 'b> {
                        x: &'a mut i32,
                        y: &'b mut i32,
-                       next: Option<Box<L<'a, 'b>>>,
+                       next: Option<Box<List<'a, 'b>>>,
                    }
-                   struct D<'a, 'b>(L<'a, 'b>, &'a mut &'b mut i32);
-                   type X<'a, 'b> = D<'a, 'b>;";
+                   struct Outer<'a, 'b>(List<'a, 'b>, &'a mut &'b mut i32);
+                   type X<'a, 'b> = Outer<'a, 'b>;";
         assert_verifies(
             src,
             r#"
-            method test(k: s_D)
-              requires base_D(k) == k
-              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
-              ensures p_L_ind(k.s_D_0, 1, 2)
+            method test(k: s_Outer)
+              requires base_Outer(k) == k
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              ensures p_List_ind(k.s_Outer_0, 1, 2)
             {
-              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
             }
             "#,
         );
         assert_fails(
             src,
             r#"
-            method test(k: s_D)
-              requires base_D(k) == k
-              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
+            method test(k: s_Outer)
+              requires base_Outer(k) == k
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
             {
-              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
               assert false
             }
             "#,
@@ -1571,34 +1571,34 @@ mod verification_tests {
         );
     }
 
-    /// `L`'s predicate for 'b on the reset field of `D` can be followed into
-    /// the next element: the snapshot in `Option` is reset, which the cast of
-    /// `Box<L>` turns into the reset concrete snapshot.
+    /// `List`'s predicate for 'b on the reset field of `Outer` can be followed
+    /// into the next element: the snapshot in `Option` is reset, which the
+    /// cast of `Box<List>` turns into the reset concrete snapshot.
     #[test]
     fn recursive_field_into_next() {
-        // The tuple's second element provides the casts of `Box<L>`.
-        let src = "struct L<'a, 'b> {
+        // The tuple's second element provides the casts of `Box<List>`.
+        let src = "struct List<'a, 'b> {
                        x: &'a mut i32,
                        y: &'b mut i32,
-                       next: Option<Box<L<'a, 'b>>>,
+                       next: Option<Box<List<'a, 'b>>>,
                    }
-                   struct D<'a, 'b>(L<'a, 'b>, &'a mut &'b mut i32);
-                   type X<'a, 'b> = (D<'a, 'b>, Box<L<'a, 'b>>);";
+                   struct Outer<'a, 'b>(List<'a, 'b>, &'a mut &'b mut i32);
+                   type X<'a, 'b> = (Outer<'a, 'b>, Box<List<'a, 'b>>);";
         let result = verify_with_casts(
             src,
             r#"
-            method test(k: s_D, b: s_Box)
-              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
-              requires k.s_D_0.s_L_2 ==
-                s_Option_1_cons(make_generic_s_Box(b, s_L_type(), s_Global_type()))
-              ensures p_Box_ind(base_Box(b, s_L_type(), s_Global_type()), s_L_type(), s_Global_type(), 1, 2)
+            method test(k: s_Outer, b: s_Box)
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires k.s_Outer_0.s_List_2 ==
+                s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
+              ensures p_Box_ind(base_Box(b, s_List_type(), s_Global_type()), s_List_type(), s_Global_type(), 1, 2)
             {
-              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
-              unfold p_L_ind(base_L(fetch_D(k, 0, 1).s_D_0), 1, 2)
-              unfold p_Option_ind(base_L(fetch_D(k, 0, 1).s_D_0).s_L_2,
-                s_Box_type(s_L_type(), s_Global_type()), 1, 2)
-              make_concrete_ind_Box(base_Box(b, s_L_type(), s_Global_type()),
-                s_L_type(), s_Global_type(), 1, 2)
+              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              unfold p_List_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0), 1, 2)
+              unfold p_Option_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0).s_List_2,
+                s_Box_type(s_List_type(), s_Global_type()), 1, 2)
+              make_concrete_ind_Box(base_Box(b, s_List_type(), s_Global_type()),
+                s_List_type(), s_Global_type(), 1, 2)
             }
             "#,
         );
@@ -1608,17 +1608,17 @@ mod verification_tests {
         let result = verify_with_casts(
             src,
             r#"
-            method test(k: s_D, b: s_Box)
-              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
-              requires k.s_D_0.s_L_2 ==
-                s_Option_1_cons(make_generic_s_Box(b, s_L_type(), s_Global_type()))
+            method test(k: s_Outer, b: s_Box)
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires k.s_Outer_0.s_List_2 ==
+                s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
             {
-              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
-              unfold p_L_ind(base_L(fetch_D(k, 0, 1).s_D_0), 1, 2)
-              unfold p_Option_ind(base_L(fetch_D(k, 0, 1).s_D_0).s_L_2,
-                s_Box_type(s_L_type(), s_Global_type()), 1, 2)
-              make_concrete_ind_Box(base_Box(b, s_L_type(), s_Global_type()),
-                s_L_type(), s_Global_type(), 1, 2)
+              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              unfold p_List_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0), 1, 2)
+              unfold p_Option_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0).s_List_2,
+                s_Box_type(s_List_type(), s_Global_type()), 1, 2)
+              make_concrete_ind_Box(base_Box(b, s_List_type(), s_Global_type()),
+                s_List_type(), s_Global_type(), 1, 2)
               assert false
             }
             "#,
