@@ -52,6 +52,15 @@ impl<'vir> EnclosureGraph<'vir> {
         self.lifetimes.indices()
     }
 
+    /// The positions, each after the positions enclosing it. A position
+    /// enclosing another one has fewer ancestors, since ancestors are
+    /// transitive and the graph has no cycles.
+    pub fn positions_outermost_first(&self) -> impl Iterator<Item = LifetimePosition> {
+        let mut positions = self.positions().collect::<Vec<_>>();
+        positions.sort_by_key(|&p| self.ancestors[p].len());
+        positions.into_iter()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lifetimes.is_empty()
     }
