@@ -756,16 +756,19 @@ impl TaskEncoder for IndirectPredEnc {
                     )) in (fetch_body)
                 }
             });
-            // At a type parameter, `fetch` and `plug` are abstract. What `fetch` reads
-            // differs from its key only at the fetched positions, so plugging it back in
-            // gives it again; field snapshots of types containing the parameter have this
-            // form.
+            // At a type parameter, `fetch`, `plug` and `base` are abstract. What `fetch`
+            // reads differs from its key only at the fetched positions, so plugging it
+            // back in gives it again, and resetting it gives the reset key; field
+            // snapshots of types containing the parameter have these forms.
             let mut fetch_posts = Vec::new();
             if ty.specifics.is_param() {
                 let result = vcx.mk_result(snapshot);
                 let plugged =
                     plug.call()(k, params.ty_exprs(), params.const_exprs(), result, lo, hi);
                 fetch_posts.push(vcx.mk_eq_expr(plugged, result));
+                let base_result = base.call()(result, params.ty_exprs(), params.const_exprs());
+                let base_key = base.call()(k, params.ty_exprs(), params.const_exprs());
+                fetch_posts.push(vcx.mk_eq_expr(base_result, base_key));
             }
             let fetch_decl = vcx.mk_function(
                 fetch,
@@ -1486,6 +1489,46 @@ mod verification_tests {
             }
             "#,
             "insufficient permission to access p_A_ind",
+        );
+    }
+
+    /// Like `field_with_fewer_enclosing_positions`, with a recursive field
+    /// type: the field of an unextended snapshot gets `L`'s predicate for 'b
+    /// on its own snapshot, though the predicate is on the field reset by
+    /// `base` after fetching through 'a.
+    #[test]
+    fn recursive_field_with_fewer_enclosing_positions() {
+        let src = "struct L<'a, 'b> {
+                       x: &'a mut i32,
+                       y: &'b mut i32,
+                       next: Option<Box<L<'a, 'b>>>,
+                   }
+                   struct D<'a, 'b>(L<'a, 'b>, &'a mut &'b mut i32);
+                   type X<'a, 'b> = D<'a, 'b>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(k: s_D)
+              requires base_D(k) == k
+              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              ensures p_L_ind(k.s_D_0, 1, 2)
+            {
+              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+            }
+            "#,
+        );
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_D)
+              requires base_D(k) == k
+              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
+            {
+              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              assert false
+            }
+            "#,
+            "Assert might fail",
         );
     }
 
