@@ -9,6 +9,7 @@ pub mod sizedness;
 pub mod arity;
 pub mod clamp;
 pub mod lifetime_position;
+pub mod merge_split;
 pub mod trait_fn;
 pub mod trait_impls;
 mod ty_expr;

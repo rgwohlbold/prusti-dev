@@ -65,6 +65,68 @@ pub struct IndirectPredRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
+/// The positions `[first, end)` of an instantiated type, merged on the
+/// snapshot `k`.
+pub(crate) struct LifetimePositionBlock<'vir, 'a> {
+    pub(crate) graph: &'a EnclosureGraph<'vir>,
+    pub(crate) first: LifetimePosition,
+    pub(crate) end: LifetimePosition,
+    pub(crate) ind: IndirectPredRef<'vir>,
+    pub(crate) args: GArgsTy<'vir>,
+    pub(crate) k: vir::ExprSnap<'vir>,
+}
+
+impl<'vir> LifetimePositionBlock<'vir, '_> {
+    fn contains(&self, p: LifetimePosition) -> bool {
+        self.first <= p && p < self.end
+    }
+
+    /// The positions of the block, each after the positions enclosing it.
+    pub(crate) fn positions(&self) -> Vec<LifetimePosition> {
+        self.graph
+            .positions_outermost_first()
+            .filter(|&p| self.contains(p))
+            .collect()
+    }
+
+    /// The key of `p`'s predicate: `k` with what the positions of the block
+    /// enclosing `p` read plugged in, as in the body of the merged predicate.
+    pub(crate) fn key(&self, p: LifetimePosition) -> vir::ExprSnap<'vir> {
+        let ancestors = self
+            .graph
+            .ancestors(p)
+            .iter()
+            .copied()
+            .filter(|&q| self.contains(q))
+            .collect::<Vec<_>>();
+        self.fold(&ancestors)
+    }
+
+    /// `k` with what each of `positions` reads through its key plugged in, in
+    /// turn.
+    pub(crate) fn fold(&self, positions: &[LifetimePosition]) -> vir::ExprSnap<'vir> {
+        let (tys, consts) = (self.args.get_ty(), self.args.get_const());
+        let mut snap = self.k;
+        for &q in positions {
+            let (lo, hi) = self.graph.interval(q);
+            let fetched = self.ind.fetch.call()(self.key(q), tys, consts, lo, hi);
+            snap = self.ind.plug.call()(snap, tys, consts, fetched, lo, hi);
+        }
+        snap
+    }
+
+    pub(crate) fn predicate(
+        &self,
+        key: vir::ExprSnap<'vir>,
+        lo: vir::ExprInt<'vir>,
+        hi: vir::ExprInt<'vir>,
+    ) -> vir::ExprBool<'vir> {
+        let pred = self.ind.predicate;
+        let (tys, consts) = (self.args.get_ty(), self.args.get_const());
+        vir::expr! { acc([pred](key, [..[tys]], [..[consts]], lo, hi)) }
+    }
+}
+
 /// The part of a query `[lo, hi)` at one own position.
 #[derive(Clone, Copy)]
 struct Subquery<'vir> {
