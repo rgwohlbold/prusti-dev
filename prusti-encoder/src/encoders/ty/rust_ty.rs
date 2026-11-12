@@ -74,6 +74,79 @@ impl<'tcx> RustTyDecomposition<'tcx> {
         Self::new(ty, args)
     }
 
+    /// The decomposition with the type parameters in `args` renamed to `P0`,
+    /// `P1`, .. in order of first occurrence and bound by a context of just
+    /// those, and with lifetimes erased: instantiations that differ only in
+    /// their context or lifetimes become equal. `None` if `args` contain a
+    /// const parameter, whose type the new context would have to give.
+    pub fn canonical(self) -> Option<Self> {
+        vir::with_vcx(|vcx| {
+            let tcx = vcx.tcx();
+            let new_param = |index: usize| {
+                let name = symbol::Symbol::intern(&format!("P{index}"));
+                ty::Ty::new_param(tcx, index as u32, name)
+            };
+            let mut params = Vec::new();
+            let mut has_const_param = false;
+            let mut folder = ty::BottomUpFolder {
+                tcx,
+                ty_op: |t: ty::Ty<'tcx>| {
+                    let ty::TyKind::Param(_) = t.kind() else {
+                        return t;
+                    };
+                    let index = params.iter().position(|&p| p == t).unwrap_or_else(|| {
+                        params.push(t);
+                        params.len() - 1
+                    });
+                    new_param(index)
+                },
+                lt_op: |_| tcx.lifetimes.re_erased,
+                ct_op: |c: ty::Const<'tcx>| {
+                    has_const_param |= matches!(c.kind(), ty::ConstKind::Param(_));
+                    c
+                },
+            };
+            let args = tcx.mk_args_from_iter(
+                self.args
+                    .args()
+                    .iter()
+                    .map(|arg| ty::TypeFoldable::fold_with(*arg, &mut folder)),
+            );
+            if has_const_param {
+                return None;
+            }
+            let context = tcx
+                .mk_args_from_iter((0..params.len()).map(|i| ty::GenericArg::from(new_param(i))));
+            Some(Self::new(
+                self.ty,
+                GArgs::new(GParams::empty_env(context), args),
+            ))
+        })
+    }
+
+    /// The name of the type with its type and const arguments, e.g.
+    /// `Option<Ref_mutable<P0>>`; lifetimes are left out.
+    pub fn instantiated_name(self) -> String {
+        let args = self
+            .args
+            .args()
+            .iter()
+            .filter_map(|arg| match arg.kind() {
+                ty::GenericArgKind::Lifetime(_) => None,
+                ty::GenericArgKind::Type(t) => Some(match t.kind() {
+                    ty::TyKind::Param(_) | ty::TyKind::Alias(..) => t.to_string(),
+                    _ => Self::from_ty(t, self.args.context()).instantiated_name(),
+                }),
+                ty::GenericArgKind::Const(c) => Some(c.to_string()),
+            })
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            self.ty.name().to_string()
+        } else {
+            format!("{}<{}>", self.ty.name(), args.join(", "))
+        }
+    }
+
     pub fn param() -> RustTy<'tcx> {
         let gty = TyData::<RustTyDatas>::args_from_tys([TySpecifics::new_param_ty(0)]);
         let data = RustTyData {
