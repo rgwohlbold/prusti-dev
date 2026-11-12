@@ -304,6 +304,44 @@ mod verification_tests {
         );
     }
 
+    /// `&'a mut T` as a type parameter, in a context generic in `T`.
+    #[test]
+    fn generic_reference_as_param() {
+        assert_merge_split(
+            "type X<'a, T> = &'a mut T;",
+            &[(0, 2)],
+            r#"
+            define RT(T) s_Ref_mutable_type(T)
+            define G(k, T) make_generic_s_Ref_mutable(k, T)
+            // The key of the predicate of the positions of `T`: `k` with what 'a
+            // reads plugged in.
+            define KT(k, T) plug_Ref_mutable(k, T, fetch_Ref_mutable(k, T, 0, 1), 0, 1)
+
+            method merge(k: s_Ref_mutable, T: Type)
+              requires p_Ref_mutable_ind(k, T, 0, 1)
+              requires p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
+              ensures p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
+              ensures fetch_Param(G(k, T), RT(T), 0, 1 + arity(T)) ==
+                old(G(fetch_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T))
+            {
+              merge_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
+              make_generic_ind_Ref_mutable(k, T, 0, 1 + arity(T))
+            }
+
+            method split(k: s_Ref_mutable, T: Type)
+              requires p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
+              ensures p_Ref_mutable_ind(k, T, 0, 1)
+              ensures p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
+              ensures G(fetch_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T) ==
+                old(fetch_Param(G(k, T), RT(T), 0, 1 + arity(T)))
+            {
+              make_concrete_ind_Ref_mutable(k, T, 0, 1 + arity(T))
+              split_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
+            }
+            "#,
+        );
+    }
+
     /// `&'a mut &'b mut T` as `&'c mut U`: merges `'b` and `T`.
     #[test]
     fn generic_nested_reference_as_reference_to_param() {
