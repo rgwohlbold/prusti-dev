@@ -97,8 +97,10 @@ impl IndirectPredEnc {
             let sub = |a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>| -> vir::ExprInt<'vir> {
                 vcx.mk_bin_op_expr(vir::BinOpKind::Sub, a, b).downcast_ty()
             };
+            // A position's predicate is on its key fetched through the positions enclosing
+            // it, so their predicates and fetches come first.
             graph
-                .positions()
+                .positions_outermost_first()
                 .map(|p| {
                     let lifetime = graph.lifetime(p);
                     let enclosing = graph
@@ -315,7 +317,7 @@ impl IndirectPredEnc {
     ) -> Result<Vec<vir::ExprBool<'vir>>, EncodeFullError<'vir, Self>> {
         let graph = deps.require_dep::<LifetimePositionEnc>(field_ty)?;
         let mut preds = Vec::new();
-        for p in graph.positions() {
+        for p in graph.positions_outermost_first() {
             if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
@@ -351,7 +353,7 @@ impl IndirectPredEnc {
             return Ok(field_snap);
         }
         let mut snap = field_snap;
-        for p in graph.positions() {
+        for p in graph.positions_outermost_first() {
             if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
@@ -1252,6 +1254,43 @@ mod verification_tests {
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
+        );
+    }
+
+    /// In `N<'b, 'a>`, `'b` comes first but lies behind `'a`. Fetching both
+    /// positions is fetching `'a`, then `'b` on the result.
+    #[test]
+    fn enclosed_lifetime_first() {
+        let src = "struct N<'b, 'a>(&'a mut &'b mut i32);
+                   type X<'b, 'a> = N<'b, 'a>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(k: s_N)
+              requires p_N_ind(k, 0, 2)
+            {
+              var all: s_N := fetch_N(k, 0, 2)
+              unfold p_N_ind(k, 0, 2)
+              fold p_N_ind(k, 1, 2)
+              fold p_N_ind(fetch_N(k, 1, 2), 0, 1)
+              assert all == fetch_N(fetch_N(k, 1, 2), 0, 1)
+            }
+            "#,
+        );
+        assert_fails(
+            src,
+            r#"
+            method test(k: s_N)
+              requires p_N_ind(k, 0, 2)
+            {
+              var all: s_N := fetch_N(k, 0, 2)
+              unfold p_N_ind(k, 0, 2)
+              fold p_N_ind(k, 1, 2)
+              fold p_N_ind(fetch_N(k, 1, 2), 0, 1)
+              assert false
+            }
+            "#,
+            "Assert might fail",
         );
     }
 
