@@ -447,7 +447,8 @@ pub type IndirectCastIdn<'vir> = MethodIdn<
 impl<'vir> task_encoder::OutputRefAny for IndirectCasters<'vir> {}
 
 /// Trusted methods exchanging a type's indirect predicate with that of a type parameter;
-/// extending or restricting any snapshot gives the same result on both sides.
+/// fetching through the predicate and resetting any snapshot give the same result on both
+/// sides.
 pub struct IndirectCastersEnc;
 
 impl TaskEncoder for IndirectCastersEnc {
@@ -524,30 +525,18 @@ impl TaskEncoder for IndirectCastersEnc {
             let generic_pred = vir::expr! { vcx;
                 acc([param_ind.predicate](generic_k, [..[&[ty]]], [..[no_consts]], lo, hi))
             };
-            let concrete_ext = concrete_ind.ext.call()(s, tys, consts, k, lo, hi);
-            let generic_ext = param_ind.ext.call()(generic(s), &[ty], no_consts, generic_k, lo, hi);
-            // Extending is the same on both sides; triggered by the side held after the cast.
-            let same_ext = |trigger: vir::ExprSnap<'vir>,
-                            after: vir::ExprSnap<'vir>,
-                            before: vir::ExprSnap<'vir>| {
-                vcx.mk_forall_expr(
-                    vcx.alloc_slice(&[s_decl]),
-                    vcx.alloc_slice(&[vcx.mk_trigger(&[trigger])]),
-                    vcx.mk_eq_expr(after, vcx.mk_old_expr(before)),
-                )
-            };
-            // Restricting does not depend on the heap, so it is the same on both sides.
-            let keep_decl = vcx.mk_local_decl("keep", vcx.mk_ty_set(vir::TYPE_INT));
-            let keep = vcx.mk_local_ex(keep_decl);
-            let concrete_restrict = concrete_ind.restrict.call()(s, tys, consts, keep);
-            let generic_restrict = param_ind.restrict.call()(generic(s), &[ty], no_consts, keep);
-            let same_restrict = vcx.mk_forall_expr(
-                vcx.alloc_slice(&[s_decl.as_dyn(), keep_decl.as_dyn()]),
+            let concrete_fetch = generic(concrete_ind.fetch.call()(k, tys, consts, lo, hi));
+            let generic_fetch = param_ind.fetch.call()(generic_k, &[ty], no_consts, lo, hi);
+            // Resetting does not depend on the heap, so it is the same on both sides.
+            let concrete_base = concrete_ind.base.call()(s, tys, consts);
+            let generic_base = param_ind.base.call()(generic(s), &[ty], no_consts);
+            let same_base = vcx.mk_forall_expr(
+                vcx.alloc_slice(&[s_decl]),
                 vcx.alloc_slice(&[
-                    vcx.mk_trigger(&[generic_restrict]),
-                    vcx.mk_trigger(&[concrete_restrict]),
+                    vcx.mk_trigger(&[generic_base]),
+                    vcx.mk_trigger(&[concrete_base]),
                 ]),
-                vcx.mk_eq_expr(generic_restrict, generic(concrete_restrict)),
+                vcx.mk_eq_expr(generic_base, generic(concrete_base)),
             );
 
             let decls = (
@@ -564,8 +553,8 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[concrete_pred]),
                 vcx.alloc_slice(&[
                     generic_pred,
-                    same_ext(generic_ext, generic_ext, generic(concrete_ext)),
-                    same_restrict,
+                    vcx.mk_eq_expr(generic_fetch, vcx.mk_old_expr(concrete_fetch)),
+                    same_base,
                 ]),
                 None,
             );
@@ -576,8 +565,8 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[generic_pred]),
                 vcx.alloc_slice(&[
                     concrete_pred,
-                    same_ext(concrete_ext, generic(concrete_ext), generic_ext),
-                    same_restrict,
+                    vcx.mk_eq_expr(concrete_fetch, vcx.mk_old_expr(generic_fetch)),
+                    same_base,
                 ]),
                 None,
             );
