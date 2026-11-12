@@ -446,9 +446,9 @@ pub type IndirectCastIdn<'vir> = MethodIdn<
 
 impl<'vir> task_encoder::OutputRefAny for IndirectCasters<'vir> {}
 
-/// Trusted methods exchanging a type's indirect predicate with that of a type parameter;
-/// fetching through the predicate and resetting any snapshot give the same result on both
-/// sides.
+/// Trusted methods exchanging a type's indirect predicate with that of a type parameter,
+/// which state that fetching through the predicate gives the same result on both sides, and
+/// an axiom stating the same for resetting any snapshot.
 pub struct IndirectCastersEnc;
 
 impl TaskEncoder for IndirectCastersEnc {
@@ -457,7 +457,7 @@ impl TaskEncoder for IndirectCastersEnc {
 
     type TaskDescription<'vir> = (RustTy<'vir>, RustTy<'vir>);
     type OutputRef<'vir> = IndirectCasters<'vir>;
-    type OutputFullLocal<'vir> = [vir::Method<'vir>; 2];
+    type OutputFullLocal<'vir> = ([vir::Method<'vir>; 2], vir::Domain<'vir>);
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
         *task
@@ -527,16 +527,26 @@ impl TaskEncoder for IndirectCastersEnc {
             };
             let concrete_fetch = generic(concrete_ind.fetch.call()(k, tys, consts, lo, hi));
             let generic_fetch = param_ind.fetch.call()(generic_k, &[ty], no_consts, lo, hi);
-            // Resetting does not depend on the heap, so it is the same on both sides.
+            // Resetting does not depend on the heap, so it is the same on both sides
+            // everywhere, not only after a cast.
             let concrete_base = concrete_ind.base.call()(s, tys, consts);
             let generic_base = param_ind.base.call()(generic(s), &[ty], no_consts);
-            let same_base = vcx.mk_forall_expr(
-                vcx.alloc_slice(&[s_decl]),
-                vcx.alloc_slice(&[
-                    vcx.mk_trigger(&[generic_base]),
-                    vcx.mk_trigger(&[concrete_base]),
-                ]),
-                vcx.mk_eq_expr(generic_base, generic(concrete_base)),
+            let same_base = generic(concrete_base);
+            let same_base = vir::expr! { vcx;
+                forall [s_decl], ..[generics.ty_decls()], ..[generics.const_decls()]
+                    :: { [generic_base] }
+                    ([generic_base]) == ([same_base])
+            };
+            let axiom = vcx.mk_domain_axiom(
+                vir::vir_format_identifier!(vcx, "base_cast_{base_name}"),
+                same_base,
+            );
+            let domain = vcx.mk_domain(
+                vir::vir_format_identifier!(vcx, "IndirectCasts_{base_name}"),
+                &[],
+                vcx.alloc_slice(&[axiom]),
+                &[],
+                None,
             );
 
             let decls = (
@@ -554,7 +564,6 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[
                     generic_pred,
                     vcx.mk_eq_expr(generic_fetch, vcx.mk_old_expr(concrete_fetch)),
-                    same_base,
                 ]),
                 None,
             );
@@ -566,19 +575,19 @@ impl TaskEncoder for IndirectCastersEnc {
                 vcx.alloc_slice(&[
                     concrete_pred,
                     vcx.mk_eq_expr(concrete_fetch, vcx.mk_old_expr(generic_fetch)),
-                    same_base,
                 ]),
                 None,
             );
-            Ok(([make_generic, make_concrete], ()))
+            Ok((([make_generic, make_concrete], domain), ()))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for methods in Self::all_outputs_local_no_errors(program) {
+        for (methods, domain) in Self::all_outputs_local_no_errors(program) {
             for method in methods {
                 program.add_method(method);
             }
+            program.add_domain(domain);
         }
     }
 }
