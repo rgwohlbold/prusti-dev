@@ -46,7 +46,7 @@ pub struct IndirectPredRef<'vir> {
         vir::Snap,
     >,
     /// `plug_X(s, T.., t, lo, hi)`: `s` with the references at `[lo, hi)` holding `t`'s
-    /// referents, each with everything behind it.
+    /// referents, in which the references at other positions are reset.
     pub plug: FunctionIdn<
         'vir,
         (
@@ -355,18 +355,26 @@ impl IndirectPredEnc {
         let mut field_snaps = Vec::new();
         for &(field_ty, read) in fields {
             let field_snap = read.call()(s.downcast_ty());
-            if deps
-                .require_dep::<LifetimePositionEnc>(field_ty)?
-                .is_empty()
-            {
-                field_snaps.push(field_snap);
-                continue;
-            }
-            let base = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.base;
-            let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-            field_snaps.push(base.call()(field_snap, args.get_ty(), args.get_const()));
+            field_snaps.push(Self::field_base(field_ty, field_snap, deps)?);
         }
         Ok(field_snaps)
+    }
+
+    /// `field_snap` of type `field_ty` reset by `base`.
+    fn field_base<'vir>(
+        field_ty: RustTyDecomposition<'vir>,
+        field_snap: vir::ExprSnap<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
+        if deps
+            .require_dep::<LifetimePositionEnc>(field_ty)?
+            .is_empty()
+        {
+            return Ok(field_snap);
+        }
+        let base = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.base;
+        let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
+        Ok(base.call()(field_snap, args.get_ty(), args.get_const()))
     }
 
     /// The field predicates for `subquery`: one per position of its lifetime in `field_ty`.
@@ -749,19 +757,21 @@ impl TaskEncoder for IndirectPredEnc {
                     let metadata = pure_data.metadata_access.call()(k.downcast_ty());
                     let fetch_body =
                         pure_data.prim_to_snap.call()(addr, metadata, value.downcast_ty());
-                    // With 'a in the interval, the referent is taken from `t` as a whole;
-                    // otherwise the referent's positions are plugged in like a field's.
+                    // The referent's positions in the interval are plugged in like a
+                    // field's: into `t`'s referent reset by `base` if 'a is in the
+                    // interval, into `s`'s otherwise. A position behind 'a that is not
+                    // in the interval is thus reset, even if `t` fetched it.
                     let s_addr = pure_data.deref_access.call()(s.downcast_ty());
                     let s_metadata = pure_data.metadata_access.call()(s.downcast_ty());
                     let s_value: vir::ExprSnap<'vir> =
                         pure_data.value_access.call()(s.downcast_ty()).upcast_ty();
                     let t_value: vir::ExprSnap<'vir> =
                         pure_data.value_access.call()(t.downcast_ty()).upcast_ty();
-                    let mut plugged = s_value;
+                    let t_base = Self::field_base(referent_ty, t_value, deps)?;
+                    let mut value = vir::expr! { vcx; (in_query) ? (t_base) : (s_value) };
                     for &subquery in &subqueries {
-                        plugged = Self::field_plug(subquery, referent_ty, plugged, t_value, deps)?;
+                        value = Self::field_plug(subquery, referent_ty, value, t_value, deps)?;
                     }
-                    let value = vir::expr! { vcx; (in_query) ? (t_value) : (plugged) };
                     let plug_body =
                         pure_data.prim_to_snap.call()(s_addr, s_metadata, value.downcast_ty());
                     // Reset, the reference has the snapshot its direct predicate gives it.
@@ -1692,6 +1702,54 @@ mod verification_tests {
                 "verification failed differently:\n{output}"
             ),
         }
+    }
+
+    /// 'y encloses 'z in `C` but not in `F`, and lies behind 'x in both: `C`
+    /// gives `F`'s predicates for 'y and 'z on one snapshot, the field
+    /// fetched through 'x, as `F` has them.
+    #[test]
+    fn field_with_fewer_enclosing_positions_behind_reference() {
+        let src = "struct F<'x, 'y, 'z>(&'x mut (&'y mut i32, &'z mut i32));
+                   struct C<'x, 'y, 'z>(F<'x, 'y, 'z>, &'y mut &'z mut i32);
+                   type X<'x, 'y, 'z> = C<'x, 'y, 'z>;";
+        let keys = r#"
+            // The keys of 'y and 'z: `k` fetched through their ancestors.
+            define KY(k) plug_C(k, fetch_C(k, 0, 1), 0, 1)
+            define KZ(k) plug_C(KY(k), fetch_C(KY(k), 1, 2), 1, 2)
+            "#;
+        assert_verifies(
+            src,
+            &format!(
+                "{keys}{}",
+                r#"
+            method test(k: s_C)
+              requires p_C_ind(k, 0, 1) && p_C_ind(KY(k), 1, 2) && p_C_ind(KZ(k), 2, 3)
+              ensures p_C_ind(k, 0, 1)
+              ensures p_F_ind(KY(k).s_C_0, 1, 2) && p_F_ind(KY(k).s_C_0, 2, 3)
+            {
+              // 'z first: its key reads through the predicate of 'y.
+              unfold p_C_ind(KZ(k), 2, 3)
+              unfold p_C_ind(KY(k), 1, 2)
+            }
+            "#
+            ),
+        );
+        assert_fails(
+            src,
+            &format!(
+                "{keys}{}",
+                r#"
+            method test(k: s_C)
+              requires p_C_ind(k, 0, 1) && p_C_ind(KY(k), 1, 2) && p_C_ind(KZ(k), 2, 3)
+            {
+              unfold p_C_ind(KZ(k), 2, 3)
+              unfold p_C_ind(KY(k), 1, 2)
+              assert false
+            }
+            "#
+            ),
+            "Assert might fail",
+        );
     }
 
     /// Resetting a mutable reference gives it the snapshot its direct
