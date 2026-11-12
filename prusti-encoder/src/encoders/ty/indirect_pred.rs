@@ -1532,6 +1532,67 @@ mod verification_tests {
         );
     }
 
+    /// `L`'s predicate for 'b on the reset field of `D` can be followed into
+    /// the next element: the snapshot in `Option` is reset, which the cast of
+    /// `Box<L>` turns into the reset concrete snapshot.
+    #[test]
+    fn recursive_field_into_next() {
+        // The tuple's second element provides the casts of `Box<L>`.
+        let src = "struct L<'a, 'b> {
+                       x: &'a mut i32,
+                       y: &'b mut i32,
+                       next: Option<Box<L<'a, 'b>>>,
+                   }
+                   struct D<'a, 'b>(L<'a, 'b>, &'a mut &'b mut i32);
+                   type X<'a, 'b> = (D<'a, 'b>, Box<L<'a, 'b>>);";
+        let result = verify_with_casts(
+            src,
+            r#"
+            method test(k: s_D, b: s_Box)
+              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              requires k.s_D_0.s_L_2 ==
+                s_Option_1_cons(make_generic_s_Box(b, s_L_type(), s_Global_type()))
+              ensures p_Box_ind(base_Box(b, s_L_type(), s_Global_type()), s_L_type(), s_Global_type(), 1, 2)
+            {
+              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              unfold p_L_ind(base_L(fetch_D(k, 0, 1).s_D_0), 1, 2)
+              unfold p_Option_ind(base_L(fetch_D(k, 0, 1).s_D_0).s_L_2,
+                s_Box_type(s_L_type(), s_Global_type()), 1, 2)
+              make_concrete_ind_Box(base_Box(b, s_L_type(), s_Global_type()),
+                s_L_type(), s_Global_type(), 1, 2)
+            }
+            "#,
+        );
+        if let Err(output) = result {
+            panic!("verification failed:\n{output}");
+        }
+        let result = verify_with_casts(
+            src,
+            r#"
+            method test(k: s_D, b: s_Box)
+              requires p_D_ind(k, 0, 1) && p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              requires k.s_D_0.s_L_2 ==
+                s_Option_1_cons(make_generic_s_Box(b, s_L_type(), s_Global_type()))
+            {
+              unfold p_D_ind(fetch_D(k, 0, 1), 1, 2)
+              unfold p_L_ind(base_L(fetch_D(k, 0, 1).s_D_0), 1, 2)
+              unfold p_Option_ind(base_L(fetch_D(k, 0, 1).s_D_0).s_L_2,
+                s_Box_type(s_L_type(), s_Global_type()), 1, 2)
+              make_concrete_ind_Box(base_Box(b, s_L_type(), s_Global_type()),
+                s_L_type(), s_Global_type(), 1, 2)
+              assert false
+            }
+            "#,
+        );
+        match result {
+            Ok(()) => panic!("verification succeeded"),
+            Err(output) => assert!(
+                output.contains("Assert might fail"),
+                "verification failed differently:\n{output}"
+            ),
+        }
+    }
+
     /// Resetting a mutable reference gives it the snapshot its direct
     /// predicate gives it.
     #[test]
