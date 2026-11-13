@@ -419,7 +419,8 @@ fn same_arg_types(x: &FuncAppGenData<'_, (), !>, y: &FuncAppGenData<'_, (), !>) 
 }
 
 /// Syntactic equality of the expressions the equations compare (locals,
-/// constants, applications and field reads), `false` for anything else.
+/// constants, operations, applications and field reads), `false` for
+/// anything else.
 pub fn syntactic_eq<'vir>(a: ExprDyn<'vir>, b: ExprDyn<'vir>) -> bool {
     if std::ptr::eq(a.kind, b.kind) {
         return true;
@@ -427,6 +428,12 @@ pub fn syntactic_eq<'vir>(a: ExprDyn<'vir>, b: ExprDyn<'vir>) -> bool {
     match (a.kind, b.kind) {
         (ExprKindGenData::Local(x), ExprKindGenData::Local(y)) => x.name == y.name,
         (ExprKindGenData::Const(x), ExprKindGenData::Const(y)) => x == y,
+        (ExprKindGenData::UnOp(x), ExprKindGenData::UnOp(y)) => {
+            x.kind == y.kind && syntactic_eq(x.expr.as_dyn(), y.expr.as_dyn())
+        }
+        (ExprKindGenData::BinOp(x), ExprKindGenData::BinOp(y)) => {
+            x.kind == y.kind && syntactic_eq(x.lhs, y.lhs) && syntactic_eq(x.rhs, y.rhs)
+        }
         (ExprKindGenData::FuncApp(x), ExprKindGenData::FuncApp(y)) => {
             same_arg_types(x, y)
                 && x.result_ty == y.result_ty

@@ -30,6 +30,19 @@ pub(crate) fn add<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::Ex
     })
 }
 
+/// The difference `a - b`, folded if both are literals, `b` is `0`, or both are the same.
+pub(crate) fn sub<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'vir> {
+    vir::with_vcx(|vcx| match (a.kind, b.kind) {
+        (
+            vir::ExprKindGenData::Const(vir::ConstData::Int(x)),
+            vir::ExprKindGenData::Const(vir::ConstData::Int(y)),
+        ) if x >= y => vcx.mk_const_expr(vir::ConstData::Int(x - y)).downcast_ty(),
+        (_, vir::ExprKindGenData::Const(vir::ConstData::Int(0))) => a,
+        _ if vir::simplify::syntactic_eq(a.as_dyn(), b.as_dyn()) => vcx.mk_uint::<0>(),
+        _ => vcx.mk_bin_op_expr(vir::BinOpKind::Sub, a, b).downcast_ty(),
+    })
+}
+
 fn arity_fn_ident<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
     vir::FunctionIdn::new(vir::ViperIdent::new("arity"), vir::TYPE_TYVAL, vir::TYPE_INT)
 }

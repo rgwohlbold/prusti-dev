@@ -7,8 +7,8 @@ use super::{
     RustTy, RustTyDecomposition,
     data::TySpecifics,
     generics::{
-        GArgsTyEnc, GenericParamsEnc, TyExprEnc,
-        arity::{ArityEnc, add},
+        GArgsTyEnc, GenericParamsEnc,
+        arity::{TyArityEnc, add, sub},
         clamp::ClampEnc,
         lifetime_position::{
             EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
@@ -168,19 +168,32 @@ struct Subquery<'vir> {
     enclosing: &'vir [GeneralizedLifetime<'vir>],
     /// Whether the query contains part of this position.
     guard: vir::ExprBool<'vir>,
-    /// The part of the query at this position, empty if `guard` is false.
-    start: vir::ExprInt<'vir>,
-    end: vir::ExprInt<'vir>,
+    /// The query.
+    lo: vir::ExprInt<'vir>,
+    hi: vir::ExprInt<'vir>,
+    /// The position covers `[x, x + width)` of the type.
+    x: vir::ExprInt<'vir>,
+    width: vir::ExprInt<'vir>,
+    clamp: FunctionIdn<'vir, (vir::Int, vir::Int, vir::Int), vir::Int>,
 }
 
 impl<'vir> Subquery<'vir> {
-    /// `[start, end)` where `guard` holds: the whole position for an own lifetime.
-    fn guarded(self) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
+    /// The part of the query at this position, numbered as in a field type in
+    /// which the position starts at `x_f`: empty if `guard` is false.
+    fn in_field(self, x_f: vir::ExprInt<'vir>) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
+        let shift = sub(self.x, x_f);
+        let end = add(x_f, self.width);
+        (
+            self.clamp.call()(sub(self.lo, shift), x_f, end),
+            self.clamp.call()(sub(self.hi, shift), x_f, end),
+        )
+    }
+
+    /// Like `in_field`, where `guard` holds: the whole position for an own lifetime.
+    fn guarded_in_field(self, x_f: vir::ExprInt<'vir>) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
         match self.lifetime {
-            GeneralizedLifetime::Region(_) => {
-                vir::with_vcx(|vcx| (vcx.mk_uint::<0>(), vcx.mk_uint::<1>()))
-            }
-            GeneralizedLifetime::RegionsIn(_) => (self.start, self.end),
+            GeneralizedLifetime::Region(_) => (x_f, add(x_f, self.width)),
+            GeneralizedLifetime::RegionsIn(_) => self.in_field(x_f),
         }
     }
 }
@@ -199,13 +212,9 @@ impl IndirectPredEnc {
         hi: vir::ExprInt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<Vec<Subquery<'vir>>, EncodeFullError<'vir, Self>> {
-        let arity = deps.require_ref::<ArityEnc>(ty)?.arity;
         let clamp = deps.require_dep::<ClampEnc>(())?;
         let graph = deps.require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(ty))?;
         vir::with_vcx(|vcx| {
-            let sub = |a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>| -> vir::ExprInt<'vir> {
-                vcx.mk_bin_op_expr(vir::BinOpKind::Sub, a, b).downcast_ty()
-            };
             // A position's predicate is on its key fetched through the positions enclosing
             // it, so their predicates and fetches come first.
             graph
@@ -219,32 +228,31 @@ impl IndirectPredEnc {
                         .collect::<Vec<_>>();
                     let enclosing = vcx.alloc_slice(&enclosing);
                     let (x, _) = graph.interval(p);
-                    let zero = vcx.mk_uint::<0>();
-                    Ok(match lifetime {
+                    let width = match lifetime {
                         // An own lifetime is a single position, either in the query or not.
+                        GeneralizedLifetime::Region(_) => vcx.mk_uint::<1>(),
+                        GeneralizedLifetime::RegionsIn(ty) => deps.require_dep::<TyArityEnc>(ty)?,
+                    };
+                    let mut subquery = Subquery {
+                        lifetime,
+                        enclosing,
+                        guard: vcx.mk_bool::<true>(),
+                        lo,
+                        hi,
+                        x,
+                        width,
+                        clamp,
+                    };
+                    subquery.guard = match lifetime {
                         GeneralizedLifetime::Region(_) => {
-                            let one = vcx.mk_uint::<1>();
-                            Subquery {
-                                lifetime,
-                                enclosing,
-                                guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
-                                start: clamp.call()(sub(lo, x), zero, one),
-                                end: clamp.call()(sub(hi, x), zero, one),
-                            }
+                            vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) }
                         }
-                        GeneralizedLifetime::RegionsIn(ty) => {
-                            let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
-                            let start = clamp.call()(sub(lo, x), zero, w);
-                            let end = clamp.call()(sub(hi, x), zero, w);
-                            Subquery {
-                                lifetime,
-                                enclosing,
-                                guard: vir::expr! { vcx; (start) < (end) },
-                                start,
-                                end,
-                            }
+                        GeneralizedLifetime::RegionsIn(_) => {
+                            let (start, end) = subquery.in_field(x);
+                            vir::expr! { vcx; (start) < (end) }
                         }
-                    })
+                    };
+                    Ok(subquery)
                 })
                 .collect()
         })
@@ -270,19 +278,8 @@ impl IndirectPredEnc {
             let key = Self::position_snap(
                 subqueries, outer, field_ty, graph, enclosing, field_snap, deps,
             )?;
-            let guard = outer.guard;
-            let (x, _) = graph.interval(enclosing);
-            let (outer_start, outer_end) = outer.guarded();
-            let start = add(x, outer_start);
-            let end = add(x, outer_end);
-            let extended = Self::extend(field_ty, snap, key, start, end, deps)?;
-            // An enclosing position of the same lifetime is in the query
-            // whenever `p` is.
-            snap = if lifetime == graph.lifetime(p) {
-                extended
-            } else {
-                vir::expr! { (guard) ? (extended) : (snap) }
-            };
+            let (start, end) = outer.in_field(graph.interval(enclosing).0);
+            snap = Self::extend(field_ty, snap, key, start, end, deps)?;
         }
         Ok(snap)
     }
@@ -328,7 +325,7 @@ impl IndirectPredEnc {
             .collect::<Vec<_>>();
         if let GeneralizedLifetime::RegionsIn(_) = graph.lifetime(p) {
             let (lo, _) = graph.interval(p);
-            keep.push((lo, add(lo, subquery.guarded().0)));
+            keep.push((lo, subquery.in_field(lo).0));
         }
         let mut snap = field_ind.base.call()(field_snap, args.get_ty(), args.get_const());
         for (lo, hi) in keep {
@@ -360,9 +357,7 @@ impl IndirectPredEnc {
             if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
-            let (x, _) = graph.interval(p);
-            let start = add(x, subquery.start);
-            let end = add(x, subquery.end);
+            let (start, end) = subquery.in_field(graph.interval(p).0);
             snap = plug.call()(snap, args.get_ty(), args.get_const(), t_field, start, end);
         }
         Ok(snap)
@@ -438,10 +433,7 @@ impl IndirectPredEnc {
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
             let snap =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_snap, deps)?;
-            let (x, _) = graph.interval(p);
-            let (subquery_start, subquery_end) = subquery.guarded();
-            let start = add(x, subquery_start);
-            let end = add(x, subquery_end);
+            let (start, end) = subquery.guarded_in_field(graph.interval(p).0);
             preds.push(vir::expr! {
                 acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], start, end))
             });
@@ -473,14 +465,10 @@ impl IndirectPredEnc {
             }
             let key =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_pred, deps)?;
-            let (x, _) = graph.interval(p);
-            let (subquery_start, subquery_end) = subquery.guarded();
-            let start = add(x, subquery_start);
-            let end = add(x, subquery_end);
+            let (start, end) = subquery.in_field(graph.interval(p).0);
             snap = Self::extend(field_ty, snap, key, start, end, deps)?;
         }
-        let guard = subquery.guard;
-        Ok(vir::expr! { (guard) ? (snap) : (field_snap) })
+        Ok(snap)
     }
 
     /// The field predicates of the fields `fields`, given by their types and
@@ -788,30 +776,18 @@ impl TaskEncoder for IndirectPredEnc {
                         }
                     }
                     // The value is read from the heap if the query contains 'a and stored
-                    // otherwise; either is extended at the referent's positions.
-                    let mut extended_current = current_snap;
-                    let mut extended_stored = stored_snap;
+                    // otherwise, then extended at the referent's positions.
+                    let mut value = referent_snap;
                     for &subquery in &subqueries {
-                        extended_current = Self::field_ext(
+                        value = Self::field_ext(
                             &subqueries,
                             subquery,
                             referent_ty,
-                            extended_current,
-                            current_snap,
-                            deps,
-                        )?;
-                        extended_stored = Self::field_ext(
-                            &subqueries,
-                            subquery,
-                            referent_ty,
-                            extended_stored,
-                            stored_snap,
+                            value,
+                            referent_snap,
                             deps,
                         )?;
                     }
-                    let value = vir::expr! { vcx;
-                        (in_query) ? (extended_current) : (extended_stored)
-                    };
                     let metadata = pure_data.metadata_access.call()(k.downcast_ty());
                     let fetch_body =
                         pure_data.prim_to_snap.call()(addr, metadata, value.downcast_ty());
@@ -868,24 +844,27 @@ impl TaskEncoder for IndirectPredEnc {
                 body,
             );
 
+            // Fetching through an empty interval reads nothing and needs no predicate, so
+            // callers extend through a position's interval without checking whether the
+            // query contains it.
             let pre = vir::expr! { vcx;
-                acc([predicate](
+                ((lo) < (hi)) ==> (acc([predicate](
                     k,
                     [..[params.ty_exprs()]],
                     [..[params.const_exprs()]],
                     lo,
                     hi
-                ))
+                )))
             };
             let fetch_body = fetch_body.map(|fetch_body| {
                 vir::expr! { vcx;
-                    unfolding ([predicate](
+                    ((lo) < (hi)) ? (unfolding ([predicate](
                         k,
                         [..[params.ty_exprs()]],
                         [..[params.const_exprs()]],
                         lo,
                         hi
-                    )) in (fetch_body)
+                    )) in (fetch_body)) : (k)
                 }
             });
             // At a type parameter, `fetch`, `plug` and `base` are abstract. What `fetch`
