@@ -415,7 +415,7 @@ fn same_arg_types(x: &FuncAppGenData<'_, (), !>, y: &FuncAppGenData<'_, (), !>) 
 
 /// Syntactic equality of the expressions the equations compare (locals,
 /// constants, applications and field reads), `false` for anything else.
-fn syntactic_eq<'vir>(a: ExprDyn<'vir>, b: ExprDyn<'vir>) -> bool {
+pub fn syntactic_eq<'vir>(a: ExprDyn<'vir>, b: ExprDyn<'vir>) -> bool {
     if std::ptr::eq(a.kind, b.kind) {
         return true;
     }
