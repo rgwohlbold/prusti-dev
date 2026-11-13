@@ -1,6 +1,6 @@
 use prusti_rustc_interface::index::Idx;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::MethodIdn;
+use vir::{CastType, MethodIdn};
 
 use crate::encoders::ty::{
     RustTyDecomposition,
@@ -9,7 +9,7 @@ use crate::encoders::ty::{
 };
 
 use super::{
-    GArgsTy, GArgsTyEnc, GenericParamsEnc,
+    GArgsTyEnc, GenericParamsEnc,
     lifetime_position::{LifetimePosition, LifetimePositionEnc},
 };
 
@@ -88,12 +88,39 @@ impl TaskEncoder for MergeSplitEnc {
             deps.emit_output_ref(*task_key, MergeSplit { merge, split })?;
 
             let k_decl = vcx.mk_local_decl("k", snapshot);
+            // The contracts name each written-out type argument once, in a `let`.
+            let mut bindings = Vec::new();
+            let ty_args: &[vir::ExprTyVal<'vir>] = args.get_ty();
+            let tys = ty_args
+                .iter()
+                .enumerate()
+                .map(|(i, &ty_arg)| {
+                    if matches!(ty_arg.kind, vir::ExprKindGenData::Local(_)) {
+                        return ty_arg;
+                    }
+                    let name = if ty_args.len() == 1 {
+                        "ty".to_string()
+                    } else {
+                        format!("ty{i}")
+                    };
+                    let decl = vcx.mk_local_decl(vcx.alloc_str(&name), vir::TYPE_TYVAL);
+                    bindings.push((decl, ty_arg));
+                    vcx.mk_local_ex(decl)
+                })
+                .collect::<Vec<_>>();
+            let with_bindings = |e: vir::ExprBool<'vir>| {
+                bindings
+                    .iter()
+                    .rev()
+                    .fold(e, |e, &(decl, ty_arg)| vcx.mk_let_expr(decl, ty_arg, e))
+            };
             let block = LifetimePositionBlock {
                 graph: &graph,
                 first,
                 end,
                 ind,
-                args,
+                tys: vcx.alloc_slice(&tys),
+                consts: args.get_const(),
                 k: vcx.mk_local_ex(k_decl),
             };
             let positions = block.positions();
@@ -109,15 +136,17 @@ impl TaskEncoder for MergeSplitEnc {
             let (lo, _) = graph.interval(first);
             let (_, hi) = graph.interval(LifetimePosition::new(end.index() - 1));
             let merged = block.predicate(block.k, lo, hi);
-            let fetched = ind.fetch.call()(block.k, args.get_ty(), args.get_const(), lo, hi);
+            let fetched = ind.fetch.call()(block.k, block.tys, block.consts, lo, hi);
             let plugged = block.fold(&positions);
             let decls = (k_decl, params.ty_decls(), params.const_decls());
+            let merge_post =
+                conjunction(&[merged, vcx.mk_eq_expr(fetched, vcx.mk_old_expr(plugged))]);
             let merge = vcx.mk_method(
                 merge,
                 decls,
                 &[],
-                vcx.alloc_slice(&preds),
-                vcx.alloc_slice(&[merged, vcx.mk_eq_expr(fetched, vcx.mk_old_expr(plugged))]),
+                vcx.alloc_slice(&[with_bindings(conjunction(&preds))]),
+                vcx.alloc_slice(&[with_bindings(merge_post)]),
                 None,
             );
             let mut split_posts = preds;
@@ -126,8 +155,8 @@ impl TaskEncoder for MergeSplitEnc {
                 split,
                 decls,
                 &[],
-                vcx.alloc_slice(&[merged]),
-                vcx.alloc_slice(&split_posts),
+                vcx.alloc_slice(&[with_bindings(merged)]),
+                vcx.alloc_slice(&[with_bindings(conjunction(&split_posts))]),
                 None,
             );
             Ok(([merge, split], ()))
@@ -141,6 +170,23 @@ impl TaskEncoder for MergeSplitEnc {
             }
         }
     }
+}
+
+/// `parts` joined by `&&` from the left, which Viper prints as one flat
+/// conjunction, in the order the parts frame each other.
+// TODO: `vcx.mk_conj` builds a balanced tree, which keeps long conjunctions shallow but
+// prints with parentheses; once it joins short conjunctions from the left, use it here.
+fn conjunction<'vir>(parts: &[vir::ExprBool<'vir>]) -> vir::ExprBool<'vir> {
+    vir::with_vcx(|vcx| {
+        parts
+            .iter()
+            .copied()
+            .reduce(|conj, part| {
+                vcx.mk_bin_op_expr(vir::BinOpKind::And, conj, part)
+                    .downcast_ty()
+            })
+            .unwrap_or_else(|| vcx.mk_bool::<true>())
+    })
 }
 
 /// Tests that verify `merge`/`split` with Silicon: merging the predicates of

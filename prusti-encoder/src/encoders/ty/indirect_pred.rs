@@ -106,7 +106,8 @@ pub(crate) struct LifetimePositionBlock<'vir, 'a> {
     pub(crate) first: LifetimePosition,
     pub(crate) end: LifetimePosition,
     pub(crate) ind: IndirectPredRef<'vir>,
-    pub(crate) args: GArgsTy<'vir>,
+    pub(crate) tys: &'vir [vir::ExprTyVal<'vir>],
+    pub(crate) consts: &'vir [vir::ExprCSnap<'vir>],
     pub(crate) k: vir::ExprSnap<'vir>,
 }
 
@@ -139,11 +140,12 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
     /// `k` with what each of `positions` reads through its key plugged in, in
     /// turn.
     pub(crate) fn fold(&self, positions: &[LifetimePosition]) -> vir::ExprSnap<'vir> {
-        let (tys, consts) = (self.args.get_ty(), self.args.get_const());
         let mut snap = self.k;
         for &q in positions {
             let (lo, hi) = self.graph.interval(q);
-            snap = self.ind.extend(snap, self.key(q), tys, consts, lo, hi);
+            snap = self
+                .ind
+                .extend(snap, self.key(q), self.tys, self.consts, lo, hi);
         }
         snap
     }
@@ -155,7 +157,7 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
         hi: vir::ExprInt<'vir>,
     ) -> vir::ExprBool<'vir> {
         let pred = self.ind.predicate;
-        let (tys, consts) = (self.args.get_ty(), self.args.get_const());
+        let (tys, consts) = (self.tys, self.consts);
         vir::expr! { acc([pred](key, [..[tys]], [..[consts]], lo, hi)) }
     }
 }
