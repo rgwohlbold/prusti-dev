@@ -18,8 +18,8 @@ use super::{
 /// their intervals, and split it again. A generic call site merges the
 /// positions a type parameter of the callee covers before casting the result
 /// to the parameter's predicate, and splits them after the call. Both state
-/// that fetching through the merged predicate gives what fetching through
-/// each position's predicate on its key gives, plugged together.
+/// that extending through the merged predicate reads what extending through
+/// each position's predicate on its key reads, grafted together.
 pub struct MergeSplitEnc;
 
 #[derive(Debug, Clone, Copy)]
@@ -124,7 +124,7 @@ impl TaskEncoder for MergeSplitEnc {
                 k: vcx.mk_local_ex(k_decl),
             };
             let positions = block.positions();
-            // Outermost first, so that each key's fetches are framed by the
+            // Outermost first, so that each key's extensions are framed by the
             // predicates before it.
             let preds = positions
                 .iter()
@@ -136,11 +136,11 @@ impl TaskEncoder for MergeSplitEnc {
             let (lo, _) = graph.interval(first);
             let (_, hi) = graph.interval(LifetimePosition::new(end.index() - 1));
             let merged = block.predicate(block.k, lo, hi);
-            let fetched = ind.fetch.call()(block.k, block.tys, block.consts, lo, hi);
-            let plugged = block.fold(&positions);
+            let extended = ind.extend.call()(block.k, block.tys, block.consts, lo, hi);
+            let grafted = block.fold(&positions);
             let decls = (k_decl, params.ty_decls(), params.const_decls());
             let merge_post =
-                conjunction(&[merged, vcx.mk_eq_expr(fetched, vcx.mk_old_expr(plugged))]);
+                conjunction(&[merged, vcx.mk_eq_expr(extended, vcx.mk_old_expr(grafted))]);
             let merge = vcx.mk_method(
                 merge,
                 decls,
@@ -150,7 +150,7 @@ impl TaskEncoder for MergeSplitEnc {
                 None,
             );
             let mut split_posts = preds;
-            split_posts.push(vcx.mk_eq_expr(plugged, vcx.mk_old_expr(fetched)));
+            split_posts.push(vcx.mk_eq_expr(grafted, vcx.mk_old_expr(extended)));
             let split = vcx.mk_method(
                 split,
                 decls,
@@ -191,7 +191,7 @@ fn conjunction<'vir>(parts: &[vir::ExprBool<'vir>]) -> vir::ExprBool<'vir> {
 
 /// Tests that verify `merge`/`split` with Silicon: merging the predicates of
 /// the positions of a block, and casting the result to the predicate of a type
-/// parameter where the block is one, keeps what is fetched through them;
+/// parameter where the block is one, keeps what extending through them reads;
 /// likewise casting back and splitting.
 #[cfg(test)]
 mod verification_tests {
@@ -264,7 +264,7 @@ mod verification_tests {
             method merge(k: s_Ref_mutable)
               requires p_Ref_mutable_ind(k, I32, 0, 1)
               ensures p_Param_ind(G(k), RI, 0, 1)
-              ensures fetch_Param(G(k), RI, 0, 1) == old(G(fetch_Ref_mutable(k, I32, 0, 1)))
+              ensures extend_Param(G(k), RI, 0, 1) == old(G(extend_Ref_mutable(k, I32, 0, 1)))
             {
               merge_ind_Ref_mutable$lt$Int_i32$gt$_0_1(k)
               make_generic_ind_Ref_mutable(k, I32, 0, 1)
@@ -273,7 +273,7 @@ mod verification_tests {
             method split(k: s_Ref_mutable)
               requires p_Param_ind(G(k), RI, 0, 1)
               ensures p_Ref_mutable_ind(k, I32, 0, 1)
-              ensures G(fetch_Ref_mutable(k, I32, 0, 1)) == old(fetch_Param(G(k), RI, 0, 1))
+              ensures G(extend_Ref_mutable(k, I32, 0, 1)) == old(extend_Param(G(k), RI, 0, 1))
             {
               make_concrete_ind_Ref_mutable(k, I32, 0, 1)
               split_ind_Ref_mutable$lt$Int_i32$gt$_0_1(k)
@@ -292,13 +292,13 @@ mod verification_tests {
             r#"
             define NT s_N_type()
             define G(k) make_generic_s_N(k)
-            // The key of the predicate of 'b: `k` with what 'a reads plugged in.
-            define KB(k) plug_N(k, fetch_N(k, 1, 2), 1, 2)
+            // The key of the predicate of 'b: `k` with what 'a reads grafted in.
+            define KB(k) extend_N(k, 1, 2)
 
             method merge(k: s_N)
               requires p_N_ind(k, 1, 2) && p_N_ind(KB(k), 0, 1)
               ensures p_Param_ind(G(k), NT, 0, 2)
-              ensures fetch_Param(G(k), NT, 0, 2) == old(G(fetch_N(KB(k), 0, 1)))
+              ensures extend_Param(G(k), NT, 0, 2) == old(G(extend_N(KB(k), 0, 1)))
             {
               merge_ind_N_0_2(k)
               make_generic_ind_N(k, 0, 2)
@@ -307,7 +307,7 @@ mod verification_tests {
             method split(k: s_N)
               requires p_Param_ind(G(k), NT, 0, 2)
               ensures p_N_ind(k, 1, 2) && p_N_ind(KB(k), 0, 1)
-              ensures G(fetch_N(KB(k), 0, 1)) == old(fetch_Param(G(k), NT, 0, 2))
+              ensures G(extend_N(KB(k), 0, 1)) == old(extend_Param(G(k), NT, 0, 2))
             {
               make_concrete_ind_N(k, 0, 2)
               split_ind_N_0_2(k)
@@ -330,8 +330,8 @@ mod verification_tests {
             method merge(k: s_A)
               requires p_A_ind(k, 0, 1) && p_A_ind(k, 1, 2)
               ensures p_Param_ind(G(k), AT, 0, 2)
-              ensures fetch_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_0 == old(fetch_A(k, 0, 1).s_A_0)
-              ensures fetch_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_1 == old(fetch_A(k, 1, 2).s_A_1)
+              ensures extend_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_0 == old(extend_A(k, 0, 1).s_A_0)
+              ensures extend_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_1 == old(extend_A(k, 1, 2).s_A_1)
             {
               merge_ind_A_0_2(k)
               make_generic_ind_A(k, 0, 2)
@@ -340,8 +340,8 @@ mod verification_tests {
             method split(k: s_A)
               requires p_Param_ind(G(k), AT, 0, 2)
               ensures p_A_ind(k, 0, 1) && p_A_ind(k, 1, 2)
-              ensures fetch_A(k, 0, 1).s_A_0 == old(fetch_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_0
-              ensures fetch_A(k, 1, 2).s_A_1 == old(fetch_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_1
+              ensures extend_A(k, 0, 1).s_A_0 == old(extend_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_0
+              ensures extend_A(k, 1, 2).s_A_1 == old(extend_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_1
             {
               make_concrete_ind_A(k, 0, 2)
               split_ind_A_0_2(k)
@@ -360,15 +360,15 @@ mod verification_tests {
             define RT(T) s_Ref_mutable_type(T)
             define G(k, T) make_generic_s_Ref_mutable(k, T)
             // The key of the predicate of the positions of `T`: `k` with what 'a
-            // reads plugged in.
-            define KT(k, T) plug_Ref_mutable(k, T, fetch_Ref_mutable(k, T, 0, 1), 0, 1)
+            // reads grafted in.
+            define KT(k, T) extend_Ref_mutable(k, T, 0, 1)
 
             method merge(k: s_Ref_mutable, T: Type)
               requires p_Ref_mutable_ind(k, T, 0, 1)
               requires p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
               ensures p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
-              ensures fetch_Param(G(k, T), RT(T), 0, 1 + arity(T)) ==
-                old(G(fetch_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T))
+              ensures extend_Param(G(k, T), RT(T), 0, 1 + arity(T)) ==
+                old(G(extend_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T))
             {
               merge_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
               make_generic_ind_Ref_mutable(k, T, 0, 1 + arity(T))
@@ -378,8 +378,8 @@ mod verification_tests {
               requires p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
               ensures p_Ref_mutable_ind(k, T, 0, 1)
               ensures p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
-              ensures G(fetch_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T) ==
-                old(fetch_Param(G(k, T), RT(T), 0, 1 + arity(T)))
+              ensures G(extend_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T) ==
+                old(extend_Param(G(k, T), RT(T), 0, 1 + arity(T)))
             {
               make_concrete_ind_Ref_mutable(k, T, 0, 1 + arity(T))
               split_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
@@ -397,8 +397,8 @@ mod verification_tests {
             r#"
             define RT(T) s_Ref_mutable_type(T)
             // The keys of the predicates of 'b and of the positions of `T`.
-            define KB(k, T) plug_Ref_mutable(k, RT(T), fetch_Ref_mutable(k, RT(T), 0, 1), 0, 1)
-            define KT(k, T) plug_Ref_mutable(KB(k, T), RT(T), fetch_Ref_mutable(KB(k, T), RT(T), 1, 2), 1, 2)
+            define KB(k, T) extend_Ref_mutable(k, RT(T), 0, 1)
+            define KT(k, T) extend_Ref_mutable(KB(k, T), RT(T), 1, 2)
 
             method merge(k: s_Ref_mutable, T: Type)
               requires p_Ref_mutable_ind(k, RT(T), 0, 1)
@@ -406,8 +406,8 @@ mod verification_tests {
               requires p_Ref_mutable_ind(KT(k, T), RT(T), 2, 2 + arity(T))
               ensures p_Ref_mutable_ind(k, RT(T), 0, 1)
               ensures p_Ref_mutable_ind(KB(k, T), RT(T), 1, 2 + arity(T))
-              ensures fetch_Ref_mutable(KB(k, T), RT(T), 1, 2 + arity(T)) ==
-                old(fetch_Ref_mutable(KT(k, T), RT(T), 2, 2 + arity(T)))
+              ensures extend_Ref_mutable(KB(k, T), RT(T), 1, 2 + arity(T)) ==
+                old(extend_Ref_mutable(KT(k, T), RT(T), 2, 2 + arity(T)))
             {
               merge_ind_Ref_mutable$lt$Ref_mutable$lt$P0$gt$$gt$_1_3(KB(k, T), T)
             }
@@ -418,8 +418,8 @@ mod verification_tests {
               ensures p_Ref_mutable_ind(k, RT(T), 0, 1)
               ensures p_Ref_mutable_ind(KB(k, T), RT(T), 1, 2)
               ensures p_Ref_mutable_ind(KT(k, T), RT(T), 2, 2 + arity(T))
-              ensures fetch_Ref_mutable(KT(k, T), RT(T), 2, 2 + arity(T)) ==
-                old(fetch_Ref_mutable(KB(k, T), RT(T), 1, 2 + arity(T)))
+              ensures extend_Ref_mutable(KT(k, T), RT(T), 2, 2 + arity(T)) ==
+                old(extend_Ref_mutable(KB(k, T), RT(T), 1, 2 + arity(T)))
             {
               split_ind_Ref_mutable$lt$Ref_mutable$lt$P0$gt$$gt$_1_3(KB(k, T), T)
             }
@@ -435,15 +435,15 @@ mod verification_tests {
             &[(1, 3)],
             r#"
             define RRI s_Ref_mutable_type(s_Ref_mutable_type(s_Int_i32_type()))
-            // The key of the predicate of 'b: `k` with what 'a reads plugged in.
-            define KB(k, T) plug_2_Tuple(k, T, RRI, fetch_2_Tuple(k, T, RRI, arity(T), arity(T) + 1), arity(T), arity(T) + 1)
+            // The key of the predicate of 'b: `k` with what 'a reads grafted in.
+            define KB(k, T) extend_2_Tuple(k, T, RRI, arity(T), arity(T) + 1)
 
             method merge(k: s_2_Tuple, T: Type)
               requires p_2_Tuple_ind(k, T, RRI, arity(T), arity(T) + 1)
               requires p_2_Tuple_ind(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2)
               ensures p_2_Tuple_ind(k, T, RRI, arity(T), arity(T) + 2)
-              ensures fetch_2_Tuple(k, T, RRI, arity(T), arity(T) + 2) ==
-                old(fetch_2_Tuple(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2))
+              ensures extend_2_Tuple(k, T, RRI, arity(T), arity(T) + 2) ==
+                old(extend_2_Tuple(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2))
             {
               merge_ind_2_Tuple$lt$P0$com$$sp$Ref_mutable$lt$Ref_mutable$lt$Int_i32$gt$$gt$$gt$_1_3(k, T)
             }
@@ -452,8 +452,8 @@ mod verification_tests {
               requires p_2_Tuple_ind(k, T, RRI, arity(T), arity(T) + 2)
               ensures p_2_Tuple_ind(k, T, RRI, arity(T), arity(T) + 1)
               ensures p_2_Tuple_ind(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2)
-              ensures fetch_2_Tuple(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2) ==
-                old(fetch_2_Tuple(k, T, RRI, arity(T), arity(T) + 2))
+              ensures extend_2_Tuple(KB(k, T), T, RRI, arity(T) + 1, arity(T) + 2) ==
+                old(extend_2_Tuple(k, T, RRI, arity(T), arity(T) + 2))
             {
               split_ind_2_Tuple$lt$P0$com$$sp$Ref_mutable$lt$Ref_mutable$lt$Int_i32$gt$$gt$$gt$_1_3(k, T)
             }
@@ -475,16 +475,16 @@ mod verification_tests {
             r#"
             define RBL s_Ref_mutable_type(s_Box_type(s_List_type(), s_Global_type()))
             // The key of the predicates of `List`'s positions: `k` with what the
-            // reference's 'a reads plugged in.
-            define KA(k) plug_Option(k, RBL, fetch_Option(k, RBL, 0, 1), 0, 1)
-            // What the positions of `List` read, plugged together.
-            define LIST(k) plug_Option(fetch_Option(KA(k), RBL, 1, 2), RBL, fetch_Option(KA(k), RBL, 2, 3), 2, 3)
+            // reference's 'a reads grafted in.
+            define KA(k) extend_Option(k, RBL, 0, 1)
+            // What the positions of `List` read, grafted together.
+            define LIST(k) graft_Option(extend_Option(KA(k), RBL, 1, 2), RBL, extend_Option(KA(k), RBL, 2, 3), 2, 3)
 
             method merge(k: s_Option)
               requires p_Option_ind(k, RBL, 0, 1)
               requires p_Option_ind(KA(k), RBL, 1, 2) && p_Option_ind(KA(k), RBL, 2, 3)
               ensures p_Option_ind(k, RBL, 0, 3)
-              ensures fetch_Option(k, RBL, 0, 3) == old(LIST(k))
+              ensures extend_Option(k, RBL, 0, 3) == old(LIST(k))
             {
               merge_ind_Option$lt$Ref_mutable$lt$Box$lt$List$com$$sp$Global$gt$$gt$$gt$_0_3(k)
             }
@@ -493,7 +493,7 @@ mod verification_tests {
               requires p_Option_ind(k, RBL, 0, 3)
               ensures p_Option_ind(k, RBL, 0, 1)
               ensures p_Option_ind(KA(k), RBL, 1, 2) && p_Option_ind(KA(k), RBL, 2, 3)
-              ensures LIST(k) == old(fetch_Option(k, RBL, 0, 3))
+              ensures LIST(k) == old(extend_Option(k, RBL, 0, 3))
             {
               split_ind_Option$lt$Ref_mutable$lt$Box$lt$List$com$$sp$Global$gt$$gt$$gt$_0_3(k)
             }

@@ -32,7 +32,7 @@ pub(crate) fn ty_impure<'vir>(
         return Ok(());
     }
     let typ = deps.require_dep::<ParamTypEnc>(())?.typ;
-    let base = deps.require_ref::<IndirectPredEnc>(ty)?.base;
+    let shallow = deps.require_ref::<IndirectPredEnc>(ty)?.shallow;
     builder.mk_predicate("", None);
     // The intended invariant of the predicate: its snapshot is a value of the
     // type the predicate is instantiated at. Everywhere a param is read out
@@ -45,13 +45,13 @@ pub(crate) fn ty_impure<'vir>(
     let vcx = builder.vcx;
     let result = vcx.mk_result(vir::TYPE_PSNAP);
     let ty_expr = builder.params.ty_exprs()[0];
-    // A direct snapshot holds no extensions, so resetting it changes nothing.
-    let reset = base.call()(result.upcast_ty(), &[ty_expr], &[]);
+    // A direct snapshot holds no extensions, so making it shallow changes nothing.
+    let shallow = shallow.call()(result.upcast_ty(), &[ty_expr], &[]);
     builder.mk_snap_function(
         None,
         &[
             vcx.mk_eq_expr(typ(result), ty_expr),
-            vcx.mk_eq_expr(reset, result.upcast_ty()),
+            vcx.mk_eq_expr(shallow, result.upcast_ty()),
         ],
     );
     Ok(())
