@@ -73,6 +73,7 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
     ///    constructors are injective, and `!=` is its negation; the
     ///    applications may be locals bound to them,
     ///  - `0 + r` is `r`, and `l + 0` and `l - 0` are `l`,
+    ///  - `l - -k` is `l + k` for a positive integer literal `k`,
     ///  - the sum and difference of two integer literals are evaluated, and
     ///    `(e + k1) + k2` and `(k1 + e) + k2` are `e + (k1 + k2)` for integer
     ///    literals `k1` and `k2`; results beyond `i128` are left as they are.
@@ -88,6 +89,10 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
             (Add | Sub, _, Some(0)) => return Some(l),
             (Add, Some(a), Some(b)) => return a.checked_add(b).map(|v| self.int(v)),
             (Sub, Some(a), Some(b)) => return a.checked_sub(b).map(|v| self.int(v)),
+            (Sub, None, Some(k)) if k < 0 => {
+                let k = self.int(k.checked_neg()?);
+                return Some(self.bin_op(Add, l, k));
+            }
             (Add, None, Some(k2)) => {
                 if let ExprKindGenData::BinOp(inner) = l.kind {
                     if inner.kind == Add {
