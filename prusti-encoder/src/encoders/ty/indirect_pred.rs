@@ -32,9 +32,9 @@ pub struct IndirectPredRef<'vir> {
             vir::Int,
         ),
     >,
-    /// `fetch_X(k, T.., lo, hi)`: `k` with the references at `[lo, hi)` holding their
-    /// current referents, read through `p_X_ind(k, T.., lo, hi)`.
-    pub fetch: FunctionIdn<
+    /// `extend_X(k, T.., lo, hi)`: `k` extended by the positions `[lo, hi)`: the references
+    /// there hold their current referents, read through `p_X_ind(k, T.., lo, hi)`.
+    pub extend: FunctionIdn<
         'vir,
         (
             vir::Snap,
@@ -45,9 +45,9 @@ pub struct IndirectPredRef<'vir> {
         ),
         vir::Snap,
     >,
-    /// `plug_X(s, T.., t, lo, hi)`: `s` with the references at `[lo, hi)` holding `t`'s
-    /// referents, in which the references at other positions are reset.
-    pub plug: FunctionIdn<
+    /// `graft_X(s, T.., t, lo, hi)`: `s` with the references at `[lo, hi)` holding `t`'s
+    /// referents, in which the references at other positions are collapsed.
+    pub graft: FunctionIdn<
         'vir,
         (
             vir::Snap,
@@ -59,29 +59,16 @@ pub struct IndirectPredRef<'vir> {
         ),
         vir::Snap,
     >,
-    /// `base_X(s, T..)`: `s` with every reference reset to its unextended state.
-    pub base: FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
-    /// `ext_X(k, T.., lo, hi)`: `plug_X(k, T.., fetch_X(k, T.., lo, hi), lo, hi)`, which
-    /// names `k` once.
-    pub ext: FunctionIdn<
-        'vir,
-        (
-            vir::Snap,
-            vir::ManyTyVal,
-            vir::ManyCSnap,
-            vir::Int,
-            vir::Int,
-        ),
-        vir::Snap,
-    >,
+    /// `shallow_X(s, T..)`: `s` with every reference collapsed, the shallow snapshot.
+    pub shallow: FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
 }
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
 impl<'vir> IndirectPredRef<'vir> {
-    /// `snap` with the positions `[lo, hi)` holding what is fetched through
-    /// the predicate on `key`.
-    pub fn extend(
+    /// `snap` with the positions `[lo, hi)` holding what extending `key` by them reads
+    /// through the predicate on `key`.
+    pub fn extend_from(
         &self,
         snap: vir::ExprSnap<'vir>,
         key: vir::ExprSnap<'vir>,
@@ -91,10 +78,10 @@ impl<'vir> IndirectPredRef<'vir> {
         hi: vir::ExprInt<'vir>,
     ) -> vir::ExprSnap<'vir> {
         if vir::simplify::syntactic_eq(snap.as_dyn(), key.as_dyn()) {
-            self.ext.call()(snap, tys, consts, lo, hi)
+            self.extend.call()(snap, tys, consts, lo, hi)
         } else {
-            let fetched = self.fetch.call()(key, tys, consts, lo, hi);
-            self.plug.call()(snap, tys, consts, fetched, lo, hi)
+            let extended = self.extend.call()(key, tys, consts, lo, hi);
+            self.graft.call()(snap, tys, consts, extended, lo, hi)
         }
     }
 }
@@ -125,7 +112,7 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
     }
 
     /// The key of `p`'s predicate: `k` with what the positions of the block
-    /// enclosing `p` read plugged in, as in the body of the merged predicate.
+    /// enclosing `p` read grafted in, as in the body of the merged predicate.
     pub(crate) fn key(&self, p: LifetimePosition) -> vir::ExprSnap<'vir> {
         let ancestors = self
             .graph
@@ -137,7 +124,7 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
         self.fold(&ancestors)
     }
 
-    /// `k` with what each of `positions` reads through its key plugged in, in
+    /// `k` with what each of `positions` reads through its key grafted in, in
     /// turn.
     pub(crate) fn fold(&self, positions: &[LifetimePosition]) -> vir::ExprSnap<'vir> {
         let mut snap = self.k;
@@ -145,7 +132,7 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
             let (lo, hi) = self.graph.interval(q);
             snap = self
                 .ind
-                .extend(snap, self.key(q), self.tys, self.consts, lo, hi);
+                .extend_from(snap, self.key(q), self.tys, self.consts, lo, hi);
         }
         snap
     }
@@ -217,8 +204,8 @@ impl IndirectPredEnc {
         let clamp = deps.require_dep::<ClampEnc>(())?;
         let graph = deps.require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(ty))?;
         vir::with_vcx(|vcx| {
-            // A position's predicate is on its key fetched through the positions enclosing
-            // it, so their predicates and fetches come first.
+            // A position's predicate is on its key extended by the positions enclosing it,
+            // so their predicates and extensions come first.
             graph
                 .positions_outermost_first()
                 .map(|p| {
@@ -281,14 +268,14 @@ impl IndirectPredEnc {
                 subqueries, outer, field_ty, graph, enclosing, field_snap, deps,
             )?;
             let (start, end) = outer.in_field(graph.interval(enclosing).0);
-            snap = Self::extend(field_ty, snap, key, start, end, deps)?;
+            snap = Self::extend_from(field_ty, snap, key, start, end, deps)?;
         }
         Ok(snap)
     }
 
     /// `snap` extended by the positions `[start, end)` of `field_ty`, whose permissions are
     /// on `key`.
-    fn extend<'vir>(
+    fn extend_from<'vir>(
         field_ty: RustTyDecomposition<'vir>,
         snap: vir::ExprSnap<'vir>,
         key: vir::ExprSnap<'vir>,
@@ -298,12 +285,12 @@ impl IndirectPredEnc {
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
         let field_ind = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?;
         let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(field_ind.extend(snap, key, args.get_ty(), args.get_const(), start, end))
+        Ok(field_ind.extend_from(snap, key, args.get_ty(), args.get_const(), start, end))
     }
 
     /// `field_snap` restricted to `p`'s ancestors in `field_ty` and `p`'s block before the
     /// subquery, if the container may have extended other positions of `field_ty`: the
-    /// field reset by `base`, with those positions plugged back in from `field_snap`.
+    /// field made shallow, with those positions grafted back in from `field_snap`.
     fn restricted_snap<'vir>(
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
@@ -329,16 +316,17 @@ impl IndirectPredEnc {
             let (lo, _) = graph.interval(p);
             keep.push((lo, subquery.in_field(lo).0));
         }
-        let mut snap = field_ind.base.call()(field_snap, args.get_ty(), args.get_const());
+        let mut snap = field_ind.shallow.call()(field_snap, args.get_ty(), args.get_const());
         for (lo, hi) in keep {
-            snap = field_ind.plug.call()(snap, args.get_ty(), args.get_const(), field_snap, lo, hi);
+            snap =
+                field_ind.graft.call()(snap, args.get_ty(), args.get_const(), field_snap, lo, hi);
         }
         Ok(snap)
     }
 
-    /// `s_field` with the positions of `subquery` in `field_ty` plugged in from `t_field`;
-    /// unchanged where the subquery is empty, since plugging nothing changes nothing.
-    fn field_plug<'vir>(
+    /// `s_field` with the positions of `subquery` in `field_ty` grafted in from `t_field`;
+    /// unchanged where the subquery is empty, since grafting nothing changes nothing.
+    fn field_graft<'vir>(
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
         s_field: vir::ExprSnap<'vir>,
@@ -352,7 +340,7 @@ impl IndirectPredEnc {
         {
             return Ok(s_field);
         }
-        let plug = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.plug;
+        let graft = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.graft;
         let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
         let mut snap = s_field;
         for p in graph.positions() {
@@ -360,14 +348,14 @@ impl IndirectPredEnc {
                 continue;
             }
             let (start, end) = subquery.in_field(graph.interval(p).0);
-            snap = plug.call()(snap, args.get_ty(), args.get_const(), t_field, start, end);
+            snap = graft.call()(snap, args.get_ty(), args.get_const(), t_field, start, end);
         }
         Ok(snap)
     }
 
     /// The fields `fields`, given by their types and readers, of `s`, with all
-    /// `subqueries` plugged in from the fields of `t`.
-    fn fields_plug<'vir>(
+    /// `subqueries` grafted in from the fields of `t`.
+    fn fields_graft<'vir>(
         subqueries: &[Subquery<'vir>],
         fields: &[Field<'vir>],
         s: vir::ExprSnap<'vir>,
@@ -379,15 +367,15 @@ impl IndirectPredEnc {
             let mut field_snap = read.call()(s.downcast_ty());
             let t_field = read.call()(t.downcast_ty());
             for &subquery in subqueries {
-                field_snap = Self::field_plug(subquery, field_ty, field_snap, t_field, deps)?;
+                field_snap = Self::field_graft(subquery, field_ty, field_snap, t_field, deps)?;
             }
             field_snaps.push(field_snap);
         }
         Ok(field_snaps)
     }
 
-    /// The fields `fields`, given by their types and readers, of `s`, each reset by `base`.
-    fn fields_base<'vir>(
+    /// The fields `fields`, given by their types and readers, of `s`, each made shallow.
+    fn fields_shallow<'vir>(
         fields: &[Field<'vir>],
         s: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
@@ -395,13 +383,13 @@ impl IndirectPredEnc {
         let mut field_snaps = Vec::new();
         for &(field_ty, read) in fields {
             let field_snap = read.call()(s.downcast_ty());
-            field_snaps.push(Self::field_base(field_ty, field_snap, deps)?);
+            field_snaps.push(Self::field_shallow(field_ty, field_snap, deps)?);
         }
         Ok(field_snaps)
     }
 
-    /// `field_snap` of type `field_ty` reset by `base`.
-    fn field_base<'vir>(
+    /// `field_snap` of type `field_ty` made shallow.
+    fn field_shallow<'vir>(
         field_ty: RustTyDecomposition<'vir>,
         field_snap: vir::ExprSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
@@ -412,9 +400,9 @@ impl IndirectPredEnc {
         {
             return Ok(field_snap);
         }
-        let base = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.base;
+        let shallow = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?.shallow;
         let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(base.call()(field_snap, args.get_ty(), args.get_const()))
+        Ok(shallow.call()(field_snap, args.get_ty(), args.get_const()))
     }
 
     /// The field predicates for `subquery`: one per position of its lifetime in `field_ty`.
@@ -445,7 +433,7 @@ impl IndirectPredEnc {
 
     /// `field_snap` extended by `subquery` at each position of its lifetime in `field_ty`;
     /// the field predicates are on `field_pred`.
-    fn field_ext<'vir>(
+    fn field_extend<'vir>(
         subqueries: &[Subquery<'vir>],
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
@@ -468,7 +456,7 @@ impl IndirectPredEnc {
             let key =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_pred, deps)?;
             let (start, end) = subquery.in_field(graph.interval(p).0);
-            snap = Self::extend(field_ty, snap, key, start, end, deps)?;
+            snap = Self::extend_from(field_ty, snap, key, start, end, deps)?;
         }
         Ok(snap)
     }
@@ -495,7 +483,7 @@ impl IndirectPredEnc {
     /// The fields `fields`, given by their types and readers, of `k`, each
     /// extended by all `subqueries`, whose field predicates are on the fields
     /// of `k`.
-    fn fields_ext<'vir>(
+    fn fields_extend<'vir>(
         subqueries: &[Subquery<'vir>],
         fields: &[Field<'vir>],
         k: vir::ExprSnap<'vir>,
@@ -506,8 +494,9 @@ impl IndirectPredEnc {
             let field_pred = read.call()(k.downcast_ty());
             let mut field_snap = field_pred;
             for &subquery in subqueries {
-                field_snap =
-                    Self::field_ext(subqueries, subquery, field_ty, field_snap, field_pred, deps)?;
+                field_snap = Self::field_extend(
+                    subqueries, subquery, field_ty, field_snap, field_pred, deps,
+                )?;
             }
             field_snaps.push(field_snap);
         }
@@ -524,7 +513,6 @@ impl TaskEncoder for IndirectPredEnc {
     type OutputRef<'vir> = IndirectPredRef<'vir>;
     type OutputFullLocal<'vir> = (
         vir::Predicate<'vir>,
-        vir::Function<'vir>,
         vir::Function<'vir>,
         vir::Function<'vir>,
         vir::Function<'vir>,
@@ -553,8 +541,8 @@ impl TaskEncoder for IndirectPredEnc {
                     vir::TYPE_INT,
                 ),
             );
-            let fetch = FunctionIdn::new(
-                vir::ViperIdent::new(vir::vir_format!(vcx, "fetch_{}", task_key.name())),
+            let extend = FunctionIdn::new(
+                vir::ViperIdent::new(vir::vir_format!(vcx, "extend_{}", task_key.name())),
                 (
                     snapshot,
                     params.ty_args(),
@@ -564,8 +552,8 @@ impl TaskEncoder for IndirectPredEnc {
                 ),
                 snapshot,
             );
-            let plug = FunctionIdn::new(
-                vir::ViperIdent::new(vir::vir_format!(vcx, "plug_{}", task_key.name())),
+            let graft = FunctionIdn::new(
+                vir::ViperIdent::new(vir::vir_format!(vcx, "graft_{}", task_key.name())),
                 (
                     snapshot,
                     params.ty_args(),
@@ -576,30 +564,18 @@ impl TaskEncoder for IndirectPredEnc {
                 ),
                 snapshot,
             );
-            let base = FunctionIdn::new(
-                vir::ViperIdent::new(vir::vir_format!(vcx, "base_{}", task_key.name())),
+            let shallow = FunctionIdn::new(
+                vir::ViperIdent::new(vir::vir_format!(vcx, "shallow_{}", task_key.name())),
                 (snapshot, params.ty_args(), params.const_args()),
-                snapshot,
-            );
-            let ext = FunctionIdn::new(
-                vir::ViperIdent::new(vir::vir_format!(vcx, "ext_{}", task_key.name())),
-                (
-                    snapshot,
-                    params.ty_args(),
-                    params.const_args(),
-                    vir::TYPE_INT,
-                    vir::TYPE_INT,
-                ),
                 snapshot,
             );
             deps.emit_output_ref(
                 *task_key,
                 IndirectPredRef {
                     predicate,
-                    fetch,
-                    plug,
-                    base,
-                    ext,
+                    extend,
+                    graft,
+                    shallow,
                 },
             )?;
 
@@ -609,13 +585,13 @@ impl TaskEncoder for IndirectPredEnc {
             let k: vir::ExprSnap<'vir> = vcx.mk_local_ex(k_decl);
             let lo = vcx.mk_local_ex(lo_decl);
             let hi = vcx.mk_local_ex(hi_decl);
-            // The snapshot arguments of `plug` and `base`.
+            // The snapshot arguments of `graft` and `shallow`.
             let s_decl = vcx.mk_local_decl("s", snapshot);
             let t_decl = vcx.mk_local_decl("t", snapshot);
             let s: vir::ExprSnap<'vir> = vcx.mk_local_ex(s_decl);
             let t: vir::ExprSnap<'vir> = vcx.mk_local_ex(t_decl);
 
-            let (body, fetch_body, plug_body, base_body) = match &ty.specifics {
+            let (body, extend_body, graft_body, shallow_body) = match &ty.specifics {
                 TySpecifics::StructLike(data) => {
                     let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
                     let fields = data
@@ -635,17 +611,17 @@ impl TaskEncoder for IndirectPredEnc {
                         }
                     }
                     let cons = data.data.1.field_snaps_to_snap;
-                    let field_snaps = Self::fields_ext(&subqueries, &fields, k, deps)?;
-                    let fetch_body = cons.call()(&field_snaps).upcast_ty();
-                    let field_snaps = Self::fields_plug(&subqueries, &fields, s, t, deps)?;
-                    let plug_body = cons.call()(&field_snaps).upcast_ty();
-                    let field_snaps = Self::fields_base(&fields, s, deps)?;
-                    let base_body = cons.call()(&field_snaps).upcast_ty();
+                    let field_snaps = Self::fields_extend(&subqueries, &fields, k, deps)?;
+                    let extend_body = cons.call()(&field_snaps).upcast_ty();
+                    let field_snaps = Self::fields_graft(&subqueries, &fields, s, t, deps)?;
+                    let graft_body = cons.call()(&field_snaps).upcast_ty();
+                    let field_snaps = Self::fields_shallow(&fields, s, deps)?;
+                    let shallow_body = cons.call()(&field_snaps).upcast_ty();
                     (
                         Some(vcx.mk_conj(&conjuncts)),
-                        Some(fetch_body),
-                        Some(plug_body),
-                        Some(base_body),
+                        Some(extend_body),
+                        Some(graft_body),
+                        Some(shallow_body),
                     )
                 }
                 TySpecifics::EnumLike(data) => {
@@ -694,45 +670,45 @@ impl TaskEncoder for IndirectPredEnc {
                             conjuncts.push(vir::expr! { vcx; (guard) ==> (preds) });
                         }
                     }
-                    let mut fetch_body = k;
+                    let mut extend_body = k;
                     for (variant_discr, fields, cons) in variants.iter().rev() {
-                        let field_snaps = Self::fields_ext(&subqueries, fields, k, deps)?;
+                        let field_snaps = Self::fields_extend(&subqueries, fields, k, deps)?;
                         let extended: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
                         let in_variant =
                             vcx.mk_eq_expr(discr.call()(k.downcast_ty()), *variant_discr);
-                        fetch_body = vir::expr! { vcx;
-                            (in_variant) ? (extended) : (fetch_body)
+                        extend_body = vir::expr! { vcx;
+                            (in_variant) ? (extended) : (extend_body)
                         };
                     }
                     // Plug only if both snapshots have the variant; `s` must not change
                     // otherwise.
-                    let mut plug_body = s;
+                    let mut graft_body = s;
                     for (variant_discr, fields, cons) in variants.iter().rev() {
-                        let field_snaps = Self::fields_plug(&subqueries, fields, s, t, deps)?;
-                        let plugged: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
+                        let field_snaps = Self::fields_graft(&subqueries, fields, s, t, deps)?;
+                        let grafted: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
                         let s_in_variant =
                             vcx.mk_eq_expr(discr.call()(s.downcast_ty()), *variant_discr);
                         let t_in_variant =
                             vcx.mk_eq_expr(discr.call()(t.downcast_ty()), *variant_discr);
-                        plug_body = vir::expr! { vcx;
-                            ((s_in_variant) && (t_in_variant)) ? (plugged) : (plug_body)
+                        graft_body = vir::expr! { vcx;
+                            ((s_in_variant) && (t_in_variant)) ? (grafted) : (graft_body)
                         };
                     }
-                    let mut base_body = s;
+                    let mut shallow_body = s;
                     for (variant_discr, fields, cons) in variants.iter().rev() {
-                        let field_snaps = Self::fields_base(fields, s, deps)?;
-                        let reset: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
+                        let field_snaps = Self::fields_shallow(fields, s, deps)?;
+                        let collapsed: vir::ExprSnap<'vir> = cons.call()(&field_snaps).upcast_ty();
                         let in_variant =
                             vcx.mk_eq_expr(discr.call()(s.downcast_ty()), *variant_discr);
-                        base_body = vir::expr! { vcx;
-                            (in_variant) ? (reset) : (base_body)
+                        shallow_body = vir::expr! { vcx;
+                            (in_variant) ? (collapsed) : (shallow_body)
                         };
                     }
                     (
                         Some(vcx.mk_conj(&conjuncts)),
-                        Some(fetch_body),
-                        Some(plug_body),
-                        Some(base_body),
+                        Some(extend_body),
+                        Some(graft_body),
+                        Some(shallow_body),
                     )
                 }
                 TySpecifics::MutRef((data, pure_data)) => {
@@ -781,7 +757,7 @@ impl TaskEncoder for IndirectPredEnc {
                     // otherwise, then extended at the referent's positions.
                     let mut value = referent_snap;
                     for &subquery in &subqueries {
-                        value = Self::field_ext(
+                        value = Self::field_extend(
                             &subqueries,
                             subquery,
                             referent_ty,
@@ -791,31 +767,31 @@ impl TaskEncoder for IndirectPredEnc {
                         )?;
                     }
                     let metadata = pure_data.metadata_access.call()(k.downcast_ty());
-                    let fetch_body =
+                    let extend_body =
                         pure_data.prim_to_snap.call()(addr, metadata, value.downcast_ty());
-                    // The referent's positions in the interval are plugged in like a
-                    // field's: into `t`'s referent reset by `base` if 'a is in the
+                    // The referent's positions in the interval are grafted in like a
+                    // field's: into `t`'s referent made shallow if 'a is in the
                     // interval, into `s`'s otherwise. A position behind 'a that is not
-                    // in the interval is thus reset, even if `t` fetched it.
+                    // in the interval is thus collapsed, even if `t` extended it.
                     let s_addr = pure_data.deref_access.call()(s.downcast_ty());
                     let s_metadata = pure_data.metadata_access.call()(s.downcast_ty());
                     let s_value: vir::ExprSnap<'vir> =
                         pure_data.value_access.call()(s.downcast_ty()).upcast_ty();
                     let t_value: vir::ExprSnap<'vir> =
                         pure_data.value_access.call()(t.downcast_ty()).upcast_ty();
-                    let t_base = Self::field_base(referent_ty, t_value, deps)?;
-                    let mut value = vir::expr! { vcx; (in_query) ? (t_base) : (s_value) };
+                    let t_shallow = Self::field_shallow(referent_ty, t_value, deps)?;
+                    let mut value = vir::expr! { vcx; (in_query) ? (t_shallow) : (s_value) };
                     for &subquery in &subqueries {
-                        value = Self::field_plug(subquery, referent_ty, value, t_value, deps)?;
+                        value = Self::field_graft(subquery, referent_ty, value, t_value, deps)?;
                     }
-                    let plug_body =
+                    let graft_body =
                         pure_data.prim_to_snap.call()(s_addr, s_metadata, value.downcast_ty());
                     // Reset, the reference has the snapshot its direct predicate gives it.
                     let arbitrary_value = deps
                         .require_dep::<TyImpureEnc>(*task_key)?
                         .expect_mutref()
                         .arbitrary_value;
-                    let base_body = arbitrary_value(
+                    let shallow_body = arbitrary_value(
                         s_addr,
                         s_metadata,
                         params.ty_exprs(),
@@ -823,9 +799,9 @@ impl TaskEncoder for IndirectPredEnc {
                     );
                     (
                         Some(vcx.mk_conj(&conjuncts)),
-                        Some(fetch_body.upcast_ty()),
-                        Some(plug_body.upcast_ty()),
-                        Some(base_body.upcast_ty()),
+                        Some(extend_body.upcast_ty()),
+                        Some(graft_body.upcast_ty()),
+                        Some(shallow_body.upcast_ty()),
                     )
                 }
                 // A shared reference has no lifetime positions.
@@ -858,7 +834,7 @@ impl TaskEncoder for IndirectPredEnc {
                     hi
                 )))
             };
-            let fetch_body = fetch_body.map(|fetch_body| {
+            let extend_body = extend_body.map(|extend_body| {
                 vir::expr! { vcx;
                     ((lo) < (hi)) ? (unfolding ([predicate](
                         k,
@@ -866,33 +842,35 @@ impl TaskEncoder for IndirectPredEnc {
                         [..[params.const_exprs()]],
                         lo,
                         hi
-                    )) in (fetch_body)) : (k)
+                    )) in (extend_body)) : (k)
                 }
             });
-            // At a type parameter, `fetch`, `plug` and `base` are abstract. What `fetch`
-            // reads differs from its key only at the fetched positions, so plugging it
-            // back in gives it again, and resetting it gives the reset key; field
+            // At a type parameter, `extend`, `graft` and `shallow` are abstract. What
+            // `extend` reads differs from its key only at the extended positions, so
+            // grafting it back in gives it again, and making it shallow gives the
+            // shallow key; field
             // snapshots of types containing the parameter have these forms.
-            let mut fetch_posts = Vec::new();
+            let mut extend_posts = Vec::new();
             if ty.specifics.is_param() {
                 let result = vcx.mk_result(snapshot);
-                let plugged =
-                    plug.call()(k, params.ty_exprs(), params.const_exprs(), result, lo, hi);
-                fetch_posts.push(vcx.mk_eq_expr(plugged, result));
-                let base_result = base.call()(result, params.ty_exprs(), params.const_exprs());
-                let base_key = base.call()(k, params.ty_exprs(), params.const_exprs());
-                fetch_posts.push(vcx.mk_eq_expr(base_result, base_key));
+                let grafted =
+                    graft.call()(k, params.ty_exprs(), params.const_exprs(), result, lo, hi);
+                extend_posts.push(vcx.mk_eq_expr(grafted, result));
+                let shallow_result =
+                    shallow.call()(result, params.ty_exprs(), params.const_exprs());
+                let shallow_key = shallow.call()(k, params.ty_exprs(), params.const_exprs());
+                extend_posts.push(vcx.mk_eq_expr(shallow_result, shallow_key));
             }
-            // Plugging an empty interval changes nothing, as for every type whose `plug`
+            // Grafting an empty interval changes nothing, as for every type whose `graft`
             // has a body.
-            let mut plug_posts = Vec::new();
+            let mut graft_posts = Vec::new();
             if ty.specifics.is_param() {
                 let result = vcx.mk_result(snapshot);
                 let unchanged = vcx.mk_eq_expr(result, s);
-                plug_posts.push(vir::expr! { vcx; ((hi) <= (lo)) ==> (unchanged) });
+                graft_posts.push(vir::expr! { vcx; ((hi) <= (lo)) ==> (unchanged) });
             }
-            let fetch_decl = vcx.mk_function(
-                fetch,
+            let extend_decl = vcx.mk_function(
+                extend,
                 (
                     k_decl,
                     params.ty_decls(),
@@ -901,13 +879,13 @@ impl TaskEncoder for IndirectPredEnc {
                     hi_decl,
                 ),
                 vcx.alloc_slice(&[pre]),
-                vcx.alloc_slice(&fetch_posts),
+                vcx.alloc_slice(&extend_posts),
                 None,
-                fetch_body,
+                extend_body,
             );
 
-            let plug_decl = vcx.mk_function(
-                plug,
+            let graft_decl = vcx.mk_function(
+                graft,
                 (
                     s_decl,
                     params.ty_decls(),
@@ -917,51 +895,30 @@ impl TaskEncoder for IndirectPredEnc {
                     hi_decl,
                 ),
                 &[],
-                vcx.alloc_slice(&plug_posts),
+                vcx.alloc_slice(&graft_posts),
                 None,
-                plug_body,
+                graft_body,
             );
 
-            let base_decl = vcx.mk_function(
-                base,
+            let shallow_decl = vcx.mk_function(
+                shallow,
                 (s_decl, params.ty_decls(), params.const_decls()),
                 &[],
                 &[],
                 None,
-                base_body,
+                shallow_body,
             );
 
-            let fetched = fetch.call()(k, params.ty_exprs(), params.const_exprs(), lo, hi);
-            let ext_body = plug.call()(k, params.ty_exprs(), params.const_exprs(), fetched, lo, hi);
-            let ext_decl = vcx.mk_function(
-                ext,
-                (
-                    k_decl,
-                    params.ty_decls(),
-                    params.const_decls(),
-                    lo_decl,
-                    hi_decl,
-                ),
-                vcx.alloc_slice(&[pre]),
-                &[],
-                None,
-                Some(ext_body),
-            );
-
-            Ok((
-                (predicate_decl, fetch_decl, plug_decl, base_decl, ext_decl),
-                (),
-            ))
+            Ok(((predicate_decl, extend_decl, graft_decl, shallow_decl), ()))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for (predicate, fetch, plug, base, ext) in Self::all_outputs_local_no_errors(program) {
+        for (predicate, extend, graft, shallow) in Self::all_outputs_local_no_errors(program) {
             program.add_predicate(predicate);
-            program.add_function(fetch);
-            program.add_function(plug);
-            program.add_function(base);
-            program.add_function(ext);
+            program.add_function(extend);
+            program.add_function(graft);
+            program.add_function(shallow);
         }
     }
 }
@@ -1062,26 +1019,26 @@ mod verification_tests {
               unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
             }
 
-            // Fetching 'a reads the referent's snapshot and keeps the address.
-            method fetch(k: s_Ref_mutable, U: Type)
+            // Extending by 'a reads the referent's snapshot and keeps the address.
+            method extend(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1)
               ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures fetch_Ref_mutable(k, U, 0, 1).s_Ref_mutable_0 == k.s_Ref_mutable_0
-              ensures fetch_Ref_mutable(k, U, 0, 1).s_Ref_mutable_2 ==
+              ensures extend_Ref_mutable(k, U, 0, 1).s_Ref_mutable_0 == k.s_Ref_mutable_0
+              ensures extend_Ref_mutable(k, U, 0, 1).s_Ref_mutable_2 ==
                 (unfolding p_Ref_mutable_ind(k, U, 0, 1) in p_Param_snap(k.s_Ref_mutable_0, U))
             {
             }
 
             // Split off 'a, the referent's positions are on the snapshot
-            // fetched through 'a.
+            // extended by 'a.
             method split(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
               ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Ref_mutable_ind(fetch_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
+              ensures p_Ref_mutable_ind(extend_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
             {
               unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
               fold p_Ref_mutable_ind(k, U, 0, 1)
-              fold p_Ref_mutable_ind(fetch_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
+              fold p_Ref_mutable_ind(extend_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
             }
             "#,
         );
@@ -1124,7 +1081,7 @@ mod verification_tests {
             r#"
             method test(k: s_Ref_immutable, U: Type)
               ensures p_Ref_immutable_ind(k, U, 0, 1)
-              ensures fetch_Ref_immutable(k, U, 0, 1) == k
+              ensures extend_Ref_immutable(k, U, 0, 1) == k
             {
               fold p_Ref_immutable_ind(k, U, 0, 1)
             }
@@ -1362,7 +1319,7 @@ mod verification_tests {
     }
 
     /// In `&'a mut &'b mut i32`, the position of `'b` lies behind `'a`. Split
-    /// off `'a`, it is on the snapshot fetched through `'a`.
+    /// off `'a`, it is on the snapshot extended by `'a`.
     #[test]
     fn nested_mutable_references() {
         let src = "struct S<'a, 'b> { r: &'a mut &'b mut i32 }
@@ -1372,11 +1329,11 @@ mod verification_tests {
             r#"
             method split(k: s_S)
               requires p_S_ind(k, 0, 2)
-              ensures p_S_ind(k, 0, 1) && p_S_ind(fetch_S(k, 0, 1), 1, 2)
+              ensures p_S_ind(k, 0, 1) && p_S_ind(extend_S(k, 0, 1), 1, 2)
             {
               unfold p_S_ind(k, 0, 2)
               fold p_S_ind(k, 0, 1)
-              fold p_S_ind(fetch_S(k, 0, 1), 1, 2)
+              fold p_S_ind(extend_S(k, 0, 1), 1, 2)
             }
             "#,
         );
@@ -1397,8 +1354,8 @@ mod verification_tests {
         );
     }
 
-    /// In `N<'b, 'a>`, `'b` comes first but lies behind `'a`. Fetching both
-    /// positions is fetching `'a`, then `'b` on the result.
+    /// In `N<'b, 'a>`, `'b` comes first but lies behind `'a`. Extending by both
+    /// positions is extending by `'a`, then by `'b` on the result.
     #[test]
     fn enclosed_lifetime_first() {
         let src = "struct N<'b, 'a>(&'a mut &'b mut i32);
@@ -1409,11 +1366,11 @@ mod verification_tests {
             method test(k: s_N)
               requires p_N_ind(k, 0, 2)
             {
-              var all: s_N := fetch_N(k, 0, 2)
+              var all: s_N := extend_N(k, 0, 2)
               unfold p_N_ind(k, 0, 2)
               fold p_N_ind(k, 1, 2)
-              fold p_N_ind(fetch_N(k, 1, 2), 0, 1)
-              assert all == fetch_N(fetch_N(k, 1, 2), 0, 1)
+              fold p_N_ind(extend_N(k, 1, 2), 0, 1)
+              assert all == extend_N(extend_N(k, 1, 2), 0, 1)
             }
             "#,
         );
@@ -1423,10 +1380,10 @@ mod verification_tests {
             method test(k: s_N)
               requires p_N_ind(k, 0, 2)
             {
-              var all: s_N := fetch_N(k, 0, 2)
+              var all: s_N := extend_N(k, 0, 2)
               unfold p_N_ind(k, 0, 2)
               fold p_N_ind(k, 1, 2)
-              fold p_N_ind(fetch_N(k, 1, 2), 0, 1)
+              fold p_N_ind(extend_N(k, 1, 2), 0, 1)
               assert false
             }
             "#,
@@ -1435,7 +1392,7 @@ mod verification_tests {
     }
 
     /// In `&'a mut &'a mut i32`, the predicate puts the inner `'a` on the
-    /// snapshot fetched through the outer one.
+    /// snapshot extended by the outer one.
     #[test]
     fn nested_mutable_references_same_lifetime() {
         let src = "struct E<'a>(&'a mut &'a mut i32);
@@ -1446,13 +1403,13 @@ mod verification_tests {
             method test(k: s_E)
               requires p_E_ind(k, 0, 1)
               ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-              ensures p_Ref_mutable_ind(fetch_Ref_mutable(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+              ensures p_Ref_mutable_ind(extend_Ref_mutable(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
             {
               unfold p_E_ind(k, 0, 1)
             }
             "#,
         );
-        // Not on the field snapshot that is not fetched.
+        // Not on the field snapshot that is not extended.
         assert_fails(
             src,
             r#"
@@ -1499,11 +1456,11 @@ mod verification_tests {
               fold p_E_ind(k, T, 0, 1 + arity(T))
             }
 
-            // Fetching keeps the variant.
-            method fetch(k: s_E, T: Type)
+            // Extending keeps the variant.
+            method extend(k: s_E, T: Type)
               requires p_E_ind(k, T, 0, 1)
               ensures p_E_ind(k, T, 0, 1)
-              ensures s_E_discr(fetch_E(k, T, 0, 1)) == s_E_discr(k)
+              ensures s_E_discr(extend_E(k, T, 0, 1)) == s_E_discr(k)
             {
             }
 
@@ -1565,32 +1522,32 @@ mod verification_tests {
               unfold p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
             }
 
-            // Resetting is the same on both sides of a cast.
-            method base(k: s_Ref_mutable, U: Type)
+            // Making a snapshot shallow is the same on both sides of a cast.
+            method shallow(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1)
             {
               make_generic_ind_Ref_mutable(k, U, 0, 1)
-              assert base_Param(make_generic_s_Ref_mutable(k, U), s_Ref_mutable_type(U)) ==
-                make_generic_s_Ref_mutable(base_Ref_mutable(k, U), U)
+              assert shallow_Param(make_generic_s_Ref_mutable(k, U), s_Ref_mutable_type(U)) ==
+                make_generic_s_Ref_mutable(shallow_Ref_mutable(k, U), U)
             }
 
-            // Casting back and forth keeps what is fetched.
+            // Casting back and forth keeps what extending reads.
             method round_trip(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1)
               ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures fetch_Ref_mutable(k, U, 0, 1) == old(fetch_Ref_mutable(k, U, 0, 1))
+              ensures extend_Ref_mutable(k, U, 0, 1) == old(extend_Ref_mutable(k, U, 0, 1))
             {
               make_generic_ind_Ref_mutable(k, U, 0, 1)
               make_concrete_ind_Ref_mutable(k, U, 0, 1)
             }
 
-            // What is fetched through the option is what is fetched through the reference.
-            method fetch_option(k: s_Option, U: Type)
+            // What extending the option reads is what extending the reference reads.
+            method extend_option(k: s_Option, U: Type)
               requires p_Option_ind(k, s_Ref_mutable_type(U), 0, 1) && k.iss_Option_1_cons
               requires s_Param_typ(k.s_Option_1_0) == s_Ref_mutable_type(U)
               ensures p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
-              ensures old(fetch_Option(k, s_Ref_mutable_type(U), 0, 1)).s_Option_1_0 ==
-                make_generic_s_Ref_mutable(fetch_Ref_mutable(
+              ensures old(extend_Option(k, s_Ref_mutable_type(U), 0, 1)).s_Option_1_0 ==
+                make_generic_s_Ref_mutable(extend_Ref_mutable(
                   k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1), U)
             {
               unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
@@ -1624,7 +1581,7 @@ mod verification_tests {
     }
 
     /// 'a encloses 'b in `B` but not in `A`, so `A`'s predicate for 'b is on
-    /// the field snapshot reset by `base`.
+    /// the shallow field snapshot.
     #[test]
     fn field_with_fewer_enclosing_positions() {
         let src = "struct A<'a, 'b>(&'a mut i32, &'b mut i32);
@@ -1635,10 +1592,10 @@ mod verification_tests {
             r#"
             method test(k: s_B)
               requires p_B_ind(k, 0, 1)
-              requires p_B_ind(fetch_B(k, 0, 1), 1, 2)
-              ensures p_A_ind(base_A(k.s_B_0), 1, 2)
+              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
+              ensures p_A_ind(shallow_A(k.s_B_0), 1, 2)
             {
-              unfold p_B_ind(fetch_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
             }
             "#,
         );
@@ -1647,24 +1604,24 @@ mod verification_tests {
             r#"
             method test(k: s_B)
               requires p_B_ind(k, 0, 1)
-              requires p_B_ind(fetch_B(k, 0, 1), 1, 2)
+              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
             {
-              unfold p_B_ind(fetch_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
               assert false
             }
             "#,
             "Assert might fail",
         );
-        // The field's snapshot itself may carry what was fetched through 'a.
+        // The field's snapshot itself may carry what extending by 'a read.
         assert_fails(
             src,
             r#"
             method test(k: s_B)
               requires p_B_ind(k, 0, 1)
-              requires p_B_ind(fetch_B(k, 0, 1), 1, 2)
+              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
               ensures p_A_ind(k.s_B_0, 1, 2)
             {
-              unfold p_B_ind(fetch_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
             }
             "#,
             "insufficient permission to access p_A_ind",
@@ -1673,8 +1630,8 @@ mod verification_tests {
 
     /// Like `field_with_fewer_enclosing_positions`, with a recursive field
     /// type: the field of an unextended snapshot gets `List`'s predicate for
-    /// 'b on its own snapshot, though the predicate is on the field reset by
-    /// `base` after fetching through 'a.
+    /// 'b on its own snapshot, though the predicate is on the shallow field
+    /// after extending by 'a.
     #[test]
     fn recursive_field_with_fewer_enclosing_positions() {
         let src = "struct List<'a, 'b> {
@@ -1688,11 +1645,11 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Outer)
-              requires base_Outer(k) == k
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires shallow_Outer(k) == k
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
               ensures p_List_ind(k.s_Outer_0, 1, 2)
             {
-              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
             }
             "#,
         );
@@ -1700,10 +1657,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Outer)
-              requires base_Outer(k) == k
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires shallow_Outer(k) == k
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
             {
-              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
               assert false
             }
             "#,
@@ -1711,9 +1668,9 @@ mod verification_tests {
         );
     }
 
-    /// `List`'s predicate for 'b on the reset field of `Outer` can be followed
-    /// into the next element: the snapshot in `Option` is reset, which the
-    /// cast of `Box<List>` turns into the reset concrete snapshot.
+    /// `List`'s predicate for 'b on the shallow field of `Outer` can be followed
+    /// into the next element: the snapshot in `Option` is shallow, which the
+    /// cast of `Box<List>` turns into the shallow concrete snapshot.
     #[test]
     fn recursive_field_into_next() {
         // The tuple's second element provides the casts of `Box<List>`.
@@ -1728,16 +1685,16 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Outer, b: s_Box)
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
               requires k.s_Outer_0.s_List_2 ==
                 s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
-              ensures p_Box_ind(base_Box(b, s_List_type(), s_Global_type()), s_List_type(), s_Global_type(), 1, 2)
+              ensures p_Box_ind(shallow_Box(b, s_List_type(), s_Global_type()), s_List_type(), s_Global_type(), 1, 2)
             {
-              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
-              unfold p_List_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0), 1, 2)
-              unfold p_Option_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0).s_List_2,
+              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              unfold p_List_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0), 1, 2)
+              unfold p_Option_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0).s_List_2,
                 s_Box_type(s_List_type(), s_Global_type()), 1, 2)
-              make_concrete_ind_Box(base_Box(b, s_List_type(), s_Global_type()),
+              make_concrete_ind_Box(shallow_Box(b, s_List_type(), s_Global_type()),
                 s_List_type(), s_Global_type(), 1, 2)
             }
             "#,
@@ -1749,15 +1706,15 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Outer, b: s_Box)
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
+              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
               requires k.s_Outer_0.s_List_2 ==
                 s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
             {
-              unfold p_Outer_ind(fetch_Outer(k, 0, 1), 1, 2)
-              unfold p_List_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0), 1, 2)
-              unfold p_Option_ind(base_List(fetch_Outer(k, 0, 1).s_Outer_0).s_List_2,
+              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              unfold p_List_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0), 1, 2)
+              unfold p_Option_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0).s_List_2,
                 s_Box_type(s_List_type(), s_Global_type()), 1, 2)
-              make_concrete_ind_Box(base_Box(b, s_List_type(), s_Global_type()),
+              make_concrete_ind_Box(shallow_Box(b, s_List_type(), s_Global_type()),
                 s_List_type(), s_Global_type(), 1, 2)
               assert false
             }
@@ -1774,16 +1731,16 @@ mod verification_tests {
 
     /// 'y encloses 'z in `C` but not in `F`, and lies behind 'x in both: `C`
     /// gives `F`'s predicates for 'y and 'z on one snapshot, the field
-    /// fetched through 'x, as `F` has them.
+    /// extended by 'x, as `F` has them.
     #[test]
     fn field_with_fewer_enclosing_positions_behind_reference() {
         let src = "struct F<'x, 'y, 'z>(&'x mut (&'y mut i32, &'z mut i32));
                    struct C<'x, 'y, 'z>(F<'x, 'y, 'z>, &'y mut &'z mut i32);
                    type X<'x, 'y, 'z> = C<'x, 'y, 'z>;";
         let keys = r#"
-            // The keys of 'y and 'z: `k` fetched through their ancestors.
-            define KY(k) plug_C(k, fetch_C(k, 0, 1), 0, 1)
-            define KZ(k) plug_C(KY(k), fetch_C(KY(k), 1, 2), 1, 2)
+            // The keys of 'y and 'z: `k` extended by their ancestors.
+            define KY(k) extend_C(k, 0, 1)
+            define KZ(k) extend_C(KY(k), 1, 2)
             "#;
         assert_verifies(
             src,
@@ -1823,21 +1780,21 @@ mod verification_tests {
     /// Resetting a mutable reference gives it the snapshot its direct
     /// predicate gives it.
     #[test]
-    fn base_mutable_reference() {
+    fn shallow_mutable_reference() {
         let src = "type X<'a, T> = &'a mut T;";
         assert_verifies(
             src,
             r#"
             method unextended(a: Ref, m: s_Param, U: Type)
-              ensures base_Ref_mutable(p_Ref_mutable_arbitrary_value(a, m, U), U) ==
+              ensures shallow_Ref_mutable(p_Ref_mutable_arbitrary_value(a, m, U), U) ==
                 p_Ref_mutable_arbitrary_value(a, m, U)
             {
             }
 
-            method fetched(k: s_Ref_mutable, U: Type)
+            method extended(k: s_Ref_mutable, U: Type)
               requires p_Ref_mutable_ind(k, U, 0, 1)
               ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures base_Ref_mutable(fetch_Ref_mutable(k, U, 0, 1), U) == base_Ref_mutable(k, U)
+              ensures shallow_Ref_mutable(extend_Ref_mutable(k, U, 0, 1), U) == shallow_Ref_mutable(k, U)
             {
             }
             "#,
@@ -1847,7 +1804,7 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Ref_mutable, U: Type)
-              ensures base_Ref_mutable(k, U) == k
+              ensures shallow_Ref_mutable(k, U) == k
             {
             }
             "#,
@@ -1856,7 +1813,7 @@ mod verification_tests {
     }
 
     #[test]
-    fn plug_empty_interval() {
+    fn graft_empty_interval() {
         let src = "struct S<'a, 'b, T>(&'a mut &'b mut i32, Option<&'a mut T>);
                    type X<'a, 'b, T> = S<'a, 'b, T>;";
         assert_verifies(
@@ -1864,7 +1821,7 @@ mod verification_tests {
             r#"
             method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
               requires hi <= lo
-              ensures plug_S(s, T, t, lo, hi) == s
+              ensures graft_S(s, T, t, lo, hi) == s
             {
             }
             "#,
@@ -1874,7 +1831,7 @@ mod verification_tests {
             src,
             r#"
             method test(s: s_S, t: s_S, T: Type)
-              ensures plug_S(s, T, t, 0, 1) == s
+              ensures graft_S(s, T, t, 0, 1) == s
             {
             }
             "#,
@@ -1886,7 +1843,7 @@ mod verification_tests {
             method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
               requires hi <= lo
             {
-              assert plug_S(s, T, t, lo, hi) == s
+              assert graft_S(s, T, t, lo, hi) == s
               assert false
             }
             "#,
