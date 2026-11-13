@@ -7,10 +7,7 @@ use vir::CastType;
 
 use crate::encoders::ty::{
     RustParamData, RustTyDecomposition, TySpecifics,
-    generics::{
-        TyExprEnc,
-        arity::{ArityEnc, add},
-    },
+    generics::arity::{TyArityEnc, add},
 };
 
 /// Encodes the lifetime positions of a type and which of them enclose which.
@@ -109,17 +106,15 @@ impl TaskEncoder for LifetimePositionEnc {
         match task_key.ty.specifics {
             TySpecifics::ImmRef(_) => {}
             TySpecifics::Param(RustParamData::Generic) => {
-                let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
-                let ty = deps.require_dep::<TyExprEnc>(*task_key)?;
+                let arity = deps.require_dep::<TyArityEnc>(*task_key)?;
                 lifetimes.push(GeneralizedLifetime::RegionsIn(*task_key));
-                intervals.push((int(0), arity.call()(ty)));
+                intervals.push((int(0), arity));
                 direct.push(Vec::new());
             }
             _ => {
                 // The positions of each generic argument, by its index.
                 let mut arg_positions = Vec::new();
                 let mut offset = int(0);
-                let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
                 for arg in task_key.args.args() {
                     let base = direct.len();
                     match arg.kind() {
@@ -143,11 +138,7 @@ impl TaskEncoder for LifetimePositionEnc {
                                     arg_graph.ancestors(p).iter().copied().map(shift).collect(),
                                 );
                             }
-                            // The arity of the argument is given by the axiom
-                            // of its type constructor.
-                            deps.require_ref::<ArityEnc>(arg_ty.ty)?;
-                            let arg_ty = deps.require_dep::<TyExprEnc>(arg_ty)?;
-                            offset = add(offset, arity.call()(arg_ty));
+                            offset = add(offset, deps.require_dep::<TyArityEnc>(arg_ty)?);
                         }
                         ty::GenericArgKind::Const(_) => {}
                     }
@@ -342,11 +333,7 @@ mod tests {
                 "struct Pair<'c, 'd>(&'c mut i32, &'d mut i32);
                  type X<'a, 'b> = (&'a mut i32, Pair<'a, 'b>);"
             ),
-            [
-                "'a @ 0",
-                "'a @ arity(s_Ref_mutable_type(s_Int_i32_type()))",
-                "'b @ (arity(s_Ref_mutable_type(s_Int_i32_type()))) + (1)",
-            ],
+            ["'a @ 0", "'a @ 1", "'b @ 2"],
         );
     }
 
@@ -357,8 +344,8 @@ mod tests {
             [
                 "'a @ 0",
                 "T @ 1 behind [0]",
-                "'a @ arity(s_Ref_mutable_type(T$1))",
-                "T @ (arity(s_Ref_mutable_type(T$1))) + (1) behind [2]",
+                "'a @ (1) + (arity(T$1))",
+                "T @ (arity(T$1)) + (2) behind [2]",
             ],
         );
     }

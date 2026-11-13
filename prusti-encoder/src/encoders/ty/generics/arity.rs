@@ -1,8 +1,11 @@
+use prusti_rustc_interface::middle::ty;
 use task_encoder::{EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::CastType;
 
 use crate::encoders::ty::{
-    RustParamData, RustTy, TySpecifics, generics::GenericParamsEnc, lifted::TyConstructorEnc,
+    RustParamData, RustTy, RustTyDecomposition, TySpecifics,
+    generics::{GenericParamsEnc, TyExprEnc},
+    lifted::TyConstructorEnc,
 };
 
 pub struct ArityEnc;
@@ -14,9 +17,17 @@ pub struct ArityEncOutputRef<'vir> {
 
 impl<'vir> task_encoder::OutputRefAny for ArityEncOutputRef<'vir> {}
 
-/// The sum `a + b`.
+/// The sum `a + b`, folded if both are literals or one is `0`.
 pub(crate) fn add<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::ExprInt<'vir> {
-    vir::with_vcx(|vcx| vcx.mk_bin_op_expr(vir::BinOpKind::Add, a, b).downcast_ty())
+    vir::with_vcx(|vcx| match (a.kind, b.kind) {
+        (
+            vir::ExprKindGenData::Const(vir::ConstData::Int(x)),
+            vir::ExprKindGenData::Const(vir::ConstData::Int(y)),
+        ) => vcx.mk_const_expr(vir::ConstData::Int(x + y)).downcast_ty(),
+        (vir::ExprKindGenData::Const(vir::ConstData::Int(0)), _) => b,
+        (_, vir::ExprKindGenData::Const(vir::ConstData::Int(0))) => a,
+        _ => vcx.mk_bin_op_expr(vir::BinOpKind::Add, a, b).downcast_ty(),
+    })
 }
 
 fn arity_fn_ident<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
@@ -111,13 +122,90 @@ impl TaskEncoder for ArityEnc {
     }
 }
 
+/// The arity of a type expression, as the arity axioms of its type constructors give
+/// it: a literal unless the expression contains type parameters, whose arities it adds.
+pub struct TyArityEnc;
+
+impl TaskEncoder for TyArityEnc {
+    task_encoder::encoder_cache!(TyArityEnc);
+    const ENCODER_NAME: &'static str = "type arity encoder";
+
+    type TaskDescription<'vir> = RustTyDecomposition<'vir>;
+    type OutputFullDependency<'vir> = vir::ExprInt<'vir>;
+
+    fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
+        *task
+    }
+
+    fn do_encode_full<'vir>(
+        task_key: &Self::TaskKey<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, Self>,
+    ) -> EncodeFullResult<'vir, Self> {
+        deps.emit_output_ref(*task_key, ())?;
+        let int = |n: u128| -> vir::ExprInt<'vir> {
+            vir::with_vcx(|vcx| vcx.mk_const_expr(vir::ConstData::Int(n)).downcast_ty())
+        };
+        let arity = match task_key.ty.specifics {
+            // The caller instantiates the parameter; the axiom of that type gives its arity.
+            TySpecifics::Param(RustParamData::Generic) => {
+                let arity = deps.require_ref::<ArityEnc>(task_key.ty)?.arity;
+                arity.call()(deps.require_dep::<TyExprEnc>(*task_key)?)
+            }
+            TySpecifics::ImmRef(_) => int(0),
+            _ => {
+                let mut arity = int(0);
+                for arg in task_key.args.args() {
+                    match arg.kind() {
+                        ty::GenericArgKind::Lifetime(_) => arity = add(arity, int(1)),
+                        ty::GenericArgKind::Type(arg_ty) => {
+                            let arg_ty =
+                                RustTyDecomposition::from_ty(arg_ty, task_key.args.context());
+                            arity = add(arity, deps.require_dep::<Self>(arg_ty)?);
+                        }
+                        ty::GenericArgKind::Const(_) => {}
+                    }
+                }
+                arity
+            }
+        };
+        Ok(((), arity))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use prusti_rustc_interface::span::DUMMY_SP;
     use task_encoder::TaskEncoder;
 
-    use super::ArityEnc;
+    use super::{ArityEnc, TyArityEnc};
     use crate::encoders::ty::test_util::{dedent, simplified, with_type_alias};
+
+    /// The arity of the type alias `X` defined in `src`, as the encoder computes it.
+    fn ty_arity(src: &str) -> String {
+        with_type_alias(src, |ty| {
+            let (_, _, arity) = TyArityEnc::encode(ty, true, DUMMY_SP).unwrap().unwrap();
+            format!("{arity:?}")
+        })
+    }
+
+    #[test]
+    fn ty_arity_of_concrete_types() {
+        assert_eq!(ty_arity("type X<'a, 'b> = &'a mut &'b mut i32;"), "2");
+        assert_eq!(
+            ty_arity("type X<'a, 'b> = (&'a mut i32, Option<&'b mut i32>);"),
+            "2"
+        );
+        assert_eq!(ty_arity("type X<'a, 'b> = &'a &'b mut i32;"), "0");
+    }
+
+    #[test]
+    fn ty_arity_of_type_params() {
+        assert_eq!(ty_arity("type X<'a, T> = &'a mut T;"), "(1) + (arity(T$1))");
+        assert_eq!(
+            ty_arity("type X<'a, T> = (T, &'a mut T);"),
+            "(arity(T$1)) + ((1) + (arity(T$1)))"
+        );
+    }
 
     /// The expression of the arity axiom of the type constructor of the type alias `X` defined in `src`.
     /// A quantified axiom shows its body on its own line.
