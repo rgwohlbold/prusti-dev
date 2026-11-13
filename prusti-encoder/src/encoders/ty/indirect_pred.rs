@@ -133,9 +133,23 @@ struct Subquery<'vir> {
     lifetime: GeneralizedLifetime<'vir>,
     /// The lifetimes of the own positions enclosing this one.
     enclosing: &'vir [GeneralizedLifetime<'vir>],
+    /// Whether the query contains part of this position.
     guard: vir::ExprBool<'vir>,
+    /// The part of the query at this position, empty if `guard` is false.
     start: vir::ExprInt<'vir>,
     end: vir::ExprInt<'vir>,
+}
+
+impl<'vir> Subquery<'vir> {
+    /// `[start, end)` where `guard` holds: the whole position for an own lifetime.
+    fn guarded(self) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
+        match self.lifetime {
+            GeneralizedLifetime::Region(_) => {
+                vir::with_vcx(|vcx| (vcx.mk_uint::<0>(), vcx.mk_uint::<1>()))
+            }
+            GeneralizedLifetime::RegionsIn(_) => (self.start, self.end),
+        }
+    }
 }
 
 /// A field of a struct or of an enum variant: its type and its reader.
@@ -172,18 +186,21 @@ impl IndirectPredEnc {
                         .collect::<Vec<_>>();
                     let enclosing = vcx.alloc_slice(&enclosing);
                     let (x, _) = graph.interval(p);
+                    let zero = vcx.mk_uint::<0>();
                     Ok(match lifetime {
                         // An own lifetime is a single position, either in the query or not.
-                        GeneralizedLifetime::Region(_) => Subquery {
-                            lifetime,
-                            enclosing,
-                            guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
-                            start: vcx.mk_uint::<0>(),
-                            end: vcx.mk_uint::<1>(),
-                        },
+                        GeneralizedLifetime::Region(_) => {
+                            let one = vcx.mk_uint::<1>();
+                            Subquery {
+                                lifetime,
+                                enclosing,
+                                guard: vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) },
+                                start: clamp.call()(sub(lo, x), zero, one),
+                                end: clamp.call()(sub(hi, x), zero, one),
+                            }
+                        }
                         GeneralizedLifetime::RegionsIn(ty) => {
                             let w = arity.call()(deps.require_dep::<TyExprEnc>(ty)?);
-                            let zero = vcx.mk_uint::<0>();
                             let start = clamp.call()(sub(lo, x), zero, w);
                             let end = clamp.call()(sub(hi, x), zero, w);
                             Subquery {
@@ -222,8 +239,9 @@ impl IndirectPredEnc {
             )?;
             let guard = outer.guard;
             let (x, _) = graph.interval(enclosing);
-            let start = add(x, outer.start);
-            let end = add(x, outer.end);
+            let (outer_start, outer_end) = outer.guarded();
+            let start = add(x, outer_start);
+            let end = add(x, outer_end);
             let extended = Self::extend(field_ty, snap, key, start, end, deps)?;
             // An enclosing position of the same lifetime is in the query
             // whenever `p` is.
@@ -285,7 +303,7 @@ impl IndirectPredEnc {
             .collect::<Vec<_>>();
         if let GeneralizedLifetime::RegionsIn(_) = graph.lifetime(p) {
             let (lo, _) = graph.interval(p);
-            keep.push((lo, add(lo, subquery.start)));
+            keep.push((lo, add(lo, subquery.guarded().0)));
         }
         let mut snap = field_ind.base.call()(field_snap, args.get_ty(), args.get_const());
         for (lo, hi) in keep {
@@ -294,7 +312,8 @@ impl IndirectPredEnc {
         Ok(snap)
     }
 
-    /// `s_field` with the positions of `subquery` in `field_ty` plugged in from `t_field`.
+    /// `s_field` with the positions of `subquery` in `field_ty` plugged in from `t_field`;
+    /// unchanged where the subquery is empty, since plugging nothing changes nothing.
     fn field_plug<'vir>(
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
@@ -321,8 +340,7 @@ impl IndirectPredEnc {
             let end = add(x, subquery.end);
             snap = plug.call()(snap, args.get_ty(), args.get_const(), t_field, start, end);
         }
-        let guard = subquery.guard;
-        Ok(vir::expr! { (guard) ? (snap) : (s_field) })
+        Ok(snap)
     }
 
     /// The fields `fields`, given by their types and readers, of `s`, with all
@@ -396,8 +414,9 @@ impl IndirectPredEnc {
             let snap =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_snap, deps)?;
             let (x, _) = graph.interval(p);
-            let start = add(x, subquery.start);
-            let end = add(x, subquery.end);
+            let (subquery_start, subquery_end) = subquery.guarded();
+            let start = add(x, subquery_start);
+            let end = add(x, subquery_end);
             preds.push(vir::expr! {
                 acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], start, end))
             });
@@ -430,8 +449,9 @@ impl IndirectPredEnc {
             let key =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_pred, deps)?;
             let (x, _) = graph.interval(p);
-            let start = add(x, subquery.start);
-            let end = add(x, subquery.end);
+            let (subquery_start, subquery_end) = subquery.guarded();
+            let start = add(x, subquery_start);
+            let end = add(x, subquery_end);
             snap = Self::extend(field_ty, snap, key, start, end, deps)?;
         }
         let guard = subquery.guard;
@@ -844,6 +864,14 @@ impl TaskEncoder for IndirectPredEnc {
                 let base_key = base.call()(k, params.ty_exprs(), params.const_exprs());
                 fetch_posts.push(vcx.mk_eq_expr(base_result, base_key));
             }
+            // Plugging an empty interval changes nothing, as for every type whose `plug`
+            // has a body.
+            let mut plug_posts = Vec::new();
+            if ty.specifics.is_param() {
+                let result = vcx.mk_result(snapshot);
+                let unchanged = vcx.mk_eq_expr(result, s);
+                plug_posts.push(vir::expr! { vcx; ((hi) <= (lo)) ==> (unchanged) });
+            }
             let fetch_decl = vcx.mk_function(
                 fetch,
                 (
@@ -870,7 +898,7 @@ impl TaskEncoder for IndirectPredEnc {
                     hi_decl,
                 ),
                 &[],
-                &[],
+                vcx.alloc_slice(&plug_posts),
                 None,
                 plug_body,
             );
@@ -1784,6 +1812,45 @@ mod verification_tests {
             }
             "#,
             "Postcondition of test might not hold",
+        );
+    }
+
+    #[test]
+    fn plug_empty_interval() {
+        let src = "struct S<'a, 'b, T>(&'a mut &'b mut i32, Option<&'a mut T>);
+                   type X<'a, 'b, T> = S<'a, 'b, T>;";
+        assert_verifies(
+            src,
+            r#"
+            method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
+              requires hi <= lo
+              ensures plug_S(s, T, t, lo, hi) == s
+            {
+            }
+            "#,
+        );
+        // Plugging a position may change the snapshot.
+        assert_fails(
+            src,
+            r#"
+            method test(s: s_S, t: s_S, T: Type)
+              ensures plug_S(s, T, t, 0, 1) == s
+            {
+            }
+            "#,
+            "Postcondition of test might not hold",
+        );
+        assert_fails(
+            src,
+            r#"
+            method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
+              requires hi <= lo
+            {
+              assert plug_S(s, T, t, lo, hi) == s
+              assert false
+            }
+            "#,
+            "Assert might fail",
         );
     }
 }
