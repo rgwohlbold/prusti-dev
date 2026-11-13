@@ -61,9 +61,43 @@ pub struct IndirectPredRef<'vir> {
     >,
     /// `base_X(s, T..)`: `s` with every reference reset to its unextended state.
     pub base: FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
+    /// `ext_X(k, T.., lo, hi)`: `plug_X(k, T.., fetch_X(k, T.., lo, hi), lo, hi)`, which
+    /// names `k` once.
+    pub ext: FunctionIdn<
+        'vir,
+        (
+            vir::Snap,
+            vir::ManyTyVal,
+            vir::ManyCSnap,
+            vir::Int,
+            vir::Int,
+        ),
+        vir::Snap,
+    >,
 }
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
+
+impl<'vir> IndirectPredRef<'vir> {
+    /// `snap` with the positions `[lo, hi)` holding what is fetched through
+    /// the predicate on `key`.
+    pub fn extend(
+        &self,
+        snap: vir::ExprSnap<'vir>,
+        key: vir::ExprSnap<'vir>,
+        tys: &'vir [vir::ExprTyVal<'vir>],
+        consts: &'vir [vir::ExprCSnap<'vir>],
+        lo: vir::ExprInt<'vir>,
+        hi: vir::ExprInt<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        if vir::simplify::syntactic_eq(snap.as_dyn(), key.as_dyn()) {
+            self.ext.call()(snap, tys, consts, lo, hi)
+        } else {
+            let fetched = self.fetch.call()(key, tys, consts, lo, hi);
+            self.plug.call()(snap, tys, consts, fetched, lo, hi)
+        }
+    }
+}
 
 /// The positions `[first, end)` of an instantiated type, merged on the
 /// snapshot `k`.
@@ -109,8 +143,7 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
         let mut snap = self.k;
         for &q in positions {
             let (lo, hi) = self.graph.interval(q);
-            let fetched = self.ind.fetch.call()(self.key(q), tys, consts, lo, hi);
-            snap = self.ind.plug.call()(snap, tys, consts, fetched, lo, hi);
+            snap = self.ind.extend(snap, self.key(q), tys, consts, lo, hi);
         }
         snap
     }
@@ -266,15 +299,7 @@ impl IndirectPredEnc {
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
         let field_ind = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?;
         let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        let fetched = field_ind.fetch.call()(key, args.get_ty(), args.get_const(), start, end);
-        Ok(field_ind.plug.call()(
-            snap,
-            args.get_ty(),
-            args.get_const(),
-            fetched,
-            start,
-            end,
-        ))
+        Ok(field_ind.extend(snap, key, args.get_ty(), args.get_const(), start, end))
     }
 
     /// `field_snap` restricted to `p`'s ancestors in `field_ty` and `p`'s block before the
@@ -512,6 +537,7 @@ impl TaskEncoder for IndirectPredEnc {
         vir::Function<'vir>,
         vir::Function<'vir>,
         vir::Function<'vir>,
+        vir::Function<'vir>,
     );
 
     fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
@@ -565,6 +591,17 @@ impl TaskEncoder for IndirectPredEnc {
                 (snapshot, params.ty_args(), params.const_args()),
                 snapshot,
             );
+            let ext = FunctionIdn::new(
+                vir::ViperIdent::new(vir::vir_format!(vcx, "ext_{}", task_key.name())),
+                (
+                    snapshot,
+                    params.ty_args(),
+                    params.const_args(),
+                    vir::TYPE_INT,
+                    vir::TYPE_INT,
+                ),
+                snapshot,
+            );
             deps.emit_output_ref(
                 *task_key,
                 IndirectPredRef {
@@ -572,6 +609,7 @@ impl TaskEncoder for IndirectPredEnc {
                     fetch,
                     plug,
                     base,
+                    ext,
                 },
             )?;
 
@@ -912,16 +950,37 @@ impl TaskEncoder for IndirectPredEnc {
                 base_body,
             );
 
-            Ok(((predicate_decl, fetch_decl, plug_decl, base_decl), ()))
+            let fetched = fetch.call()(k, params.ty_exprs(), params.const_exprs(), lo, hi);
+            let ext_body = plug.call()(k, params.ty_exprs(), params.const_exprs(), fetched, lo, hi);
+            let ext_decl = vcx.mk_function(
+                ext,
+                (
+                    k_decl,
+                    params.ty_decls(),
+                    params.const_decls(),
+                    lo_decl,
+                    hi_decl,
+                ),
+                vcx.alloc_slice(&[pre]),
+                &[],
+                None,
+                Some(ext_body),
+            );
+
+            Ok((
+                (predicate_decl, fetch_decl, plug_decl, base_decl, ext_decl),
+                (),
+            ))
         })
     }
 
     fn emit_outputs<'vir>(program: &mut task_encoder::Program<'vir>) {
-        for (predicate, fetch, plug, base) in Self::all_outputs_local_no_errors(program) {
+        for (predicate, fetch, plug, base, ext) in Self::all_outputs_local_no_errors(program) {
             program.add_predicate(predicate);
             program.add_function(fetch);
             program.add_function(plug);
             program.add_function(base);
+            program.add_function(ext);
         }
     }
 }
