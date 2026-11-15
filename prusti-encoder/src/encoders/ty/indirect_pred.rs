@@ -288,9 +288,11 @@ impl IndirectPredEnc {
         Ok(field_ind.extend_from(snap, key, args.get_ty(), args.get_const(), start, end))
     }
 
-    /// `field_snap` restricted to `p`'s ancestors in `field_ty` and `p`'s block before the
-    /// subquery, if the container may have extended other positions of `field_ty`: the
-    /// field made shallow, with those positions grafted back in from `field_snap`.
+    /// `field_snap` restricted to `p`'s ancestors in `field_ty` and, for a type parameter,
+    /// all of `p`'s block, if the container may have extended other positions of
+    /// `field_ty`: the field made shallow, with those positions grafted back in from
+    /// `field_snap`. Which positions of a type parameter enclose the subquery is up to its
+    /// instantiation, so its block keeps what the container's key has there.
     fn restricted_snap<'vir>(
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
@@ -313,8 +315,7 @@ impl IndirectPredEnc {
             .map(|&q| graph.interval(q))
             .collect::<Vec<_>>();
         if let GeneralizedLifetime::RegionsIn(_) = graph.lifetime(p) {
-            let (lo, _) = graph.interval(p);
-            keep.push((lo, subquery.in_field(lo).0));
+            keep.push(graph.interval(p));
         }
         let mut snap = field_ind.shallow.call()(field_snap, args.get_ty(), args.get_const());
         for (lo, hi) in keep {
@@ -1769,6 +1770,53 @@ mod verification_tests {
             {
               unfold p_C_ind(KZ(k), 2, 3)
               unfold p_C_ind(KY(k), 1, 2)
+              assert false
+            }
+            "#
+            ),
+            "Assert might fail",
+        );
+    }
+
+    /// 'l encloses `T` in `D` but not in the tuple, so `D` resets the tuple's
+    /// 'l, but leaves all positions of `T` as its key has them: `D` does not
+    /// know which of them enclose the interval, the instantiation does. With
+    /// `T = S<'a, 'b, 'c>`, where 'b and 'c enclose 'a, the key of 'a is
+    /// extended by 'b and 'c, which come after 'a.
+    #[test]
+    fn type_param_field_with_fewer_enclosing_positions() {
+        let src = "struct D<'l, T> { c: &'l mut T, d: (&'l mut i32, T) }
+                   type X<'l, T> = D<'l, T>;";
+        let tuple = r#"
+            define R s_Ref_mutable_type(s_Int_i32_type())
+            define KEEP_T(k, T) graft_2_Tuple(shallow_2_Tuple(k.s_D_1, R, T), R, T,
+              k.s_D_1, 1, 1 + arity(T))
+            "#;
+        assert_verifies(
+            src,
+            &format!(
+                "{tuple}{}",
+                r#"
+            method test(k: s_D, T: Type)
+              requires 1 <= arity(T)
+              requires p_D_ind(k, T, 1, 2)
+              ensures p_2_Tuple_ind(KEEP_T(k, T), R, T, 1, 2)
+            {
+              unfold p_D_ind(k, T, 1, 2)
+            }
+            "#
+            ),
+        );
+        assert_fails(
+            src,
+            &format!(
+                "{tuple}{}",
+                r#"
+            method test(k: s_D, T: Type)
+              requires 1 <= arity(T)
+              requires p_D_ind(k, T, 1, 2)
+            {
+              unfold p_D_ind(k, T, 1, 2)
               assert false
             }
             "#
