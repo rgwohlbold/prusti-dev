@@ -4,22 +4,14 @@ use ide::{fake_error, IdeInfo};
 use prusti_interface::{
     data::VerificationTask,
     environment::{mir_storage, Environment},
-    specs::{self, cross_crate::CrossCrateSpecs, is_spec_fn},
+    specs::{self, cross_crate::CrossCrateSpecs},
     PrustiError,
 };
 use prusti_rustc_interface::{
     ast::{AttrVec, Crate, Item, ItemKind, Visibility, VisibilityKind, DUMMY_NODE_ID},
-    borrowck::consumers,
-    data_structures::steal::Steal,
     driver::Compilation,
-    hir::{def::DefKind, def_id::LocalDefId},
-    index::IndexVec,
     interface::{interface::Compiler, Config},
-    middle::{
-        mir,
-        queries::{mir_borrowck::ProvidedValue as MirBorrowck, Providers},
-        ty::TyCtxt,
-    },
+    middle::ty::TyCtxt,
     session::Session,
     span::{Ident, Symbol, DUMMY_SP},
 };
@@ -27,60 +19,6 @@ use prusti_utils::config;
 
 #[derive(Default)]
 pub struct PrustiCompilerCalls;
-
-// Running `get_body_with_borrowck_facts` can be very slow, therefore we avoid it when not
-// necessary; for crates which won't be verified or spec_fns it suffices to load just the fn body
-
-#[allow(clippy::needless_lifetimes)]
-#[tracing::instrument(level = "debug", skip(tcx))]
-fn mir_borrowck<'tcx>(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> MirBorrowck<'tcx> {
-    let def_kind = tcx.def_kind(def_id.to_def_id());
-    let is_anon_const = matches!(def_kind, DefKind::AnonConst);
-    // Anon Const bodies have already been stolen and so will result in a crash
-    // when calling `get_body_with_borrowck_facts`. TODO: figure out if we need
-    // (anon) const bodies at all, and if so, how to get them?
-    if !is_anon_const {
-        let consumer_opts =
-            if is_spec_fn(tcx, def_id.to_def_id()) || config::verify_mode().is_compile_only() {
-                consumers::ConsumerOptions::RegionInferenceContext
-            } else {
-                consumers::ConsumerOptions::PoloniusInputFacts
-            };
-        let body_with_facts = consumers::get_bodies_with_borrowck_facts(tcx, def_id, consumer_opts);
-        for (def_id, body) in body_with_facts {
-            // SAFETY: This is safe because we are feeding in the same `tcx` that is
-            // going to be used as a witness when pulling out the data.
-            unsafe {
-                mir_storage::store_mir_body(tcx, def_id, body);
-            }
-        }
-    }
-    let mut providers = Providers::default();
-    prusti_rustc_interface::borrowck::provide(&mut providers);
-    let original_mir_borrowck = providers.mir_borrowck;
-    original_mir_borrowck(tcx, def_id)
-}
-
-#[allow(clippy::needless_lifetimes)]
-#[tracing::instrument(level = "debug", skip(tcx))]
-fn mir_promoted<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    def_id: LocalDefId,
-) -> (
-    &'tcx Steal<mir::Body<'tcx>>,
-    &'tcx Steal<IndexVec<mir::Promoted, mir::Body<'tcx>>>,
-) {
-    let original_mir_promoted = prusti_rustc_interface::interface::DEFAULT_QUERY_PROVIDERS
-        .queries
-        .mir_promoted;
-    let result = original_mir_promoted(tcx, def_id);
-    // SAFETY: This is safe because we are feeding in the same `tcx` that is
-    // going to be used as a witness when pulling out the data.
-    unsafe {
-        mir_storage::store_promoted_mir_body(tcx, def_id, result.0.borrow().clone());
-    }
-    result
-}
 
 struct NoAnn;
 
@@ -90,8 +28,7 @@ impl prusti_rustc_interface::driver::Callbacks for PrustiCompilerCalls {
     fn config(&mut self, config: &mut Config) {
         assert!(config.override_queries.is_none());
         config.override_queries = Some(|_session: &Session, providers| {
-            providers.queries.mir_borrowck = mir_borrowck;
-            providers.queries.mir_promoted = mir_promoted;
+            mir_storage::override_queries(providers);
         });
     }
 
