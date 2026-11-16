@@ -693,7 +693,7 @@ mod tests {
 
     use super::{WandEnc, WandEncTask};
     use crate::encoders::{
-        TyUseImpureEnc,
+        MirLocalDefEnc, MirLocalDefEncTask, TyUseImpureEnc,
         pure::spec::PledgeExpr,
         ty::{
             RustTyDecomposition,
@@ -701,10 +701,31 @@ mod tests {
         },
     };
 
-    /// The wands of a function, or the error of `WandEnc`. As in
-    /// `wand_posts`, the wands are on the result's snapshot and the old
-    /// snapshots of the arguments, each named after its parameter. Building a
-    /// wand requires the dependencies of an encoder.
+    /// The wands and the contract of a function, as shown by `assert_wands`
+    /// and `assert_contract`.
+    #[derive(Clone)]
+    struct Shown {
+        wands: Vec<String>,
+        contract: Vec<String>,
+    }
+
+    impl Shown {
+        fn error(message: &str) -> Self {
+            let lines = vec![format!("error: {message}")];
+            Self {
+                wands: lines.clone(),
+                contract: lines,
+            }
+        }
+    }
+
+    /// The wands and the contract of a function, or the error of `WandEnc`.
+    /// As in `wand_posts`, the wands are on the result's snapshot and the old
+    /// snapshots of the arguments, each named after its parameter. The
+    /// contract consists of the predicates that `method.rs` adds to the
+    /// method's pre- and postconditions with `indirect_pres` and
+    /// `indirect_posts`, on the method's own locals. Building them requires
+    /// the dependencies of an encoder.
     struct WandTestEnc;
 
     impl TaskEncoder for WandTestEnc {
@@ -712,7 +733,7 @@ mod tests {
         const ENCODER_NAME: &'static str = "wand test encoder";
 
         type TaskDescription<'vir> = DefId;
-        type OutputFullDependency<'vir> = Vec<String>;
+        type OutputFullDependency<'vir> = Shown;
 
         fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
             *task
@@ -732,7 +753,7 @@ mod tests {
                 // The error of `WandEnc` itself comes last, after its context.
                 Err(EncodeFullError::DependencyError(errors)) => {
                     let (_, message, _) = errors.last().unwrap();
-                    return Ok(((), vec![format!("error: {message}")]));
+                    return Ok(((), Shown::error(message)));
                 }
                 Err(error) => return Err(error),
             };
@@ -760,7 +781,32 @@ mod tests {
                         lines.push(wand_lines.join("\n"));
                     }
                 }
-                Ok(((), lines))
+                let local_defs = deps.require_dep::<MirLocalDefEnc>(MirLocalDefEncTask::Local {
+                    def_id,
+                    all_locals: false,
+                })?;
+                let pres = wands
+                    .indirect_pres(vcx, &local_defs, deps)
+                    .collect::<Vec<_>>();
+                let posts = wands
+                    .indirect_posts(vcx, &local_defs, deps)
+                    .collect::<Vec<_>>();
+                let pres = pres
+                    .into_iter()
+                    .flat_map(show)
+                    .map(|c| format!("requires {c}"));
+                let posts = posts
+                    .into_iter()
+                    .flat_map(show)
+                    .map(|c| format!("ensures {c}"));
+                let contract = pres.chain(posts).collect();
+                Ok((
+                    (),
+                    Shown {
+                        wands: lines,
+                        contract,
+                    },
+                ))
             })
         }
     }
@@ -802,12 +848,9 @@ mod tests {
         }
     }
 
-    /// Asserts that the wands of the function `f` defined in `src` are
-    /// `expected`: each wand lists the conjuncts of its left side, `--*`, and
-    /// the conjuncts of its right side on lines of their own, and wands are
-    /// separated by an empty line.
-    fn assert_wands(src: &str, expected: &str) {
-        let lines = with_crate(src, |tcx| {
+    /// What `WandTestEnc` shows for the function `f` defined in `src`.
+    fn shown(src: &str) -> Shown {
+        with_crate(src, |tcx| {
             let f = tcx
                 .hir_crate_items(())
                 .definitions()
@@ -816,10 +859,23 @@ mod tests {
                 })
                 .expect("the input defines no function `f`")
                 .to_def_id();
-            let (_, _, lines) = WandTestEnc::encode(f, true, DUMMY_SP).unwrap().unwrap();
-            lines
-        });
-        assert_eq!(lines.join("\n\n"), dedent(expected));
+            let (_, _, shown) = WandTestEnc::encode(f, true, DUMMY_SP).unwrap().unwrap();
+            shown
+        })
+    }
+
+    /// Asserts that the wands of the function `f` defined in `src` are
+    /// `expected`: each wand lists the conjuncts of its left side, `--*`, and
+    /// the conjuncts of its right side on lines of their own, and wands are
+    /// separated by an empty line.
+    fn assert_wands(src: &str, expected: &str) {
+        assert_eq!(shown(src).wands.join("\n\n"), dedent(expected));
+    }
+
+    /// Asserts that the contract of the function `f` defined in `src` is
+    /// `expected`, one conjunct of a pre- or postcondition per line.
+    fn assert_contract(src: &str, expected: &str) {
+        assert_eq!(shown(src).contract.join("\n"), dedent(expected));
     }
 
     #[test]
@@ -956,6 +1012,59 @@ mod tests {
             --*
             p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
             p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
+            "#,
+        );
+    }
+
+    #[test]
+    fn contract_reborrow() {
+        assert_contract(
+            "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
+            r#"
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
+            ensures p_Ref_mutable_ind(p_Ref_mutable_snap(_0p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
+            "#,
+        );
+    }
+
+    /// The nested lifetime is given back by the postcondition, on the referent
+    /// of `x` after the call.
+    #[test]
+    fn contract_nested_references() {
+        assert_contract(
+            "fn f<'a, 'b>(x: &'a mut &'b mut i32) {}",
+            r#"
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            "#,
+        );
+    }
+
+    /// The nested lifetimes are given back by the wand, not the postcondition.
+    #[test]
+    fn contract_store_into_argument() {
+        assert_contract(
+            "fn f<'a, 'b>(x: &'a mut &'b mut i32, y: &'b mut i32) { *x = y; }",
+            r#"
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_2p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            "#,
+        );
+    }
+
+    #[test]
+    fn contract_generic_referent() {
+        assert_contract(
+            "fn f<T>(x: &mut T) {}",
+            r#"
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, T$0), T$0, 0, 1)
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, T$0), T$0, 0, 1), T$0, 1, (1) + (arity(T$0)))
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, T$0)), T$0, 0, 1)
+            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, T$0)), T$0, 0, 1), T$0, 1, (1) + (arity(T$0)))
             "#,
         );
     }
