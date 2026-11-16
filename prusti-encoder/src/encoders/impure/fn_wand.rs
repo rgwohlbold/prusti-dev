@@ -237,13 +237,14 @@ impl<'vir> WandEncOutput<'vir> {
             .inputs()
             .filter(|i| !self.blocked_inputs().contains(i))
             .filter_map(|lp| {
+                // Unblocked inputs are given back in the post-state.
                 self.encode_predicates_for_function_shape_node(
                     vcx,
                     deps,
                     lp,
                     None,
                     |i| vcx.mk_old_expr(local_defs[i].impure_snap),
-                    Some(vir::OldLabel::None),
+                    None,
                 )
             })
             .collect::<Vec<_>>()
