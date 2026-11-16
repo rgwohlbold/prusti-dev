@@ -652,3 +652,225 @@ impl<'vir> WandEncOutput<'vir> {
         self.outputs.iter().copied()
     }
 }
+
+/// Tests that show the wands `WandEnc` builds for a function's signature.
+#[cfg(test)]
+mod tests {
+    use pcg::borrow_pcg::FunctionData;
+    use prusti_rustc_interface::{
+        hir::def::DefKind,
+        span::{DUMMY_SP, def_id::DefId},
+    };
+    use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
+    use vir::CastType;
+
+    use super::{WandEnc, WandEncTask};
+    use crate::encoders::{
+        TyUseImpureEnc,
+        pure::spec::PledgeExpr,
+        ty::{
+            RustTyDecomposition,
+            test_util::{dedent, simplified, with_crate},
+        },
+    };
+
+    /// The wands of a function, one per line, on snapshots named after its
+    /// parameters, or the error of `WandEnc`. Building a wand requires the
+    /// dependencies of an encoder.
+    struct WandTestEnc;
+
+    impl TaskEncoder for WandTestEnc {
+        task_encoder::encoder_cache!(WandTestEnc);
+        const ENCODER_NAME: &'static str = "wand test encoder";
+
+        type TaskDescription<'vir> = DefId;
+        type OutputFullDependency<'vir> = Vec<String>;
+
+        fn task_to_key<'vir>(task: &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
+            *task
+        }
+
+        fn do_encode_full<'vir>(
+            task_key: &Self::TaskKey<'vir>,
+            deps: &mut TaskEncoderDependencies<'vir, Self>,
+        ) -> EncodeFullResult<'vir, Self> {
+            let def_id = *task_key;
+            deps.emit_output_ref(def_id, ())?;
+            let task = WandEncTask {
+                data: FunctionData::new(def_id),
+            };
+            let wands = match deps.require_dep::<WandEnc>(task) {
+                Ok(wands) => wands,
+                // The error of `WandEnc` itself comes last, after its context.
+                Err(EncodeFullError::DependencyError(errors)) => {
+                    let (_, message, _) = errors.last().unwrap();
+                    return Ok(((), vec![format!("error: {message}")]));
+                }
+                Err(error) => return Err(error),
+            };
+            vir::with_vcx(|vcx| {
+                let sig = wands.fn_sig(vcx, None);
+                let params = vcx.tcx().fn_arg_idents(def_id).iter();
+                let names = std::iter::once("result".to_string())
+                    .chain(params.map(|ident| ident.unwrap().to_string()));
+                let tys = std::iter::once(sig.output()).chain(sig.inputs().iter().copied());
+                let mut snaps = Vec::new();
+                for (ty, name) in tys.zip(names) {
+                    let ty = RustTyDecomposition::from_ty(ty, def_id);
+                    let snapshot = deps.require_dep::<TyUseImpureEnc>(ty)?.snapshot();
+                    let decl = vcx.mk_local_decl(vcx.alloc_str(&name), snapshot);
+                    snaps.push(vcx.mk_local_ex(decl));
+                }
+                let args = PledgeExpr::pledge_args(snaps[0], &snaps[1..]);
+                let mut lines = Vec::new();
+                for wand_data in wands.viper_wands() {
+                    if let Some(wand) = wands.mk_wand(&wand_data, args, None, None, vcx, deps) {
+                        lines.push(format!("{} --* {}", show(wand.lhs), show(wand.rhs)));
+                    }
+                }
+                Ok(((), lines))
+            })
+        }
+    }
+
+    /// Replaces `inhabited(..)` by `true`, which the simplifier then drops:
+    /// it is not about borrows.
+    struct DropInhabited;
+
+    impl<'vir> vir::Folder<'vir, (), !> for DropInhabited {
+        fn fold_expr(
+            &mut self,
+            e: vir::ExprGenDyn<'vir, (), !>,
+        ) -> Option<vir::ExprGenDyn<'vir, (), !>> {
+            match e.kind {
+                vir::ExprKindGenData::FuncApp(app) if app.target == "inhabited" => {
+                    Some(vir::with_vcx(|vcx| vcx.mk_bool::<true>().as_dyn()))
+                }
+                _ => e.super_fold_with(self),
+            }
+        }
+    }
+
+    fn show(e: vir::ExprBool<'_>) -> String {
+        use vir::Foldable;
+        format!(
+            "{:?}",
+            simplified(e.fold_with(&mut DropInhabited).unwrap_or(e))
+        )
+    }
+
+    /// Asserts that the wands of the function `f` defined in `src` are
+    /// `expected`.
+    fn assert_wands(src: &str, expected: &str) {
+        let lines = with_crate(src, |tcx| {
+            let f = tcx
+                .hir_crate_items(())
+                .definitions()
+                .find(|&def_id| {
+                    tcx.def_kind(def_id) == DefKind::Fn && tcx.item_name(def_id).as_str() == "f"
+                })
+                .expect("the input defines no function `f`")
+                .to_def_id();
+            let (_, _, lines) = WandTestEnc::encode(f, true, DUMMY_SP).unwrap().unwrap();
+            lines
+        });
+        assert_eq!(lines.join("\n"), dedent(expected));
+    }
+
+    #[test]
+    fn reborrow() {
+        assert_wands(
+            "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
+            r#"
+            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
+            "#,
+        );
+    }
+
+    #[test]
+    fn nested_references_reborrow() {
+        assert_wands(
+            "fn f<'a, 'b>(x: &'a mut &'b mut i32) -> &'a mut i32 { *x }",
+            r#"
+            error: borrows in the result that expire separately but depend on a common argument are not supported
+            "#,
+        );
+    }
+
+    #[test]
+    fn lifetime_in_struct() {
+        assert_wands(
+            "struct S<'a> { r: &'a mut i32 }
+             fn f<'a, 'b>(s: &'b mut S<'a>) -> &'b mut i32 { s.r }",
+            r#"
+            error: borrows in the result that expire separately but depend on a common argument are not supported
+            "#,
+        );
+    }
+
+    #[test]
+    fn generic_referent() {
+        assert_wands(
+            "fn f<'a, T>(x: &'a mut T) -> &'a mut T { x }",
+            r#"
+            p_Param(result.s_Ref_mutable_0, T$0) --* p_Param(x.s_Ref_mutable_0, T$0)
+            "#,
+        );
+    }
+
+    #[test]
+    fn reborrow_into_adt() {
+        assert_wands(
+            "fn f<'a, T>(x: &'a mut Option<T>) -> Option<&'a mut T> { x.as_mut() }",
+            r#"
+            ((s_Option_discr(result)) == (s_Int_isize_cons(1))) ==> (p_Param(result.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, T$0)) --* p_Param(x.s_Ref_mutable_0, s_Option_type(T$0))
+            "#,
+        );
+    }
+    /// Result borrows that expire separately get a wand each.
+    #[test]
+    fn two_wands() {
+        assert_wands(
+            "fn f<'a, 'b>(x: &'a mut i32, y: &'b mut i32) -> (&'a mut i32, &'b mut i32) { (x, y) }",
+            r#"
+            p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
+            p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(y.s_Ref_mutable_0, s_Int_i32_type())
+            "#,
+        );
+    }
+
+    /// The result may borrow from both arguments, which have different
+    /// lifetimes.
+    #[test]
+    fn two_sources() {
+        assert_wands(
+            "fn f<'a, 'b: 'a>(x: &'a mut i32, y: &'b mut i32) -> &'a mut i32 { x }",
+            r#"
+            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(x.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(y.s_Ref_mutable_0, s_Int_i32_type()))
+            "#,
+        );
+    }
+
+    /// Two result lifetimes that both borrow from the same argument are given
+    /// back together.
+    #[test]
+    fn two_targets() {
+        assert_wands(
+            "fn f<'a: 'b + 'c, 'b, 'c>(x: &'a mut i32) -> (&'b mut i32, &'c mut i32) { (x, todo!()) }",
+            r#"
+            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
+            "#,
+        );
+    }
+
+    /// A lifetime that occurs twice in the result is one node.
+    #[test]
+    fn lifetime_twice() {
+        assert_wands(
+            "fn f<'a>(x: &'a mut (i32, i32)) -> (&'a mut i32, &'a mut i32) { (&mut x.0, &mut x.1) }",
+            r#"
+            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(x.s_Ref_mutable_0, s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()))
+            "#,
+        );
+    }
+}

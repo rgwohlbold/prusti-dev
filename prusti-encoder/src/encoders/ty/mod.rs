@@ -15,7 +15,7 @@ pub mod generics;
 mod data;
 mod rust_ty;
 #[cfg(test)]
-mod test_util;
+pub(crate) mod test_util;
 pub mod interpretation;
 
 pub use data::TySpecifics;
