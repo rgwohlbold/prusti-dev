@@ -1,3 +1,4 @@
+use pcg::borrow_pcg::{GeneralizedLifetime as PcgLifetime, region_projection::PcgRegion};
 use prusti_rustc_interface::index::Idx;
 use task_encoder::{EncodeFullError, TaskEncoder, TaskEncoderDependencies};
 
@@ -52,14 +53,14 @@ impl<'vir> NodePredicates<'vir> {
     /// `snap`, outermost first.
     pub fn of(
         &self,
-        lifetime: GeneralizedLifetime<'vir>,
+        lifetime: PcgLifetime<'vir>,
         snap: vir::ExprSnap<'vir>,
     ) -> Vec<vir::ExprBool<'vir>> {
         let block = self.block(snap);
         block
             .positions()
             .into_iter()
-            .filter(|&p| self.graph.lifetime(p) == lifetime)
+            .filter(|&p| is_position_of(self.graph.lifetime(p), lifetime))
             .map(|p| {
                 let (lo, hi) = self.graph.interval(p);
                 block.predicate(block.key(p), lo, hi)
@@ -73,18 +74,31 @@ impl<'vir> NodePredicates<'vir> {
     }
 }
 
+/// Whether a position of `position`'s lifetime belongs to the node of the PCG
+/// lifetime `lifetime`. Positions are matched by lifetime, not by the PCG's
+/// lifetime index, which counts each lifetime once.
+fn is_position_of<'tcx>(position: GeneralizedLifetime<'tcx>, lifetime: PcgLifetime<'tcx>) -> bool {
+    match (position, lifetime) {
+        (GeneralizedLifetime::Region(r), PcgLifetime::Region(l)) => PcgRegion::from(r) == l,
+        // The decomposition of a type parameter or alias has it as its only
+        // argument.
+        (GeneralizedLifetime::RegionsIn(param), PcgLifetime::RegionsIn(opaque)) => {
+            vir::with_vcx(|vcx| param.args.args()[0].expect_ty() == opaque.ty(vcx.tcx()))
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use pcg::borrow_pcg::GeneralizedLifetime as PcgLifetime;
     use prusti_rustc_interface::{middle::ty, span::DUMMY_SP};
     use task_encoder::TaskEncoder;
 
     use super::NodePredicates;
     use crate::encoders::ty::{
         RustTyDecomposition,
-        generics::{
-            GArgsTyEnc,
-            lifetime_position::{GeneralizedLifetime, LifetimePositionEnc},
-        },
+        generics::{GArgsTyEnc, lifetime_position::LifetimePositionEnc},
         indirect_pred::IndirectPredEnc,
         pure::TyPureEnc,
         test_util::{simplified, with_type_alias},
@@ -96,11 +110,7 @@ mod tests {
     fn with_node<R: Send>(
         src: &str,
         name: &str,
-        f: impl for<'vir> FnOnce(
-            &NodePredicates<'vir>,
-            GeneralizedLifetime<'vir>,
-            vir::ExprSnap<'vir>,
-        ) -> R
+        f: impl for<'vir> FnOnce(&NodePredicates<'vir>, PcgLifetime<'vir>, vir::ExprSnap<'vir>) -> R
         + Send,
     ) -> R {
         let name = name.to_string();
@@ -128,12 +138,10 @@ mod tests {
                 .flat_map(|arg| arg.walk())
                 .find_map(|arg| match arg.kind() {
                     ty::GenericArgKind::Lifetime(region) if region.to_string() == name => {
-                        Some(GeneralizedLifetime::Region(region))
+                        Some(PcgLifetime::Region(region.into()))
                     }
                     ty::GenericArgKind::Type(arg_ty) if arg_ty.to_string() == name => {
-                        Some(GeneralizedLifetime::RegionsIn(
-                            RustTyDecomposition::from_ty(arg_ty, ty.args.context()),
-                        ))
+                        Some(PcgLifetime::RegionsIn(arg_ty.try_into().unwrap()))
                     }
                     _ => None,
                 })
