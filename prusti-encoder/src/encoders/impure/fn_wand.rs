@@ -505,8 +505,8 @@ impl TaskEncoder for WandEnc {
             // with `T: Tr<'a>`), inserted right after `RegionsIn(T)`, and one for
             // each input region, appended, if the result is a type parameter.
             // The indices of the shape's nodes refer to this extended list, but
-            // `projection_for_generalized_idx` interprets them in the list of
-            // `extract_regions`. Extra nodes at the end are out of range there
+            // `node` interprets them in the list of `extract_regions`. Extra
+            // nodes at the end are out of range there
             // and get no resources, which matches their lack of positions; what
             // they stand for is part of `RegionsIn(T)`. An extra node before
             // another entry, however, shifts the indices of the entries after
