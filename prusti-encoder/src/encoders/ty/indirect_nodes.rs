@@ -50,11 +50,13 @@ impl<'vir> NodePredicates<'vir> {
     }
 
     /// The predicates of the node of `lifetime` on a place with snapshot
-    /// `snap`, outermost first.
+    /// `snap`, outermost first. The keys extend `snap` in the state `state`,
+    /// or in the current state if it is `None`.
     pub fn of(
         &self,
         lifetime: PcgLifetime<'vir>,
         snap: vir::ExprSnap<'vir>,
+        state: Option<vir::OldLabel<'vir>>,
     ) -> Vec<vir::ExprBool<'vir>> {
         let block = self.block(snap);
         block
@@ -63,9 +65,17 @@ impl<'vir> NodePredicates<'vir> {
             .filter(|&p| is_position_of(self.graph.lifetime(p), lifetime))
             .map(|p| {
                 let (lo, hi) = self.graph.interval(p);
-                block.predicate(block.key(p), lo, hi)
+                let key = vir::with_vcx(|vcx| vcx.maybe_apply_label(block.key(p), state));
+                block.predicate(key, lo, hi)
             })
             .collect()
+    }
+
+    /// Whether the node of `lifetime` has any predicates.
+    pub fn has_positions(&self, lifetime: PcgLifetime<'vir>) -> bool {
+        self.graph
+            .positions()
+            .any(|p| is_position_of(self.graph.lifetime(p), lifetime))
     }
 
     pub fn deep_snap(&self, snap: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {
@@ -155,7 +165,7 @@ mod tests {
     fn node(src: &str, name: &str) -> Vec<String> {
         with_node(src, name, |nodes, lifetime, x| {
             nodes
-                .of(lifetime, x)
+                .of(lifetime, x, None)
                 .into_iter()
                 .map(|pred| format!("{:?}", simplified(pred)))
                 .collect()

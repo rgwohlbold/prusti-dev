@@ -4,7 +4,7 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition,
         generics::{GArgs, GArgsTyEnc, GParams, GenericParamsEnc},
-        indirect::{IndirectPredicatesEnc, projection_for_generalized_idx},
+        indirect_nodes::NodePredicates,
     },
 };
 use pcg::borrow_pcg::{
@@ -63,6 +63,7 @@ impl<'vir, E: TaskEncoder> ImpureEncVisitor<'vir, '_, E> {
                         *g,
                         None,
                         |i| args[i],
+                        Some(vir::OldLabel::None),
                     );
                     (
                         mir::Place::from(g.mir_local()),
@@ -158,49 +159,49 @@ impl<'vir> WandEncOutput<'vir> {
         }
     }
 
-    /// The (unreified) predicates associated with the given node, or `None` if
-    /// there are no resources associated with it.
-    #[allow(clippy::type_complexity)]
-    fn predicates_for_function_shape_node(
+    /// The node predicates of the type of `g`'s local and the PCG lifetime of
+    /// `g`, in the callee's own context, or `None` if `g` has no positions:
+    /// e.g. the lifetime of a shared reference, or a lifetime in the trait
+    /// bounds of a type parameter, which is part of `RegionsIn` of the
+    /// parameter. The PCG's lifetimes are matched by value, which needs the
+    /// distinct regions of the callee's signature; at a call site, the
+    /// regions of the generic arguments are erased.
+    fn node<E: TaskEncoder>(
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
-        deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
         g: FunctionShapeNode<Generalized>,
-        call_ctx: WandCallContext<'vir>,
-    ) -> Option<Vec<vir::ExprGenBool<'vir, vir::ExprSnap<'vir>, vir::ExprKind<'vir>>>> {
-        let arg_ty = g.ty(self.fn_sig(vcx, call_ctx));
-        let decomp = RustTyDecomposition::from_ty(arg_ty, self.g_params(vcx, call_ctx));
-        let region_proj =
-            projection_for_generalized_idx(arg_ty, g.region_idx(), decomp, vcx.tcx())?;
-        let predicates = deps
-            .require_dep::<IndirectPredicatesEnc>(region_proj)
-            .unwrap()
-            .predicate_applications;
-        (!predicates.is_empty()).then_some(predicates)
+    ) -> Option<(NodePredicates<'vir>, GeneralizedLifetime<'vir>)> {
+        let ty = g.ty(self.fn_sig(vcx, None));
+        let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> = vcx.tcx().extract_regions(ty);
+        let lifetime = *lifetimes.get(g.region_idx())?;
+        let decomp = RustTyDecomposition::from_ty(ty, self.g_params(vcx, None));
+        let nodes = NodePredicates::new(decomp, deps).unwrap();
+        nodes.has_positions(lifetime).then_some((nodes, lifetime))
     }
 
-    fn encode_predicates_for_function_shape_node(
+    /// The predicates of `g` on the snapshot `snap` of its local, with keys
+    /// that extend the snapshot in the state `state`. An input node refers to
+    /// the state before the call, so the extension of its key must read that
+    /// state's heap, not only the local's snapshot.
+    fn encode_predicates_for_function_shape_node<E: TaskEncoder>(
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
-        deps: &mut TaskEncoderDependencies<'vir, impl TaskEncoder>,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
         g: impl Into<FunctionShapeNode<Generalized>>,
         call_ctx: WandCallContext<'vir>,
         mut snap: impl FnMut(mir::Local) -> vir::ExprSnap<'vir>,
+        state: Option<vir::OldLabel<'vir>>,
     ) -> Option<vir::ExprBool<'vir>> {
         use vir::Reify;
         let g = g.into();
-        let predicates = self.predicates_for_function_shape_node(vcx, deps, g, call_ctx)?;
-
-        let local = g.mir_local();
-        let local_snap = snap(local);
-        Some(
-            vcx.mk_conj(
-                &predicates
-                    .iter()
-                    .map(|p| p.reify(vcx, local_snap))
-                    .collect::<Vec<_>>(),
-            ),
-        )
+        let (nodes, lifetime) = self.node(vcx, deps, g)?;
+        let predicates = vcx.mk_conj(&nodes.of(lifetime, snap(g.mir_local()), state));
+        // The predicates are in terms of the callee's generic parameters.
+        let generics = self.generics_subst(call_ctx, vcx, deps);
+        Some(vcx.with_local_subst(generics, || {
+            predicates.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
+        }))
     }
 
     pub fn indirect_pres<'a, E: TaskEncoder>(
@@ -210,9 +211,14 @@ impl<'vir> WandEncOutput<'vir> {
         deps: &'a mut TaskEncoderDependencies<'vir, E>,
     ) -> impl Iterator<Item = vir::ExprBool<'vir>> + 'a {
         self.inputs().filter_map(|g| {
-            self.encode_predicates_for_function_shape_node(vcx, deps, g, None, |i| {
-                local_defs[i].impure_snap
-            })
+            self.encode_predicates_for_function_shape_node(
+                vcx,
+                deps,
+                g,
+                None,
+                |i| local_defs[i].impure_snap,
+                None,
+            )
         })
     }
 
@@ -231,17 +237,27 @@ impl<'vir> WandEncOutput<'vir> {
             .inputs()
             .filter(|i| !self.blocked_inputs().contains(i))
             .filter_map(|lp| {
-                self.encode_predicates_for_function_shape_node(vcx, deps, lp, None, |i| {
-                    vcx.mk_old_expr(local_defs[i].impure_snap)
-                })
+                self.encode_predicates_for_function_shape_node(
+                    vcx,
+                    deps,
+                    lp,
+                    None,
+                    |i| vcx.mk_old_expr(local_defs[i].impure_snap),
+                    Some(vir::OldLabel::None),
+                )
             })
             .collect::<Vec<_>>()
             .into_iter();
 
         let output_posts = self.outputs().filter_map(|g| {
-            self.encode_predicates_for_function_shape_node(vcx, deps, g, None, |i| {
-                local_defs[i].impure_snap
-            })
+            self.encode_predicates_for_function_shape_node(
+                vcx,
+                deps,
+                g,
+                None,
+                |i| local_defs[i].impure_snap,
+                None,
+            )
         });
         unblocked_input_posts.chain(output_posts)
     }
@@ -322,10 +338,17 @@ impl<'vir> WandEncOutput<'vir> {
             }
             None => pledge.expr(pledge_args),
         };
+        // The right side gives back inputs, as they were before the call.
+        let pre = Some(pledge_old_label.map_or(vir::OldLabel::None, vir::OldLabel::Label));
         let rhs = wand_data.rhs.iter().filter_map(|g| {
-            self.encode_predicates_for_function_shape_node(vcx, deps, *g, call_ctx, |i| {
-                pledge_args[i]
-            })
+            self.encode_predicates_for_function_shape_node(
+                vcx,
+                deps,
+                *g,
+                call_ctx,
+                |i| pledge_args[i],
+                pre,
+            )
         });
         let rhs = rhs
             .chain(
@@ -343,9 +366,14 @@ impl<'vir> WandEncOutput<'vir> {
         }
         let rhs = vcx.mk_conj(&rhs);
         let lhs = wand_data.lhs.iter().filter_map(|g| {
-            self.encode_predicates_for_function_shape_node(vcx, deps, *g, call_ctx, |i| {
-                pledge_args[i]
-            })
+            self.encode_predicates_for_function_shape_node(
+                vcx,
+                deps,
+                *g,
+                call_ctx,
+                |i| pledge_args[i],
+                None,
+            )
         });
         let lhs = lhs
             .chain(
@@ -581,10 +609,8 @@ impl<'vir> WandEncOutput<'vir> {
         vcx: &'vir vir::VirCtxt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<Vec<WandData<'vir>>, WandEncError> {
-        let mut has_resources = |g: FunctionShapeNode<Generalized>| {
-            self.predicates_for_function_shape_node(vcx, deps, g, None)
-                .is_some()
-        };
+        let mut has_resources =
+            |g: FunctionShapeNode<Generalized>| self.node(vcx, deps, g).is_some();
         // A wand is only needed if it gives back a resource, or to carry the
         // pledges if none does (e.g. for shared references).
         let (mut wands, resourceless): (Vec<_>, Vec<_>) = wands
@@ -674,7 +700,7 @@ mod tests {
         },
     };
 
-    /// The wands of a function, one per line, or the error of `WandEnc`. As in
+    /// The wands of a function, or the error of `WandEnc`. As in
     /// `wand_posts`, the wands are on the result's snapshot and the old
     /// snapshots of the arguments, each named after its parameter. Building a
     /// wand requires the dependencies of an encoder.
@@ -727,7 +753,10 @@ mod tests {
                 let mut lines = Vec::new();
                 for wand_data in wands.viper_wands() {
                     if let Some(wand) = wands.mk_wand(&wand_data, args, None, None, vcx, deps) {
-                        lines.push(format!("{} --* {}", show(wand.lhs), show(wand.rhs)));
+                        let mut wand_lines = show(wand.lhs);
+                        wand_lines.push("--*".to_string());
+                        wand_lines.extend(show(wand.rhs));
+                        lines.push(wand_lines.join("\n"));
                     }
                 }
                 Ok(((), lines))
@@ -753,16 +782,29 @@ mod tests {
         }
     }
 
-    fn show(e: vir::ExprBool<'_>) -> String {
+    /// The conjuncts of the simplified `e`, one per line.
+    fn show(e: vir::ExprBool<'_>) -> Vec<String> {
         use vir::Foldable;
-        format!(
-            "{:?}",
-            simplified(e.fold_with(&mut DropInhabited).unwrap_or(e))
-        )
+        let e = simplified(e.fold_with(&mut DropInhabited).unwrap_or(e));
+        let mut conjuncts = Vec::new();
+        collect_conjuncts(e.as_dyn(), &mut conjuncts);
+        conjuncts.iter().map(|c| format!("{c:?}")).collect()
+    }
+
+    fn collect_conjuncts<'vir>(e: vir::ExprDyn<'vir>, conjuncts: &mut Vec<vir::ExprDyn<'vir>>) {
+        match e.kind {
+            vir::ExprKindGenData::BinOp(b) if b.kind == vir::BinOpKind::And => {
+                collect_conjuncts(b.lhs, conjuncts);
+                collect_conjuncts(b.rhs, conjuncts);
+            }
+            _ => conjuncts.push(e),
+        }
     }
 
     /// Asserts that the wands of the function `f` defined in `src` are
-    /// `expected`.
+    /// `expected`: each wand lists the conjuncts of its left side, `--*`, and
+    /// the conjuncts of its right side on lines of their own, and wands are
+    /// separated by an empty line.
     fn assert_wands(src: &str, expected: &str) {
         let lines = with_crate(src, |tcx| {
             let f = tcx
@@ -776,7 +818,7 @@ mod tests {
             let (_, _, lines) = WandTestEnc::encode(f, true, DUMMY_SP).unwrap().unwrap();
             lines
         });
-        assert_eq!(lines.join("\n"), dedent(expected));
+        assert_eq!(lines.join("\n\n"), dedent(expected));
     }
 
     #[test]
@@ -784,7 +826,9 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
+            p_Ref_mutable_ind(result, s_Int_i32_type(), 0, 1)
+            --*
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
             "#,
         );
     }
@@ -810,12 +854,14 @@ mod tests {
         );
     }
 
+    /// The lifetimes in `T` are nested in `*x`, like `'b` in
+    /// `&'a mut S<'b>`, and expire separately from `'a`.
     #[test]
     fn generic_referent() {
         assert_wands(
             "fn f<'a, T>(x: &'a mut T) -> &'a mut T { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, T$0) --* p_Param(old(x).s_Ref_mutable_0, T$0)
+            error: borrows in the result that expire separately but depend on a common argument are not supported
             "#,
         );
     }
@@ -825,7 +871,14 @@ mod tests {
         assert_wands(
             "fn f<'a, T>(x: &'a mut Option<T>) -> Option<&'a mut T> { x.as_mut() }",
             r#"
-            ((s_Option_discr(result)) == (s_Int_isize_cons(1))) ==> (p_Param(result.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, T$0)) --* p_Param(old(x).s_Ref_mutable_0, s_Option_type(T$0))
+            p_Option_ind(result, s_Ref_mutable_type(T$0), 0, 1)
+            --*
+            p_Ref_mutable_ind(old(x), s_Option_type(T$0), 0, 1)
+
+            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Option_type(T$0), 0, 1), s_Option_type(T$0), 1, (1) + (arity(T$0)))
+            p_Option_ind(extend_Option(result, s_Ref_mutable_type(T$0), 0, 1), s_Ref_mutable_type(T$0), 1, (1) + (arity(T$0)))
+            --*
+            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Option_type(T$0), 0, 1)), s_Option_type(T$0), 1, (1) + (arity(T$0)))
             "#,
         );
     }
@@ -835,8 +888,13 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b>(x: &'a mut i32, y: &'b mut i32) -> (&'a mut i32, &'b mut i32) { (x, y) }",
             r#"
-            p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
-            p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type())
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            --*
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
+
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            --*
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
             "#,
         );
     }
@@ -848,7 +906,10 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b: 'a>(x: &'a mut i32, y: &'b mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type()))
+            p_Ref_mutable_ind(result, s_Int_i32_type(), 0, 1)
+            --*
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
             "#,
         );
     }
@@ -860,7 +921,10 @@ mod tests {
         assert_wands(
             "fn f<'a: 'b + 'c, 'b, 'c>(x: &'a mut i32) -> (&'b mut i32, &'c mut i32) { (x, todo!()) }",
             r#"
-            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            --*
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
             "#,
         );
     }
@@ -871,22 +935,26 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut (i32, i32)) -> (&'a mut i32, &'a mut i32) { (&mut x.0, &mut x.1) }",
             r#"
-            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(old(x).s_Ref_mutable_0, s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()))
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            --*
+            p_Ref_mutable_ind(old(x), s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()), 0, 1)
             "#,
         );
     }
 
     /// The callee stores `y` in `*x`, so the caller gets back `**x` from
-    /// before the call, and `*y`, once it gives up `**x` after the call.
-    // TODO: The right side reads `**x` after the call as well: `old` covers
-    // the snapshot of `x` but not the read of `*x`, which is outside it. So the
-    // right side gives back `*y` twice, and `**x` from before the call never.
+    /// before the call, and `*y`, once it gives up `**x` after the call. The
+    /// key of `**x` on the right side reads `*x` before the call.
     #[test]
     fn store_into_argument() {
         assert_wands(
             "fn f<'a, 'b>(x: &'a mut &'b mut i32, y: &'b mut i32) { *x = y; }",
             r#"
-            p_Param(p_Param_snap(old(x).s_Ref_mutable_0, s_Ref_mutable_type(s_Int_i32_type())).make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(p_Param_snap(old(x).s_Ref_mutable_0, s_Ref_mutable_type(s_Int_i32_type())).make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type()))
+            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            --*
+            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
             "#,
         );
     }
