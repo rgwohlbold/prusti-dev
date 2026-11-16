@@ -8,12 +8,15 @@ use crate::encoders::{
     },
 };
 use pcg::borrow_pcg::{
-    FunctionData, FunctionShape, FunctionShapeInput, FunctionShapeNode, FunctionShapeOutput,
-    MakeFunctionShapeError, region_projection::Generalized, state::BorrowsState,
+    ArgIdxOrResult, FunctionData, FunctionShape, FunctionShapeInput, FunctionShapeNode,
+    FunctionShapeOutput, GeneralizedLifetime, MakeFunctionShapeError,
+    region_projection::{ExtractRegionsCtxt, Generalized},
+    state::BorrowsState,
 };
 use prusti_interface::PrustiError;
 use prusti_rustc_interface::{
     data_structures::fx::{FxHashMap, FxHashSet},
+    index::IndexVec,
     middle::{mir, ty},
     span::def_id::DefId,
 };
@@ -469,6 +472,54 @@ impl TaskEncoder for WandEnc {
             let edges: FxHashSet<_> = shape.edges().map(|e| (e.input(), e.output())).collect();
 
             let (inputs, outputs) = shape.take_inputs_and_outputs();
+            // TODO: The PCG gives the signature shape extra nodes: one for each
+            // region in the trait bounds of a type parameter (`'a` for `x: T`
+            // with `T: Tr<'a>`), inserted right after `RegionsIn(T)`, and one for
+            // each input region, appended, if the result is a type parameter.
+            // The indices of the shape's nodes refer to this extended list, but
+            // `projection_for_generalized_idx` interprets them in the list of
+            // `extract_regions`. Extra nodes at the end are out of range there
+            // and get no resources, which matches their lack of positions; what
+            // they stand for is part of `RegionsIn(T)`. An extra node before
+            // another entry, however, shifts the indices of the entries after
+            // it, which then get the resources of the wrong lifetime. Until the
+            // PCG and the encoding agree on these nodes, such signatures are
+            // rejected. The shape has a node for each entry of its list, so it
+            // has extra nodes iff it has more nodes than `extract_regions` has
+            // entries, and they can only precede an entry after a `RegionsIn`.
+            let sig = task_key.data.identity_fn_sig(vcx.tcx());
+            let bases = sig
+                .inputs()
+                .iter()
+                .enumerate()
+                .map(|(i, &ty)| (ArgIdxOrResult::Argument(i.into()), ty))
+                .chain([(ArgIdxOrResult::Result, sig.output())]);
+            for (base, ty) in bases {
+                let nodes = inputs
+                    .iter()
+                    .map(|input| input.to_function_shape_node())
+                    .chain(outputs.iter().copied())
+                    .filter(|node| node.base() == base)
+                    .map(|node| node.region_idx())
+                    .collect::<FxHashSet<_>>();
+                let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> =
+                    vcx.tcx().extract_regions(ty);
+                let regions_in_before_end = lifetimes
+                    .iter()
+                    .rev()
+                    .skip(1)
+                    .any(|lifetime| matches!(lifetime, GeneralizedLifetime::RegionsIn(_)));
+                if nodes.len() > lifetimes.len() && regions_in_before_end {
+                    return Err(EncodeFullError::EncodingError(
+                        WandEncError::Unsupported(
+                            "lifetimes in the trait bounds of a type parameter are not \
+                             supported where other lifetimes follow the type parameter"
+                                .to_string(),
+                        ),
+                        None,
+                    ));
+                }
+            }
             let spec = deps.require_dep::<MirSpecEnc>((def_id, def_id, MirSpecEncMode::Impure))?;
             if coupled_edges.is_empty() {
                 assert!(spec.pledges.is_empty());
