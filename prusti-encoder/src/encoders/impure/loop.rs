@@ -1,8 +1,12 @@
 use rustc_hash::FxHashMap;
 
 use pcg::{
-    borrow_pcg::region_projection::{
-        HasTy, LifetimeProjection, PcgLifetimeProjectionBase, PcgLifetimeProjectionBaseLike,
+    borrow_pcg::{
+        GeneralizedLifetime,
+        region_projection::{
+            ExtractRegionsCtxt, HasTy, LifetimeProjection, PcgLifetimeProjectionBase,
+            PcgLifetimeProjectionBaseLike,
+        },
     },
     r#loop::PlaceUsages,
     pcg::{CapabilityKind, EvalStmtPhase, PcgNode},
@@ -12,14 +16,13 @@ use pcg::{
         maybe_remote::MaybeRemotePlace,
     },
 };
-use prusti_rustc_interface::middle::mir;
+use prusti_rustc_interface::index::IndexVec;
 
 use task_encoder::TaskEncoder;
-use vir::Reify;
 
 use crate::encoders::{
     EncodeResult, ImpureEncVisitor, TyUseImpureEnc,
-    ty::{RustTyDecomposition, indirect::IndirectPredicatesEnc, use_impure::TyUseImpure},
+    ty::{RustTyDecomposition, indirect_nodes::NodePredicates},
 };
 
 pub(crate) enum WandOldOuter<'vir> {
@@ -64,17 +67,11 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             let projs = place
                 .with_inherent_region(ctxt)
                 .generalized_lifetime_projections(ctxt);
+            let nodes = NodePredicates::new(task, self.deps).unwrap();
+            let snap = ty_out.ref_to_snap(place_res.expr.expect_predicate());
             for proj in projs {
-                let indirect = self
-                    .deps
-                    .require_dep::<IndirectPredicatesEnc>(proj.with_base(task))
-                    .unwrap();
-                inv.extend(indirect.predicate_applications.iter().map(|p| {
-                    p.reify(
-                        self.vcx,
-                        ty_out.ref_to_snap(place_res.expr.expect_predicate()),
-                    )
-                }));
+                let lifetime = proj.region(ctxt);
+                inv.extend(nodes.of(lifetime, snap, |key| key));
             }
         }
 
@@ -128,23 +125,20 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         r: LifetimeProjection<'vir, T>,
         old_outer: &mut WandOldOuter<'vir>,
     ) -> EncodeResult<'vir, Vec<vir::ExprBool<'vir>>, E> {
-        let place = r.base().to_pcg_lifetime_projection_base();
-        let (place_snap, ty, _) = match place {
-            PcgLifetimeProjectionBase::Place(p) => {
-                self.encode_maybe_remote_place_snap(p, old_outer)?
-            }
+        let place = match r.base().to_pcg_lifetime_projection_base() {
+            PcgLifetimeProjectionBase::Place(p) => p,
             PcgLifetimeProjectionBase::Const(c) => todo!("{c:?}"),
         };
-        let ty = RustTyDecomposition::from_ty(ty.ty, self.def_id);
-        let indirect = self
-            .deps
-            .require_dep::<IndirectPredicatesEnc>(r.with_base(ty))
-            .unwrap();
-        Ok(indirect
-            .predicate_applications
-            .into_iter()
-            .map(|expr| expr.reify(self.vcx, place_snap))
-            .collect::<Vec<_>>())
+        let (_, snap, ty, _) = self.encode_place_with_snap(Self::get_place(place))?;
+        let decomp = RustTyDecomposition::from_ty(ty.ty, self.def_id);
+        let nodes = NodePredicates::new(decomp, self.deps).unwrap();
+        let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> =
+            self.pcg_ctxt().extract_regions(ty.ty);
+        let lifetime = lifetimes[r.region_idx()];
+        // The keys extend the snapshot in the state the node refers to.
+        Ok(nodes.of(lifetime, snap, |key| {
+            self.configure_old(place, key, old_outer)
+        }))
     }
 
     fn get_place(place: MaybeRemotePlace<'vir>) -> Place<'vir> {
@@ -153,17 +147,6 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             MaybeRemotePlace::Local(MaybeLabelledPlace::Labelled(place)) => place.place(),
             MaybeRemotePlace::Remote(r) => r.assigned_local().into(),
         }
-    }
-
-    fn encode_maybe_remote_place_snap(
-        &mut self,
-        place: MaybeRemotePlace<'vir>,
-        old_outer: &mut WandOldOuter<'vir>,
-    ) -> EncodeResult<'vir, (vir::ExprSnap<'vir>, mir::PlaceTy<'vir>, TyUseImpure<'vir>), E> {
-        let p = Self::get_place(place);
-        let (_, place_snap, ty, ty_out) = self.encode_place_with_snap(p)?;
-        let place_snap = self.configure_old(place, place_snap, old_outer);
-        Ok((place_snap, ty, ty_out))
     }
 
     fn configure_old<T: SnapOrRef>(

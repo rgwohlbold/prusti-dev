@@ -196,7 +196,8 @@ impl<'vir> WandEncOutput<'vir> {
         use vir::Reify;
         let g = g.into();
         let (nodes, lifetime) = self.node(vcx, deps, g)?;
-        let predicates = vcx.mk_conj(&nodes.of(lifetime, snap(g.mir_local()), state));
+        let in_state = |key| vcx.maybe_apply_label(key, state);
+        let predicates = vcx.mk_conj(&nodes.of(lifetime, snap(g.mir_local()), in_state));
         // The predicates are in terms of the callee's generic parameters.
         let generics = self.generics_subst(call_ctx, vcx, deps);
         Some(vcx.with_local_subst(generics, || {

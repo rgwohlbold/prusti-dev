@@ -1,6 +1,5 @@
 pub mod pure;
 pub mod inhabited;
-pub mod indirect;
 pub mod indirect_pred;
 pub mod indirect_nodes;
 pub mod impure;
