@@ -674,9 +674,10 @@ mod tests {
         },
     };
 
-    /// The wands of a function, one per line, on snapshots named after its
-    /// parameters, or the error of `WandEnc`. Building a wand requires the
-    /// dependencies of an encoder.
+    /// The wands of a function, one per line, or the error of `WandEnc`. As in
+    /// `wand_posts`, the wands are on the result's snapshot and the old
+    /// snapshots of the arguments, each named after its parameter. Building a
+    /// wand requires the dependencies of an encoder.
     struct WandTestEnc;
 
     impl TaskEncoder for WandTestEnc {
@@ -721,7 +722,8 @@ mod tests {
                     let decl = vcx.mk_local_decl(vcx.alloc_str(&name), snapshot);
                     snaps.push(vcx.mk_local_ex(decl));
                 }
-                let args = PledgeExpr::pledge_args(snaps[0], &snaps[1..]);
+                let args = snaps[1..].iter().map(|&snap| vcx.mk_old_expr(snap));
+                let args = PledgeExpr::pledge_args(snaps[0], args);
                 let mut lines = Vec::new();
                 for wand_data in wands.viper_wands() {
                     if let Some(wand) = wands.mk_wand(&wand_data, args, None, None, vcx, deps) {
@@ -782,7 +784,7 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
+            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
             "#,
         );
     }
@@ -813,7 +815,7 @@ mod tests {
         assert_wands(
             "fn f<'a, T>(x: &'a mut T) -> &'a mut T { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, T$0) --* p_Param(x.s_Ref_mutable_0, T$0)
+            p_Param(result.s_Ref_mutable_0, T$0) --* p_Param(old(x).s_Ref_mutable_0, T$0)
             "#,
         );
     }
@@ -823,7 +825,7 @@ mod tests {
         assert_wands(
             "fn f<'a, T>(x: &'a mut Option<T>) -> Option<&'a mut T> { x.as_mut() }",
             r#"
-            ((s_Option_discr(result)) == (s_Int_isize_cons(1))) ==> (p_Param(result.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, T$0)) --* p_Param(x.s_Ref_mutable_0, s_Option_type(T$0))
+            ((s_Option_discr(result)) == (s_Int_isize_cons(1))) ==> (p_Param(result.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, T$0)) --* p_Param(old(x).s_Ref_mutable_0, s_Option_type(T$0))
             "#,
         );
     }
@@ -833,8 +835,8 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b>(x: &'a mut i32, y: &'b mut i32) -> (&'a mut i32, &'b mut i32) { (x, y) }",
             r#"
-            p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
-            p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(y.s_Ref_mutable_0, s_Int_i32_type())
+            p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
+            p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type())
             "#,
         );
     }
@@ -846,7 +848,7 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b: 'a>(x: &'a mut i32, y: &'b mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(x.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(y.s_Ref_mutable_0, s_Int_i32_type()))
+            p_Param(result.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type()))
             "#,
         );
     }
@@ -858,7 +860,7 @@ mod tests {
         assert_wands(
             "fn f<'a: 'b + 'c, 'b, 'c>(x: &'a mut i32) -> (&'b mut i32, &'c mut i32) { (x, todo!()) }",
             r#"
-            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(x.s_Ref_mutable_0, s_Int_i32_type())
+            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(old(x).s_Ref_mutable_0, s_Int_i32_type())
             "#,
         );
     }
@@ -869,7 +871,22 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut (i32, i32)) -> (&'a mut i32, &'a mut i32) { (&mut x.0, &mut x.1) }",
             r#"
-            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(x.s_Ref_mutable_0, s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()))
+            (p_Param(result.s_2_Tuple_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(result.s_2_Tuple_1.make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) --* p_Param(old(x).s_Ref_mutable_0, s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()))
+            "#,
+        );
+    }
+
+    /// The callee stores `y` in `*x`, so the caller gets back `**x` from
+    /// before the call, and `*y`, once it gives up `**x` after the call.
+    // TODO: The right side reads `**x` after the call as well: `old` covers
+    // the snapshot of `x` but not the read of `*x`, which is outside it. So the
+    // right side gives back `*y` twice, and `**x` from before the call never.
+    #[test]
+    fn store_into_argument() {
+        assert_wands(
+            "fn f<'a, 'b>(x: &'a mut &'b mut i32, y: &'b mut i32) { *x = y; }",
+            r#"
+            p_Param(p_Param_snap(old(x).s_Ref_mutable_0, s_Ref_mutable_type(s_Int_i32_type())).make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type()) --* (p_Param(p_Param_snap(old(x).s_Ref_mutable_0, s_Ref_mutable_type(s_Int_i32_type())).make_concrete_s_Ref_mutable.s_Ref_mutable_0, s_Int_i32_type())) && (p_Param(old(y).s_Ref_mutable_0, s_Int_i32_type()))
             "#,
         );
     }
