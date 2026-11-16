@@ -21,8 +21,15 @@ impl<'vir> Simplifier<'_, 'vir, '_> {
             ExprKindGenData::Forall(q) => self.fold_quantifier(q.body.as_dyn()),
             ExprKindGenData::Exists(q) => self.fold_quantifier(q.body.as_dyn()),
             ExprKindGenData::Let(l) => self.fold_let(l),
+            ExprKindGenData::Old(o) => self.fold_old(o.expr),
             _ => None,
         }
+    }
+
+    /// `old[l](e)`: `old[l](old[k](a))` is `old[k](a)`, since the inner `old`
+    /// already fixes the heap that `a` is evaluated in.
+    fn fold_old(&mut self, e: ExprDyn<'vir>) -> Option<ExprDyn<'vir>> {
+        matches!(e.kind, ExprKindGenData::Old(_)).then_some(e)
     }
 
     /// `let x = v in b`:

@@ -288,6 +288,15 @@ fn i128_min_literal() {
 }
 
 #[test]
+fn old() {
+    check("old(x)", |c| c.old(c.old(c.i("x"))));
+    // The inner `old` decides the heap, whatever the outer one's label.
+    check("old[l](x)", |c| {
+        c.old(c.vcx.mk_local_labelled_old_expr(c.i("x"), "l"))
+    });
+}
+
+#[test]
 fn let_() {
     check("y", |c| c.let_("a", c.i("x"), c.i("y")));
     check("((x) + (1)) == (y)", |c| {
