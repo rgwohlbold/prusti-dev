@@ -751,12 +751,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             // A value that is no longer in its place gives the indirect
             // predicates of its parts back when they flow out of it. A value
             // still in its place does so when the place is unfolded.
-            BorrowPcgEdgeKind::BorrowFlow(borrow_flow)
-                if matches!(borrow_flow.kind(), BorrowFlowEdgeKind::Aggregate { .. })
-                    && edge_action.is_remove()
-                    && let MaybeLabelledPlace::Labelled(snap) = borrow_flow.short().base() =>
+            BorrowPcgEdgeKind::Aggregate(aggregate)
+                if edge_action.is_remove()
+                    && let MaybeLabelledPlace::Labelled(snap) = aggregate.target().base() =>
             {
-                let target = borrow_flow.short().base();
+                let target = aggregate.target().base();
                 let target_label = Some(self.get_location_label(snap.at()));
                 let target_ref = self.encode_place(target.place())?;
                 let data = self.ty_use_impure(target_ref.ty.ty);
