@@ -627,16 +627,12 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
     }
 
     /// The predicates of a struct's or enum's positions, outermost first,
-    /// keyed by its snapshot at `label`.
-    fn indirect_predicates(
-        &self,
-        self_ref: vir::ExprRef<'vir>,
-        label: Option<vir::OldLabel<'vir>>,
-    ) -> Vec<vir::PredicateApp<'vir>> {
+    /// keyed by its snapshot.
+    fn indirect_predicates(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::PredicateApp<'vir>> {
         let Some(nodes) = self.nodes else {
             return Vec::new();
         };
-        let snap = vir::with_vcx(|vcx| vcx.maybe_apply_label(self.ref_to_snap(self_ref), label));
+        let snap = self.ref_to_snap(self_ref);
         nodes
             .positions()
             .into_iter()
@@ -647,20 +643,16 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
     /// Fold the predicates of the positions after the type's predicate,
     /// outermost first: their keys read its snapshot and the enclosing ones.
     pub fn fold_indirect(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.indirect_predicates(self_ref, None)
+        self.indirect_predicates(self_ref)
             .into_iter()
             .map(|pred| vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred)))
             .collect()
     }
 
-    /// Unfold the predicates of the positions, innermost first, keyed by the
-    /// snapshot at `label`.
-    pub fn unfold_indirect(
-        &self,
-        self_ref: vir::ExprRef<'vir>,
-        label: Option<vir::OldLabel<'vir>>,
-    ) -> Vec<vir::Stmt<'vir>> {
-        self.indirect_predicates(self_ref, label)
+    /// Unfold the predicates of the positions before the type's predicate,
+    /// innermost first.
+    fn unfold_indirect(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
+        self.indirect_predicates(self_ref)
             .into_iter()
             .rev()
             .map(|pred| vir::with_vcx(|vcx| vcx.mk_unfold_stmt(pred)))
@@ -711,13 +703,13 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
             TySpecifics::ImmRef(..) | TySpecifics::Raw(..) => Vec::new(),
             TySpecifics::MutRef(data) => data.unfold(self_ref, old),
             TySpecifics::StructLike(data) => self
-                .unfold_indirect(self_ref, None)
+                .unfold_indirect(self_ref)
                 .into_iter()
                 .chain(data.unfold(self_ref, perm))
                 .collect(),
             TySpecifics::EnumLike(data) => {
                 let pred_app = self.ref_to_pred_app(self_ref, perm);
-                let indirect = self.unfold_indirect(self_ref, None);
+                let indirect = self.unfold_indirect(self_ref);
                 vir::with_vcx(|vcx| {
                     let discr = data
                         .discr_ty()

@@ -3,6 +3,7 @@ use pcg::{
     PcgOutput,
     action::{BorrowPcgAction, PcgAction, PcgActions},
     borrow_pcg::{
+        GeneralizedLifetime,
         action::BorrowPcgActionKind,
         borrow_pcg_edge::{BlockedNode, BorrowPcgEdge},
         borrow_pcg_expansion::BorrowPcgExpansion,
@@ -12,7 +13,7 @@ use pcg::{
             kind::BorrowPcgEdgeKind,
         },
         edge_data::EdgeData,
-        region_projection::PlaceOrConst,
+        region_projection::{ExtractRegionsCtxt, PlaceOrConst},
         state::BorrowsState,
         unblock_graph::{BorrowPcgUnblockAction, UnblockGraph},
         validity_conditions::BranchChoices,
@@ -30,7 +31,7 @@ use pcg::{
 use prusti_interface::PrustiError;
 use prusti_rustc_interface::{
     data_structures::graph::Successors,
-    index::Idx,
+    index::{Idx, IndexVec},
     middle::{
         mir,
         ty::{self, TyKind},
@@ -50,6 +51,7 @@ use crate::encoders::{
     ty::{
         RustFieldAddress, RustTyDecomposition, RustTySpecial,
         generics::GParams,
+        indirect_nodes::NodePredicates,
         use_impure::TyUseImpure,
         use_pure::{TyUsePure, TyUsePureEnc},
     },
@@ -750,7 +752,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
             // A value that is no longer in its place gives the indirect
             // predicates of its parts back when they flow out of it. A value
-            // still in its place does so when the place is unfolded.
+            // still in its place does so when the place is unfolded. Only the
+            // predicates of the edge's lifetime are given back: the value's
+            // other lifetimes may be held elsewhere, e.g. in a callee's wand.
             BorrowPcgEdgeKind::Aggregate(aggregate)
                 if edge_action.is_remove()
                     && let MaybeLabelledPlace::Labelled(snap) = aggregate.target().base() =>
@@ -758,11 +762,28 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 let target = aggregate.target().base();
                 let target_label = Some(self.get_location_label(snap.at()));
                 let target_ref = self.encode_place(target.place())?;
-                let data = self.ty_use_impure(target_ref.ty.ty);
+                let ty = target_ref.ty.ty;
+                let data = self.ty_use_impure(ty);
                 let target_ref = self
                     .vcx
                     .maybe_apply_label(target_ref.expr.expect_predicate(), target_label);
-                self.stmts(data.unfold_indirect(target_ref, target_label));
+                let snap = self
+                    .vcx
+                    .maybe_apply_label(data.ref_to_snap(target_ref), target_label);
+                let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> =
+                    self.pcg_ctxt().extract_regions(ty);
+                let lifetime = lifetimes[aggregate.target().region_idx()];
+                let nodes =
+                    NodePredicates::new(RustTyDecomposition::from_ty(ty, self.def_id), self.deps)?
+                        .in_ty(ty);
+                // Innermost first: the keys read the enclosing predicates.
+                let unfolds = nodes
+                    .positions_of(lifetime)
+                    .into_iter()
+                    .rev()
+                    .map(|p| self.vcx.mk_unfold_stmt(nodes.predicate(p, snap)))
+                    .collect::<Vec<_>>();
+                self.stmts(unfolds);
             }
             BorrowPcgEdgeKind::Deref(deref) => {
                 let frame = self.fold_or_unfold(

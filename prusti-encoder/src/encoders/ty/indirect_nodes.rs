@@ -1,11 +1,14 @@
 use pcg::borrow_pcg::{GeneralizedLifetime as PcgLifetime, region_projection::PcgRegion};
-use prusti_rustc_interface::index::Idx;
+use prusti_rustc_interface::{
+    index::{Idx, IndexVec},
+    middle::ty,
+};
 use task_encoder::{EncodeFullError, TaskEncoder, TaskEncoderDependencies};
 
 use super::{
     RustTyDecomposition,
     generics::{
-        GArgsTyEnc,
+        GArgsTyEnc, GParams,
         lifetime_position::{
             EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
         },
@@ -18,6 +21,10 @@ use super::{
 #[derive(Debug)]
 pub struct NodePredicates<'vir> {
     graph: EnclosureGraph<'vir>,
+    /// The lifetime of each position, against which the PCG's lifetimes are
+    /// matched.
+    lifetimes: IndexVec<LifetimePosition, GeneralizedLifetime<'vir>>,
+    context: GParams<'vir>,
     ind: IndirectPredRef<'vir>,
     tys: &'vir [vir::ExprTyVal<'vir>],
     consts: &'vir [vir::ExprCSnap<'vir>],
@@ -29,12 +36,27 @@ impl<'vir> NodePredicates<'vir> {
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<Self, EncodeFullError<'vir, E>> {
         let args = deps.require_dep::<GArgsTyEnc>(ty.args)?;
+        let graph = deps.require_dep::<LifetimePositionEnc>(ty)?;
         Ok(Self {
-            graph: deps.require_dep::<LifetimePositionEnc>(ty)?,
+            lifetimes: graph.positions().map(|p| graph.lifetime(p)).collect(),
+            graph,
+            context: ty.args.context(),
             ind: deps.require_ref::<IndirectPredEnc>(ty.ty)?,
             tys: args.get_ty(),
             consts: args.get_const(),
         })
+    }
+
+    /// Matches the PCG's lifetimes against the regions of `ty`, the type the
+    /// predicates are for, rather than those of its decomposition, which
+    /// erases inference regions such as those of a body's types.
+    pub fn in_ty(mut self, ty: ty::Ty<'vir>) -> Self {
+        self.lifetimes = self
+            .graph
+            .positions()
+            .map(|p| self.graph.lifetime_in(p, ty, self.context))
+            .collect();
+        self
     }
 
     /// All positions of the type, merged on the snapshot `snap`.
@@ -63,7 +85,7 @@ impl<'vir> NodePredicates<'vir> {
         block
             .positions()
             .into_iter()
-            .filter(|&p| is_position_of(self.graph.lifetime(p), lifetime))
+            .filter(|&p| is_position_of(self.lifetimes[p], lifetime))
             .map(|p| {
                 let (lo, hi) = self.graph.interval(p);
                 block.predicate(in_state(block.key(p)), lo, hi)
@@ -75,12 +97,21 @@ impl<'vir> NodePredicates<'vir> {
     pub fn has_positions(&self, lifetime: PcgLifetime<'vir>) -> bool {
         self.graph
             .positions()
-            .any(|p| is_position_of(self.graph.lifetime(p), lifetime))
+            .any(|p| is_position_of(self.lifetimes[p], lifetime))
     }
 
     /// The positions of the type, each after the positions enclosing it.
     pub fn positions(&self) -> Vec<LifetimePosition> {
         self.graph.positions_outermost_first().collect()
+    }
+
+    /// The positions of the node of `lifetime`, each after the positions
+    /// enclosing it.
+    pub fn positions_of(&self, lifetime: PcgLifetime<'vir>) -> Vec<LifetimePosition> {
+        self.positions()
+            .into_iter()
+            .filter(|&p| is_position_of(self.lifetimes[p], lifetime))
+            .collect()
     }
 
     /// The key of position `p` on a place with snapshot `snap`.
@@ -160,6 +191,8 @@ mod tests {
                 .unwrap();
             let (pure, _, _) = TyPureEnc::encode(ty.ty, true, DUMMY_SP).unwrap().unwrap();
             let nodes = NodePredicates {
+                lifetimes: graph.positions().map(|p| graph.lifetime(p)).collect(),
+                context: ty.args.context(),
                 graph,
                 ind,
                 tys: args.get_ty(),

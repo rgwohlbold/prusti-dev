@@ -67,7 +67,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             let projs = place
                 .with_inherent_region(ctxt)
                 .generalized_lifetime_projections(ctxt);
-            let nodes = NodePredicates::new(task, self.deps).unwrap();
+            let nodes = NodePredicates::new(task, self.deps).unwrap().in_ty(ty.ty);
             let snap = ty_out.ref_to_snap(place_res.expr.expect_predicate());
             for proj in projs {
                 let lifetime = proj.region(ctxt);
@@ -131,7 +131,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         };
         let (_, snap, ty, _) = self.encode_place_with_snap(Self::get_place(place))?;
         let decomp = RustTyDecomposition::from_ty(ty.ty, self.def_id);
-        let nodes = NodePredicates::new(decomp, self.deps).unwrap();
+        let nodes = NodePredicates::new(decomp, self.deps).unwrap().in_ty(ty.ty);
         let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> =
             self.pcg_ctxt().extract_regions(ty.ty);
         let lifetime = lifetimes[r.region_idx()];

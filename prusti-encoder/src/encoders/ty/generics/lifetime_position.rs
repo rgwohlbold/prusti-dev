@@ -6,8 +6,12 @@ use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDe
 use vir::CastType;
 
 use crate::encoders::ty::{
-    RustParamData, RustTyDecomposition, TySpecifics,
-    generics::arity::{TyArityEnc, add},
+    RustParamData, RustTyDatas, RustTyDecomposition, TySpecifics,
+    data::TyData,
+    generics::{
+        GParams,
+        arity::{TyArityEnc, add},
+    },
 };
 
 /// Encodes the lifetime positions of a type and which of them enclose which.
@@ -42,6 +46,10 @@ pub struct EnclosureGraph<'vir> {
     intervals: IndexVec<LifetimePosition, (vir::ExprInt<'vir>, vir::ExprInt<'vir>)>,
     /// For each position, the positions enclosing it, transitively, outermost first.
     ancestors: IndexVec<LifetimePosition, Vec<LifetimePosition>>,
+    /// For each position, the indices of the generic arguments that lead from
+    /// the type to its lifetime: the last one is a lifetime argument, or the
+    /// path ends at a type parameter, whose regions the position covers.
+    paths: IndexVec<LifetimePosition, Vec<usize>>,
 }
 
 impl<'vir> EnclosureGraph<'vir> {
@@ -64,6 +72,27 @@ impl<'vir> EnclosureGraph<'vir> {
 
     pub fn lifetime(&self, p: LifetimePosition) -> GeneralizedLifetime<'vir> {
         self.lifetimes[p]
+    }
+
+    /// The lifetime of `p` in `ty`, a type whose decomposition this graph is
+    /// for but whose regions may differ from the decomposition's: the
+    /// decomposition erases inference regions, e.g. those of a body's types.
+    /// The type parameter of a `RegionsIn` lifetime is decomposed in `context`.
+    pub fn lifetime_in(
+        &self,
+        p: LifetimePosition,
+        mut ty: ty::Ty<'vir>,
+        context: GParams<'vir>,
+    ) -> GeneralizedLifetime<'vir> {
+        for &arg in &self.paths[p] {
+            let (_, args) = TyData::<RustTyDatas>::identity_for_ty(ty, false);
+            match args[arg].kind() {
+                ty::GenericArgKind::Lifetime(region) => return GeneralizedLifetime::Region(region),
+                ty::GenericArgKind::Type(arg_ty) => ty = arg_ty,
+                ty::GenericArgKind::Const(_) => unreachable!("a path leads through a constant"),
+            }
+        }
+        GeneralizedLifetime::RegionsIn(RustTyDecomposition::from_ty(ty, context))
     }
 
     /// The lifetime position numbers that `p` covers: `[x, x + 1)` for a
@@ -103,6 +132,7 @@ impl TaskEncoder for LifetimePositionEnc {
         let mut lifetimes = IndexVec::new();
         let mut intervals = IndexVec::new();
         let mut direct: IndexVec<LifetimePosition, Vec<LifetimePosition>> = IndexVec::new();
+        let mut paths: IndexVec<LifetimePosition, Vec<usize>> = IndexVec::new();
         match task_key.ty.specifics {
             TySpecifics::ImmRef(_) => {}
             TySpecifics::Param(RustParamData::Generic) => {
@@ -110,18 +140,20 @@ impl TaskEncoder for LifetimePositionEnc {
                 lifetimes.push(GeneralizedLifetime::RegionsIn(*task_key));
                 intervals.push((int(0), arity));
                 direct.push(Vec::new());
+                paths.push(Vec::new());
             }
             _ => {
                 // The positions of each generic argument, by its index.
                 let mut arg_positions = Vec::new();
                 let mut offset = int(0);
-                for arg in task_key.args.args() {
+                for (arg_index, arg) in task_key.args.args().iter().enumerate() {
                     let base = direct.len();
                     match arg.kind() {
                         ty::GenericArgKind::Lifetime(region) => {
                             lifetimes.push(GeneralizedLifetime::Region(region));
                             intervals.push((offset, add(offset, int(1))));
                             direct.push(Vec::new());
+                            paths.push(vec![arg_index]);
                             offset = add(offset, int(1));
                         }
                         ty::GenericArgKind::Type(arg_ty) => {
@@ -136,6 +168,11 @@ impl TaskEncoder for LifetimePositionEnc {
                                 intervals.push((add(offset, lo), add(offset, hi)));
                                 direct.push(
                                     arg_graph.ancestors(p).iter().copied().map(shift).collect(),
+                                );
+                                paths.push(
+                                    std::iter::once(arg_index)
+                                        .chain(arg_graph.paths[p].iter().copied())
+                                        .collect(),
                                 );
                             }
                             offset = add(offset, deps.require_dep::<TyArityEnc>(arg_ty)?);
@@ -165,6 +202,7 @@ impl TaskEncoder for LifetimePositionEnc {
                 lifetimes,
                 intervals,
                 ancestors,
+                paths,
             },
         ))
     }
