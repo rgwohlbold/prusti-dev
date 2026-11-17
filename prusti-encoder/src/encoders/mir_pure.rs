@@ -6,6 +6,7 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition,
         generics::{GArgs, GParams},
+        indirect_nodes::NodePredicates,
         use_pure::{TyUsePure, TyUsePureEnc},
     },
 };
@@ -292,7 +293,7 @@ struct Enc<'vir: 'enc, 'enc> {
     rel0_mode: bool,
     rel1_mode: bool,
     before_expiry_mode: bool,
-    impure_context: bool,
+    kind: PureKind,
 }
 
 struct EncodedPlace<'vir> {
@@ -301,6 +302,7 @@ struct EncodedPlace<'vir> {
     /// The metadata for the pointed-to value. Set when going through a
     /// `ProjectionElem::Deref`.
     metadata: Option<ExprRet<'vir>>,
+    in_deep_snap: bool,
 }
 
 impl<'vir> EncodedPlace<'vir> {
@@ -309,7 +311,13 @@ impl<'vir> EncodedPlace<'vir> {
             snap: expr,
             place_ref,
             metadata: None,
+            in_deep_snap: false,
         }
+    }
+
+    fn with_in_deep_snap(mut self, in_deep_snap: bool) -> Self {
+        self.in_deep_snap = in_deep_snap;
+        self
     }
 
     fn with_metadata(mut self, metadata: ExprRet<'vir>) -> Self {
@@ -393,18 +401,34 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             rel0_mode: false,
             rel1_mode: false,
             before_expiry_mode: false,
-            // An impure method's specs and contained spec blocks get shallow
-            // argument snapshots (and can take a snapshot of the predicates
-            // behind `&mut`s). Pure functions currently also only get shallow
-            // snapshots but cannot get the value behind `&mut`s.
-            impure_context: matches!(
-                kind,
-                PureKind::Spec {
-                    mode: MirSpecEncMode::Impure,
-                    ..
-                } | PureKind::SpecBlock(..)
-            ),
+            kind,
         }
+    }
+
+    /// Whether this is an impure method's spec or spec block, which may read behind `&mut`s.
+    fn impure_context(&self) -> bool {
+        matches!(
+            self.kind,
+            PureKind::Spec {
+                mode: MirSpecEncMode::Impure,
+                ..
+            } | PureKind::SpecBlock(..)
+        )
+    }
+
+    /// Whether `local` is a contract's argument or result, read from its deep
+    /// snapshot.
+    fn has_deep_snap(&self, local: mir::Local) -> bool {
+        matches!(
+            self.kind,
+            PureKind::Spec {
+                mode: MirSpecEncMode::Impure,
+                ..
+            }
+        ) && matches!(
+            self.body.local_kind(local),
+            mir::LocalKind::Arg | mir::LocalKind::ReturnPointer
+        )
     }
 
     fn ty_use(&mut self, ty: ty::Ty<'vir>) -> TyUsePure<'vir> {
@@ -1138,7 +1162,9 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                         let val_expr = data.box_value_access(snap);
                         let place_ref = Some(data.box_address_access(snap));
                         let metadata = data.box_metadata_access(snap);
-                        EncodedPlace::new(val_expr, place_ref).with_metadata(metadata)
+                        EncodedPlace::new(val_expr, place_ref)
+                            .with_metadata(metadata)
+                            .with_in_deep_snap(encoded_place.in_deep_snap)
                     }
                     TyKind::Ref(.., ty::Mutability::Not) => {
                         let e_ty = e_ty.expect_immref();
@@ -1153,7 +1179,12 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                         let snap = encoded_place.snap.downcast_ty();
                         let metadata = e_ty.metadata_access(snap);
                         let ref_expr = e_ty.deref_access(snap);
-                        if !self.impure_context {
+                        if encoded_place.in_deep_snap {
+                            return Ok(EncodedPlace::new(e_ty.value_access(snap), Some(ref_expr))
+                                .with_metadata(metadata)
+                                .with_in_deep_snap(true));
+                        }
+                        if !self.impure_context() {
                             // The value field of a mutable reference's snapshot
                             // is never constrained to the referent (see
                             // `p_Ref_mutable_arbitrary_value`).
@@ -1204,7 +1235,8 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
                 let proj = variant[field_idx];
                 let proj_app = proj.read(encoded_place.snap.downcast_ty());
                 let place_ref = encoded_place.place_ref.map(|pr| proj.field_ref(pr));
-                let place = EncodedPlace::new(proj_app, place_ref);
+                let place = EncodedPlace::new(proj_app, place_ref)
+                    .with_in_deep_snap(encoded_place.in_deep_snap);
                 // Only the last field can be an unsized DST tail that shares the
                 // containing value's pointer metadata; propagate it there, and
                 // nowhere else (every other field is sized and thin).
@@ -1260,6 +1292,36 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         self.old_mode || self.rel0_mode || self.rel1_mode || self.before_expiry_mode
     }
 
+    /// Whether `place` dereferences a mutable reference.
+    fn derefs_mut_ref(&self, place: Place<'vir>) -> bool {
+        let mut place_ty = mir::PlaceTy::from_ty(self.body.local_decls[place.local].ty);
+        place.projection.iter().any(|elem| {
+            let derefs = matches!(elem, mir::ProjectionElem::Deref)
+                && matches!(place_ty.ty.kind(), TyKind::Ref(.., ty::Mutability::Mut));
+            place_ty = place_ty.projection_ty(self.vcx.tcx(), *elem);
+            derefs
+        })
+    }
+
+    /// The snapshot `snap` of `local`, extended through the local's indirect
+    /// predicates so that its `&mut`s hold their referents.
+    fn deep_snap(
+        &mut self,
+        local: mir::Local,
+        snap: ExprRet<'vir>,
+    ) -> EncodeResult<'vir, ExprRet<'vir>, MirPureEnc> {
+        let ty = RustTyDecomposition::from_ty(self.body.local_decls[local].ty, self.context);
+        let nodes = NodePredicates::new(ty, self.deps)?;
+        Ok(self.vcx.mk_lazy_expr(
+            "deep_snap",
+            snap.ty(),
+            Box::new(move |vcx, lctx: ExprInput<'vir>| {
+                use vir::Reify;
+                nodes.deep_snap(snap.reify(vcx, lctx)).kind
+            }),
+        ))
+    }
+
     fn encode_place_with_ref(
         &mut self,
         curr_ver: &FxHashMap<mir::Local, Version<'vir>>,
@@ -1286,7 +1348,14 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
         } else {
             self.mk_local_ex(place.local, curr_ver[&place.local])
         };
-        let mut encoded_place = EncodedPlace::new(expr, None);
+        // Only reads behind a `&mut` need the extension.
+        let in_deep_snap = self.has_deep_snap(place.local) && self.derefs_mut_ref(place);
+        let expr = if in_deep_snap {
+            self.deep_snap(place.local, expr)?
+        } else {
+            expr
+        };
+        let mut encoded_place = EncodedPlace::new(expr, None).with_in_deep_snap(in_deep_snap);
         // TODO: factor this out (duplication with impure encoder)?
         for elem in place.projection {
             // The snapshots of the arguments and the result are pinned to a
@@ -1297,7 +1366,7 @@ impl<'vir: 'enc, 'enc> Enc<'vir, 'enc> {
             // labelled. Silicon evaluates the heap-independent parts of a wand
             // when inhaling it, where `old[lhs]` is undefined.
             let heap_read = should_wrap
-                && self.impure_context
+                && self.impure_context()
                 && matches!(elem, mir::ProjectionElem::Deref)
                 && matches!(place_ty.ty.kind(), TyKind::Ref(.., ty::Mutability::Mut));
             encoded_place = self.encode_place_element(curr_ver, place_ty, *elem, encoded_place)?;
