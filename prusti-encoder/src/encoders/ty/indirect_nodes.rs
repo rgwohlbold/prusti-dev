@@ -15,6 +15,7 @@ use super::{
 
 /// The predicates of the nodes on places of a type: one `p_T_ind` per
 /// occurrence of the node's generalized lifetime in the type.
+#[derive(Debug)]
 pub struct NodePredicates<'vir> {
     graph: EnclosureGraph<'vir>,
     ind: IndirectPredRef<'vir>,
@@ -75,6 +76,30 @@ impl<'vir> NodePredicates<'vir> {
         self.graph
             .positions()
             .any(|p| is_position_of(self.graph.lifetime(p), lifetime))
+    }
+
+    /// The positions of the type, each after the positions enclosing it.
+    pub fn positions(&self) -> Vec<LifetimePosition> {
+        self.graph.positions_outermost_first().collect()
+    }
+
+    /// The key of position `p` on a place with snapshot `snap`.
+    pub fn key(&self, p: LifetimePosition, snap: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {
+        self.block(snap).key(p)
+    }
+
+    /// The predicate of position `p` on a place with snapshot `snap`.
+    pub fn predicate(
+        &self,
+        p: LifetimePosition,
+        snap: vir::ExprSnap<'vir>,
+    ) -> vir::PredicateApp<'vir> {
+        let (lo, hi) = self.graph.interval(p);
+        (self.ind.predicate)(self.key(p, snap), self.tys, self.consts, lo, hi)(None)
+    }
+
+    pub fn interval(&self, p: LifetimePosition) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
+        self.graph.interval(p)
     }
 
     pub fn deep_snap(&self, snap: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {

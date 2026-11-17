@@ -18,7 +18,7 @@ pub(crate) use param_typ::ParamTypEnc;
 
 pub use args::*;
 pub use args_ty::*;
-pub use casters::IndirectCastersEnc;
+pub use casters::{IndirectCastIdn, IndirectCasters, IndirectCastersEnc};
 pub use params::*;
 pub use ty_expr::*;
 pub use use_casters::*;
