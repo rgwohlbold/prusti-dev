@@ -331,9 +331,16 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 | mir::AggregateKind::Tuple
                 | mir::AggregateKind::Closure(..)),
                 fields,
-            ) => Ok(self
-                .encode_aggregate_snap(rvalue_ty, kind, fields, operand_snaps)?
-                .into()),
+            ) => {
+                let expr = self.encode_aggregate_snap(rvalue_ty, kind, fields, operand_snaps)?;
+                // The indirect predicates of the fields, which moved in with
+                // their snapshots, make up those of the new value.
+                let ty = self.ty_use_impure(rvalue_ty);
+                Ok(EncodedRvalue {
+                    expr,
+                    post_assign_folds: Some(Box::new(move |lhs_place| ty.fold_indirect(lhs_place))),
+                })
+            }
 
             mir::Rvalue::Repeat(operand, len) => Ok(self
                 .encode_repeat_snap(rvalue_ty, operand, *len, operand_snaps)?
@@ -740,6 +747,23 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 let undo = cast_output.undo(src_enc);
                 self.stmts(undo);
                 return Ok(());
+            }
+            // A value that is no longer in its place gives the indirect
+            // predicates of its parts back when they flow out of it. A value
+            // still in its place does so when the place is unfolded.
+            BorrowPcgEdgeKind::BorrowFlow(borrow_flow)
+                if matches!(borrow_flow.kind(), BorrowFlowEdgeKind::Aggregate { .. })
+                    && edge_action.is_remove()
+                    && let MaybeLabelledPlace::Labelled(snap) = borrow_flow.short().base() =>
+            {
+                let target = borrow_flow.short().base();
+                let target_label = Some(self.get_location_label(snap.at()));
+                let target_ref = self.encode_place(target.place())?;
+                let data = self.ty_use_impure(target_ref.ty.ty);
+                let target_ref = self
+                    .vcx
+                    .maybe_apply_label(target_ref.expr.expect_predicate(), target_label);
+                self.stmts(data.unfold_indirect(target_ref, target_label));
             }
             BorrowPcgEdgeKind::Deref(deref) => {
                 let frame = self.fold_or_unfold(

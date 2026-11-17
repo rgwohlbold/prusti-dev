@@ -49,6 +49,9 @@ pub struct TyUseImpureData<'vir> {
     args: GArgsTy<'vir>,
     impure: <ImpureTyDatas as TyDatas<'vir>>::TyData,
     inhabited: TyUseInhabitedRef<'vir>,
+    /// The predicates of a struct's or enum's positions, if it has any. They
+    /// hold the indirect predicates of its fields.
+    nodes: Option<&'vir NodePredicates<'vir>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -310,10 +313,17 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             }
             TySpecifics::Builtin(..) => TySpecifics::mk_builtin(()),
         };
+        let nodes = match specifics {
+            TySpecifics::StructLike(..) | TySpecifics::EnumLike(..) => {
+                Some(self.alloc_nodes(self.decomp)?).filter(|nodes| !nodes.positions().is_empty())
+            }
+            _ => None,
+        };
         let data = TyUseImpureData {
             args: self.args_t,
             impure: *ty.1,
             inhabited: self.inhabited,
+            nodes,
         };
         Ok(TyData::new(data, specifics))
     }
@@ -323,7 +333,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         ty: RustTyDecomposition<'vir>,
     ) -> EncResult<'vir, &'vir NodePredicates<'vir>> {
         let nodes = NodePredicates::new(ty, self.deps)?;
-        Ok(vir::with_vcx(|vcx| &*vcx.alloc(nodes)))
+        Ok(vir::with_vcx(|vcx| vcx.alloc(nodes)))
     }
 
     /// The casts of the referent's predicates, if it is a concrete type with
@@ -603,12 +613,58 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
             }
             TySpecifics::ImmRef(..) | TySpecifics::Raw(..) => Vec::new(),
             TySpecifics::MutRef(data) => data.fold(self_ref, label),
-            TySpecifics::StructLike(data) => data.fold(self_ref, perm).collect(),
+            TySpecifics::StructLike(data) => data
+                .fold(self_ref, perm)
+                .chain(self.fold_indirect(self_ref))
+                .collect(),
             TySpecifics::EnumLike(..) => {
                 let pred_app = self.ref_to_pred_app(self_ref, perm);
-                vec![vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred_app))]
+                std::iter::once(vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred_app)))
+                    .chain(self.fold_indirect(self_ref))
+                    .collect()
             }
         }
+    }
+
+    /// The predicates of a struct's or enum's positions, outermost first,
+    /// keyed by its snapshot at `label`.
+    fn indirect_predicates(
+        &self,
+        self_ref: vir::ExprRef<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> Vec<vir::PredicateApp<'vir>> {
+        let Some(nodes) = self.nodes else {
+            return Vec::new();
+        };
+        let snap = vir::with_vcx(|vcx| vcx.maybe_apply_label(self.ref_to_snap(self_ref), label));
+        nodes
+            .positions()
+            .into_iter()
+            .map(|p| nodes.predicate(p, snap))
+            .collect()
+    }
+
+    /// Fold the predicates of the positions after the type's predicate,
+    /// outermost first: their keys read its snapshot and the enclosing ones.
+    pub fn fold_indirect(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
+        self.indirect_predicates(self_ref, None)
+            .into_iter()
+            .map(|pred| vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred)))
+            .collect()
+    }
+
+    /// Unfold the predicates of the positions, innermost first, keyed by the
+    /// snapshot at `label`.
+    pub fn unfold_indirect(
+        &self,
+        self_ref: vir::ExprRef<'vir>,
+        label: Option<vir::OldLabel<'vir>>,
+    ) -> Vec<vir::Stmt<'vir>> {
+        self.indirect_predicates(self_ref, label)
+            .into_iter()
+            .rev()
+            .map(|pred| vir::with_vcx(|vcx| vcx.mk_unfold_stmt(pred)))
+            .collect()
     }
 
     /// Unfold the predicate (including generic casts).
@@ -654,15 +710,22 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
             }
             TySpecifics::ImmRef(..) | TySpecifics::Raw(..) => Vec::new(),
             TySpecifics::MutRef(data) => data.unfold(self_ref, old),
-            TySpecifics::StructLike(data) => data.unfold(self_ref, perm).collect(),
+            TySpecifics::StructLike(data) => self
+                .unfold_indirect(self_ref, None)
+                .into_iter()
+                .chain(data.unfold(self_ref, perm))
+                .collect(),
             TySpecifics::EnumLike(data) => {
                 let pred_app = self.ref_to_pred_app(self_ref, perm);
+                let indirect = self.unfold_indirect(self_ref, None);
                 vir::with_vcx(|vcx| {
                     let discr = data
                         .discr_ty()
                         .ref_to_snap(data.discr(self_ref))
                         .downcast_ty::<vir::CSnap>();
-                    std::iter::once(vcx.mk_unfold_stmt(pred_app))
+                    indirect
+                        .into_iter()
+                        .chain(std::iter::once(vcx.mk_unfold_stmt(pred_app)))
                         .chain(data.variant_inhabited.iter().map(
                             |(variant_discr, variant_inhabited)| {
                                 let is_variant = vcx.mk_eq_expr(discr, *variant_discr);
