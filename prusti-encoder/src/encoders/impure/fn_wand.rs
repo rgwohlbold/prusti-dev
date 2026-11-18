@@ -3,7 +3,9 @@ use crate::encoders::{
     pure::spec::{EncodedPledge, MirSpecEncMode, PledgeArgs, PledgeExpr},
     ty::{
         RustTyDecomposition,
-        generics::{GArgs, GArgsTyEnc, GParams, GenericParamsEnc},
+        generics::{
+            GArgs, GArgsTyEnc, GParams, GenericParamsEnc, lifetime_position::LifetimePositionEnc,
+        },
         indirect_nodes::NodePredicates,
     },
 };
@@ -203,6 +205,68 @@ impl<'vir> WandEncOutput<'vir> {
         Some(vcx.with_local_subst(generics, || {
             predicates.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
         }))
+    }
+
+    /// The folds that give a call with generic arguments `call_ctx` the
+    /// predicates its precondition requires for the lifetimes in a type
+    /// parameter that the call instantiates with a type without positions. The
+    /// caller's argument has no position there and so no predicate, but the
+    /// predicate of an empty interval holds nothing. `arguments` are the
+    /// snapshots of the call's arguments, in order.
+    pub fn empty_input_folds<E: TaskEncoder>(
+        &self,
+        vcx: &'vir vir::VirCtxt<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
+        arguments: &[vir::ExprSnap<'vir>],
+        call_ctx: GArgs<'vir>,
+    ) -> Vec<vir::Stmt<'vir>> {
+        let generics = self.generics_subst(Some(call_ctx), vcx, deps);
+        let mut folds = Vec::new();
+        for g in self.inputs() {
+            // The predicate of an argument of a type parameter's type is
+            // abstract, so it cannot be folded.
+            let arg_ty = FunctionShapeNode::from(g).ty(self.fn_sig(vcx, None));
+            if matches!(arg_ty.kind(), ty::TyKind::Param(_)) {
+                continue;
+            }
+            let Some((nodes, lifetime)) = self.node(vcx, deps, g.into()) else {
+                continue;
+            };
+            let GeneralizedLifetime::RegionsIn(regions_in) = lifetime else {
+                continue;
+            };
+            let ty::TyKind::Param(param) = regions_in.ty(vcx.tcx()).kind() else {
+                continue;
+            };
+            let arg_ty = call_ctx.args()[param.index as usize].expect_ty();
+            let arg_decomp = RustTyDecomposition::from_ty(arg_ty, call_ctx.context());
+            let graph = deps.require_dep::<LifetimePositionEnc>(arg_decomp).unwrap();
+            if graph.positions().next().is_some() {
+                continue;
+            }
+            // The callee's argument locals start after the return place.
+            let arg = arguments[g.mir_local().as_usize() - 1];
+            // The argument's snapshot is substituted for a placeholder
+            // together with the generic arguments, so that the substitution
+            // does not apply to the caller's own type parameters in it.
+            let placeholder = vcx.mk_local_decl("call_arg", arg.ty());
+            let mut subst = generics.clone();
+            subst.insert(placeholder.name, arg.as_dyn());
+            let subst = vcx.alloc(subst);
+            for p in nodes.positions_of(lifetime) {
+                let pred =
+                    vcx.mk_predicate_app_expr(nodes.predicate(p, vcx.mk_local_ex(placeholder)));
+                let pred = vcx.with_local_subst(subst, || {
+                    use vir::Reify;
+                    pred.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
+                });
+                let vir::ExprKindGenData::PredicateApp(app) = pred.kind else {
+                    unreachable!("a substituted predicate application is one");
+                };
+                folds.push(vcx.mk_fold_stmt(app));
+            }
+        }
+        folds
     }
 
     pub fn indirect_pres<'a, E: TaskEncoder>(

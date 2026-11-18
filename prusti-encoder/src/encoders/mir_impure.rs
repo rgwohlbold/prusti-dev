@@ -3,7 +3,7 @@ use pcg::{
     PcgOutput,
     action::{BorrowPcgAction, PcgAction, PcgActions},
     borrow_pcg::{
-        GeneralizedLifetime,
+        FunctionData, GeneralizedLifetime,
         action::BorrowPcgActionKind,
         borrow_pcg_edge::{BlockedNode, BorrowPcgEdge},
         borrow_pcg_expansion::BorrowPcgExpansion,
@@ -2523,6 +2523,24 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                             .iter()
                             .map(|arg| self.encode_operand(&arg.node).unwrap())
                             .collect::<Vec<_>>();
+
+                        // The callee requires predicates for the lifetimes in
+                        // its type parameters, also where the call instantiates
+                        // one with a type without positions, for which the
+                        // arguments hold none.
+                        if !func_out.is_trait_stub() {
+                            let wands = self.deps.require_dep::<WandEnc>(WandEncTask {
+                                data: FunctionData::new(func_def_id),
+                            })?;
+                            let arg_snaps = args
+                                .iter()
+                                .map(|arg| self.encode_operand_snap_immediate(&arg.node))
+                                .collect::<EncodeResult<'vir, Vec<_>, E>>()?;
+                            let call_ctx = self.gargs(caller_substs);
+                            let folds =
+                                wands.empty_input_folds(vcx, self.deps, &arg_snaps, call_ctx);
+                            self.stmts(folds);
+                        }
 
                         let call = func_out.call(method_in, dest);
 
