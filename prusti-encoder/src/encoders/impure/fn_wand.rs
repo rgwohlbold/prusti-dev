@@ -264,7 +264,6 @@ impl<'vir> WandEncOutput<'vir> {
             .map(|g| (g.into(), arguments[g.mir_local().as_usize() - 1]));
         let outputs = self
             .outputs()
-            .map(FunctionShapeNode::from)
             .filter(|g| g.mir_local() == mir::RETURN_PLACE)
             .map(|g| (g, result));
         let mut stmts = Vec::new();
