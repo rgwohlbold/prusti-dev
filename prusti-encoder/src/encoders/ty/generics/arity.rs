@@ -44,7 +44,11 @@ pub(crate) fn sub<'vir>(a: vir::ExprInt<'vir>, b: vir::ExprInt<'vir>) -> vir::Ex
 }
 
 fn arity_fn_ident<'vir>() -> vir::FunctionIdn<'vir, vir::TyVal, vir::Int> {
-    vir::FunctionIdn::new(vir::ViperIdent::new("arity"), vir::TYPE_TYVAL, vir::TYPE_INT)
+    vir::FunctionIdn::new(
+        vir::ViperIdent::new("arity"),
+        vir::TYPE_TYVAL,
+        vir::TYPE_INT,
+    )
 }
 
 impl TaskEncoder for ArityEnc {
@@ -82,8 +86,11 @@ impl TaskEncoder for ArityEnc {
         let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
         vir::with_vcx(|vcx| {
             let arity_fn_ident = arity_fn_ident();
-            let num_lifetimes = vcx.mk_const_expr(vir::ConstData::Int(num_lifetimes as u128)).downcast_ty();
-            let instantiated_type = ty_constructor.ty_constructor.call()(params.ty_exprs(), params.const_exprs());
+            let num_lifetimes = vcx
+                .mk_const_expr(vir::ConstData::Int(num_lifetimes as u128))
+                .downcast_ty();
+            let instantiated_type =
+                ty_constructor.ty_constructor.call()(params.ty_exprs(), params.const_exprs());
             // shared references have no lifetime positions, they work with snapshots instead
             let rhs = if matches!(task_key.specifics, TySpecifics::ImmRef(_)) {
                 vcx.mk_uint::<0>()
@@ -98,8 +105,9 @@ impl TaskEncoder for ArityEnc {
                     ([arity_fn_ident](instantiated_type)) == (rhs)
             };
             let axiom = vcx.mk_domain_axiom(
-                vir::vir_format_identifier!(vcx, "arity_{}", task_key.name())
-            , expr);
+                vir::vir_format_identifier!(vcx, "arity_{}", task_key.name()),
+                expr,
+            );
             Ok((Some(axiom), ()))
         })
     }
