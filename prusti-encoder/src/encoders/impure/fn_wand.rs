@@ -8,7 +8,7 @@ use crate::encoders::{
             lifetime_position::{
                 GeneralizedLifetime as TyLifetime, LifetimePosition, LifetimePositionEnc,
             },
-            merge_split::MergeSplitEnc,
+            merge_split::{MergeSplitEnc, MergeTarget},
         },
         indirect_nodes::NodePredicates,
     },
@@ -277,10 +277,10 @@ impl<'vir> WandEncOutput<'vir> {
     /// value with snapshot `snap` into the callee's before a call with generic
     /// arguments `call_ctx`, or the callee's back into the caller's after it.
     /// A callee position of the lifetimes in a type parameter covers the block
-    /// of the caller's positions that the parameter's instantiation occupies:
-    /// an empty block's predicate holds nothing and is folded before the call,
-    /// and a block of several positions is merged before the call and split
-    /// after it.
+    /// of the caller's positions that the parameter's instantiation occupies,
+    /// which may be empty or have several positions: it is merged into the
+    /// callee's predicate before the call, and split after it. For a value of
+    /// a type parameter's type, the callee's predicate is the parameter's.
     fn call_adjustments<E: TaskEncoder>(
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
@@ -290,18 +290,18 @@ impl<'vir> WandEncOutput<'vir> {
         call_ctx: GArgs<'vir>,
         side: CallSide,
     ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
-        let callee_ty = g.ty(self.fn_sig(vcx, None));
-        // The predicate of a value of a type parameter's type is abstract, so
-        // it cannot be folded, merged or split.
-        if matches!(callee_ty.kind(), ty::TyKind::Param(_)) {
-            return Ok(Vec::new());
-        }
         let Some((nodes, lifetime)) = self.node(vcx, deps, g) else {
             return Ok(Vec::new());
         };
         if !matches!(lifetime, GeneralizedLifetime::RegionsIn(_)) {
             return Ok(Vec::new());
         }
+        let callee_ty = g.ty(self.fn_sig(vcx, None));
+        let target = if matches!(callee_ty.kind(), ty::TyKind::Param(_)) {
+            MergeTarget::Param
+        } else {
+            MergeTarget::Own
+        };
         let callee_decomp = RustTyDecomposition::from_ty(callee_ty, self.g_params(vcx, None));
         let graph = deps.require_dep::<LifetimePositionEnc>(callee_decomp)?;
         let caller_ty = g.ty(self.fn_sig(vcx, Some(call_ctx)));
@@ -325,6 +325,15 @@ impl<'vir> WandEncOutput<'vir> {
             caller_graph.positions().count(),
             "the callee's positions do not cover the caller's"
         );
+        // The merge/split methods are shared by the instantiations with the
+        // same canonical form and take its type parameters.
+        let (_, params) = caller_decomp
+            .canonical_with_params()
+            .expect("the merge/split encoder rejects const parameters");
+        let params = vcx
+            .tcx()
+            .mk_args_from_iter(params.into_iter().map(ty::GenericArg::from));
+        let args = deps.require_dep::<GArgsTyEnc>(GArgs::new(call_ctx.context(), params))?;
         // The snapshot is substituted for a placeholder together with the
         // generic arguments, so that the substitution does not apply to the
         // caller's own type parameters in it.
@@ -336,46 +345,29 @@ impl<'vir> WandEncOutput<'vir> {
         let mut stmts = Vec::new();
         for p in nodes.positions_of(lifetime) {
             let (first, end) = blocks[p];
-            match (end - first, side) {
-                (0, CallSide::Before) => {
-                    let pred = vcx.mk_predicate_app_expr(nodes.predicate(p, placeholder));
-                    let pred = vcx.with_local_subst(subst, || {
-                        pred.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
-                    });
-                    let vir::ExprKindGenData::PredicateApp(app) = pred.kind else {
-                        unreachable!("a substituted predicate application is one");
-                    };
-                    stmts.push(vcx.mk_fold_stmt(app));
-                }
-                (0, CallSide::After) | (1, _) => {}
-                _ => {
-                    let block = (
-                        caller_decomp,
-                        LifetimePosition::new(first),
-                        LifetimePosition::new(end),
-                    );
-                    let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
-                    // The methods are shared by the instantiations with the
-                    // same canonical form and take its type parameters.
-                    let (_, params) = caller_decomp
-                        .canonical_with_params()
-                        .expect("the merge/split encoder rejects const parameters");
-                    let params = vcx
-                        .tcx()
-                        .mk_args_from_iter(params.into_iter().map(ty::GenericArg::from));
-                    let args =
-                        deps.require_dep::<GArgsTyEnc>(GArgs::new(call_ctx.context(), params))?;
+            let block = (
+                caller_decomp,
+                LifetimePosition::new(first),
+                LifetimePosition::new(end),
+                target,
+            );
+            let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
+            // A type parameter's only position is keyed by the value's
+            // snapshot, which the methods cast to the generic one themselves.
+            let key = match target {
+                MergeTarget::Param => snap,
+                MergeTarget::Own => {
                     let key = nodes.key(p, placeholder);
-                    let key = vcx.with_local_subst(subst, || {
+                    vcx.with_local_subst(subst, || {
                         key.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
-                    });
-                    let method = match side {
-                        CallSide::Before => merge_split.merge,
-                        CallSide::After => merge_split.split,
-                    };
-                    stmts.push(method(key, args.get_ty(), args.get_const()).alloc());
+                    })
                 }
-            }
+            };
+            let method = match side {
+                CallSide::Before => merge_split.merge,
+                CallSide::After => merge_split.split,
+            };
+            stmts.push(method(key, args.get_ty(), args.get_const()).alloc());
         }
         Ok(stmts)
     }

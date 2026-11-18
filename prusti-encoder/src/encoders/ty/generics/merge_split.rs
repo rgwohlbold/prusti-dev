@@ -2,25 +2,43 @@ use prusti_rustc_interface::index::Idx;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, MethodIdn};
 
-use crate::encoders::ty::{
-    RustTyDecomposition,
-    indirect_pred::{IndirectPredEnc, LifetimePositionBlock},
-    pure::TyPureEnc,
+use crate::encoders::{
+    Pure,
+    ty::{
+        RustTyDecomposition,
+        indirect_pred::{IndirectPredEnc, LifetimePositionBlock},
+        lifted::ty_constructor::TyConstructorEnc,
+        pure::TyPureEnc,
+    },
 };
 
 use super::{
     GArgsTyEnc, GenericParamsEnc,
+    casters::CastersEnc,
     lifetime_position::{LifetimePosition, LifetimePositionEnc},
 };
 
 /// Trusted methods that merge the indirect predicates of the lifetime
 /// positions `[first, end)` of an instantiated type into one predicate over
-/// their intervals, and split it again. A generic call site merges the
-/// positions a type parameter of the callee covers before casting the result
-/// to the parameter's predicate, and splits them after the call. Both state
-/// that extending through the merged predicate reads what extending through
-/// each position's predicate on its key reads, grafted together.
+/// their intervals, and split it again. A call to a generic function merges
+/// each block of positions that a position of the callee covers into the
+/// callee's predicate before the call, and splits it after the call. A block
+/// may be empty, when the callee's position is the lifetimes in a type
+/// parameter instantiated with a type without lifetimes: its predicate holds
+/// nothing. Both methods state that extending through the merged predicate
+/// reads what extending through each position's predicate on its key reads,
+/// grafted together.
 pub struct MergeSplitEnc;
+
+/// The predicate a block is merged into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MergeTarget {
+    /// The instantiated type's own predicate.
+    Own,
+    /// The predicate of a type parameter instantiated with the type, on the
+    /// generic snapshot. The block is all positions of the type.
+    Param,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct MergeSplit<'vir> {
@@ -45,44 +63,69 @@ impl TaskEncoder for MergeSplitEnc {
         RustTyDecomposition<'vir>,
         LifetimePosition,
         LifetimePosition,
+        MergeTarget,
     );
     type OutputRef<'vir> = MergeSplit<'vir>;
     type OutputFullLocal<'vir> = [vir::Method<'vir>; 2];
     type EncodingError = ConstParamInBlock;
 
     // Instantiations that differ only in their context or lifetimes share the
-    // methods.
-    fn task_to_key<'vir>((ty, first, end): &Self::TaskDescription<'vir>) -> Self::TaskKey<'vir> {
-        (ty.canonical().unwrap_or(*ty), *first, *end)
+    // methods. A type parameter's own predicate is already the parameter's.
+    fn task_to_key<'vir>(
+        (ty, first, end, target): &Self::TaskDescription<'vir>,
+    ) -> Self::TaskKey<'vir> {
+        let target = if ty.ty.specifics.is_param() {
+            MergeTarget::Own
+        } else {
+            *target
+        };
+        (ty.canonical().unwrap_or(*ty), *first, *end, target)
     }
 
     fn do_encode_full<'vir>(
         task_key: &Self::TaskKey<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> EncodeFullResult<'vir, Self> {
-        let (ty, first, end) = *task_key;
+        let (ty, first, end, target) = *task_key;
         if ty.canonical().is_none() {
             return Err(EncodeFullError::EncodingError(ConstParamInBlock, None));
         }
         let graph = deps.require_dep::<LifetimePositionEnc>(ty)?;
+        let count = graph.positions().count();
+        assert!(first <= end && end.index() <= count, "block out of range");
         assert!(
-            first < end && end.index() <= graph.positions().count(),
-            "block out of range"
+            target == MergeTarget::Own || (first.index() == 0 && end.index() == count),
+            "a type parameter's predicate covers all positions of its instantiation"
         );
         let snapshot = deps.require_ref::<TyPureEnc>(ty.ty)?.snapshot;
         let ind = deps.require_ref::<IndirectPredEnc>(ty.ty)?;
         let params = deps.require_dep::<GenericParamsEnc>(ty.args.context())?;
         let args = deps.require_dep::<GArgsTyEnc>(ty.args)?;
+        let param_target = match target {
+            MergeTarget::Own => None,
+            MergeTarget::Param => {
+                let param = RustTyDecomposition::param();
+                Some((
+                    deps.require_ref::<IndirectPredEnc>(param)?,
+                    deps.require_ref::<CastersEnc<Pure>>((param, ty.ty))?,
+                    deps.require_ref::<TyConstructorEnc>(ty.ty)?,
+                ))
+            }
+        };
         vir::with_vcx(|vcx| {
             let name = ty.instantiated_name();
             let (f, e) = (first.index(), end.index());
+            let kind = match target {
+                MergeTarget::Own => "ind",
+                MergeTarget::Param => "param_ind",
+            };
             let arg_tys = (snapshot, params.ty_args(), params.const_args());
             let merge = MethodIdn::new(
-                vir::vir_format_identifier!(vcx, "merge_ind_{name}_{f}_{e}"),
+                vir::vir_format_identifier!(vcx, "merge_{kind}_{name}_{f}_{e}"),
                 arg_tys,
             );
             let split = MethodIdn::new(
-                vir::vir_format_identifier!(vcx, "split_ind_{name}_{f}_{e}"),
+                vir::vir_format_identifier!(vcx, "split_{kind}_{name}_{f}_{e}"),
                 arg_tys,
             );
             deps.emit_output_ref(*task_key, MergeSplit { merge, split })?;
@@ -133,11 +176,51 @@ impl TaskEncoder for MergeSplitEnc {
                     block.predicate(block.key(p), lo, hi)
                 })
                 .collect::<Vec<_>>();
-            let (lo, _) = graph.interval(first);
-            let (_, hi) = graph.interval(LifetimePosition::new(end.index() - 1));
-            let merged = block.predicate(block.k, lo, hi);
-            let extended = ind.extend.call()(block.k, block.tys, block.consts, lo, hi);
+            // An empty block's interval is empty, at its place among the
+            // positions.
+            let (lo, hi) = if first < end {
+                let (lo, _) = graph.interval(first);
+                let (_, hi) = graph.interval(LifetimePosition::new(end.index() - 1));
+                (lo, hi)
+            } else {
+                let at = if first.index() < count {
+                    graph.interval(first).0
+                } else if let Some(last) = count.checked_sub(1) {
+                    graph.interval(LifetimePosition::new(last)).1
+                } else {
+                    vcx.mk_uint::<0>()
+                };
+                (at, at)
+            };
             let grafted = block.fold(&positions);
+            let (merged, extended, grafted) = match param_target {
+                None => (
+                    block.predicate(block.k, lo, hi),
+                    ind.extend.call()(block.k, block.tys, block.consts, lo, hi),
+                    grafted,
+                ),
+                Some((param_ind, casters, ty_constructor)) => {
+                    let generic = |e: vir::ExprSnap<'vir>| -> vir::ExprSnap<'vir> {
+                        casters.make_generic.call()(e.downcast_ty(), block.tys, block.consts)
+                            .upcast_ty()
+                    };
+                    let param_ty = (ty_constructor.ty_constructor)(block.tys, block.consts);
+                    let no_consts: &[vir::ExprCSnap<'vir>] = &[];
+                    let generic_k = generic(block.k);
+                    let merged = vir::expr! { vcx;
+                        acc([param_ind.predicate](
+                            generic_k,
+                            [..[&[param_ty]]],
+                            [..[no_consts]],
+                            lo,
+                            hi
+                        ))
+                    };
+                    let extended =
+                        param_ind.extend.call()(generic_k, &[param_ty], no_consts, lo, hi);
+                    (merged, extended, generic(grafted))
+                }
+            };
             let decls = (k_decl, params.ty_decls(), params.const_decls());
             let merge_post =
                 conjunction(&[merged, vcx.mk_eq_expr(extended, vcx.mk_old_expr(grafted))]);
@@ -198,7 +281,7 @@ mod verification_tests {
     use prusti_rustc_interface::{index::Idx, span::DUMMY_SP};
     use task_encoder::TaskEncoder;
 
-    use super::{LifetimePosition, MergeSplitEnc};
+    use super::{LifetimePosition, MergeSplitEnc, MergeTarget};
     use crate::encoders::ty::{
         RustTyDecomposition, generics::IndirectCastersEnc, indirect_pred::IndirectPredEnc,
         test_util::verify,
@@ -207,16 +290,19 @@ mod verification_tests {
     /// Asserts that the methods in `viper` verify together with the indirect
     /// predicate of the type alias `X` defined in `src`, its casts, and
     /// `merge`/`split` of `X` for each of `blocks`, given by its first and end
-    /// position; and that each of them does not with `assert false` at the end
-    /// of its body, the probe that its state is consistent.
-    fn assert_merge_split(src: &str, blocks: &[(usize, usize)], viper: &str) {
+    /// position and its target; and that each of them does not with
+    /// `assert false` at the end of its body, the probe that its state is
+    /// consistent.
+    fn assert_merge_split(src: &str, blocks: &[(usize, usize, MergeTarget)], viper: &str) {
         let verify_with_merge = |viper: &str| {
             verify(
                 src,
                 |ty| {
                     IndirectPredEnc::encode(ty.ty, true, DUMMY_SP).unwrap();
-                    for &(first, end) in blocks {
-                        let block = (ty, LifetimePosition::new(first), LifetimePosition::new(end));
+                    for &(first, end, target) in blocks {
+                        let (first, end) =
+                            (LifetimePosition::new(first), LifetimePosition::new(end));
+                        let block = (ty, first, end, target);
                         MergeSplitEnc::encode(block, true, DUMMY_SP).unwrap();
                     }
                     let casts = (RustTyDecomposition::param(), ty.ty);
@@ -255,7 +341,7 @@ mod verification_tests {
     fn reference_as_param() {
         assert_merge_split(
             "type X<'a> = &'a mut i32;",
-            &[(0, 1)],
+            &[(0, 1, MergeTarget::Own), (0, 1, MergeTarget::Param)],
             r#"
             define I32 s_Int_i32_type()
             define RI s_Ref_mutable_type(I32)
@@ -278,6 +364,22 @@ mod verification_tests {
               make_concrete_ind_Ref_mutable(k, I32, 0, 1)
               split_ind_Ref_mutable$lt$Int_i32$gt$_0_1(k)
             }
+
+            method merge_param(k: s_Ref_mutable)
+              requires p_Ref_mutable_ind(k, I32, 0, 1)
+              ensures p_Param_ind(G(k), RI, 0, 1)
+              ensures extend_Param(G(k), RI, 0, 1) == old(G(extend_Ref_mutable(k, I32, 0, 1)))
+            {
+              merge_param_ind_Ref_mutable$lt$Int_i32$gt$_0_1(k)
+            }
+
+            method split_param(k: s_Ref_mutable)
+              requires p_Param_ind(G(k), RI, 0, 1)
+              ensures p_Ref_mutable_ind(k, I32, 0, 1)
+              ensures G(extend_Ref_mutable(k, I32, 0, 1)) == old(extend_Param(G(k), RI, 0, 1))
+            {
+              split_param_ind_Ref_mutable$lt$Int_i32$gt$_0_1(k)
+            }
             "#,
         );
     }
@@ -288,7 +390,7 @@ mod verification_tests {
         assert_merge_split(
             "struct N<'b, 'a>(&'a mut &'b mut i32);
              type X<'b, 'a> = N<'b, 'a>;",
-            &[(0, 2)],
+            &[(0, 2, MergeTarget::Own), (0, 2, MergeTarget::Param)],
             r#"
             define NT s_N_type()
             define G(k) make_generic_s_N(k)
@@ -312,6 +414,22 @@ mod verification_tests {
               make_concrete_ind_N(k, 0, 2)
               split_ind_N_0_2(k)
             }
+
+            method merge_param(k: s_N)
+              requires p_N_ind(k, 1, 2) && p_N_ind(KB(k), 0, 1)
+              ensures p_Param_ind(G(k), NT, 0, 2)
+              ensures extend_Param(G(k), NT, 0, 2) == old(G(extend_N(KB(k), 0, 1)))
+            {
+              merge_param_ind_N_0_2(k)
+            }
+
+            method split_param(k: s_N)
+              requires p_Param_ind(G(k), NT, 0, 2)
+              ensures p_N_ind(k, 1, 2) && p_N_ind(KB(k), 0, 1)
+              ensures G(extend_N(KB(k), 0, 1)) == old(extend_Param(G(k), NT, 0, 2))
+            {
+              split_param_ind_N_0_2(k)
+            }
             "#,
         );
     }
@@ -322,7 +440,7 @@ mod verification_tests {
         assert_merge_split(
             "struct A<'a, 'b>(&'a mut i32, &'b mut i32);
              type X<'a, 'b> = A<'a, 'b>;",
-            &[(0, 2)],
+            &[(0, 2, MergeTarget::Own), (0, 2, MergeTarget::Param)],
             r#"
             define AT s_A_type()
             define G(k) make_generic_s_A(k)
@@ -346,6 +464,24 @@ mod verification_tests {
               make_concrete_ind_A(k, 0, 2)
               split_ind_A_0_2(k)
             }
+
+            method merge_param(k: s_A)
+              requires p_A_ind(k, 0, 1) && p_A_ind(k, 1, 2)
+              ensures p_Param_ind(G(k), AT, 0, 2)
+              ensures extend_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_0 == old(extend_A(k, 0, 1).s_A_0)
+              ensures extend_Param(G(k), AT, 0, 2).make_concrete_s_A.s_A_1 == old(extend_A(k, 1, 2).s_A_1)
+            {
+              merge_param_ind_A_0_2(k)
+            }
+
+            method split_param(k: s_A)
+              requires p_Param_ind(G(k), AT, 0, 2)
+              ensures p_A_ind(k, 0, 1) && p_A_ind(k, 1, 2)
+              ensures extend_A(k, 0, 1).s_A_0 == old(extend_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_0
+              ensures extend_A(k, 1, 2).s_A_1 == old(extend_Param(G(k), AT, 0, 2)).make_concrete_s_A.s_A_1
+            {
+              split_param_ind_A_0_2(k)
+            }
             "#,
         );
     }
@@ -355,7 +491,7 @@ mod verification_tests {
     fn generic_reference_as_param() {
         assert_merge_split(
             "type X<'a, T> = &'a mut T;",
-            &[(0, 2)],
+            &[(0, 2, MergeTarget::Own), (0, 2, MergeTarget::Param)],
             r#"
             define RT(T) s_Ref_mutable_type(T)
             define G(k, T) make_generic_s_Ref_mutable(k, T)
@@ -384,6 +520,26 @@ mod verification_tests {
               make_concrete_ind_Ref_mutable(k, T, 0, 1 + arity(T))
               split_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
             }
+
+            method merge_param(k: s_Ref_mutable, T: Type)
+              requires p_Ref_mutable_ind(k, T, 0, 1)
+              requires p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
+              ensures p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
+              ensures extend_Param(G(k, T), RT(T), 0, 1 + arity(T)) ==
+                old(G(extend_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T))
+            {
+              merge_param_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
+            }
+
+            method split_param(k: s_Ref_mutable, T: Type)
+              requires p_Param_ind(G(k, T), RT(T), 0, 1 + arity(T))
+              ensures p_Ref_mutable_ind(k, T, 0, 1)
+              ensures p_Ref_mutable_ind(KT(k, T), T, 1, 1 + arity(T))
+              ensures G(extend_Ref_mutable(KT(k, T), T, 1, 1 + arity(T)), T) ==
+                old(extend_Param(G(k, T), RT(T), 0, 1 + arity(T)))
+            {
+              split_param_ind_Ref_mutable$lt$P0$gt$_0_2(k, T)
+            }
             "#,
         );
     }
@@ -393,7 +549,7 @@ mod verification_tests {
     fn generic_nested_reference_as_reference_to_param() {
         assert_merge_split(
             "type X<'a, 'b, T> = &'a mut &'b mut T;",
-            &[(1, 3)],
+            &[(1, 3, MergeTarget::Own)],
             r#"
             define RT(T) s_Ref_mutable_type(T)
             // The keys of the predicates of 'b and of the positions of `T`.
@@ -432,7 +588,7 @@ mod verification_tests {
     fn block_after_type_param() {
         assert_merge_split(
             "type X<'a, 'b, T> = (T, &'a mut &'b mut i32);",
-            &[(1, 3)],
+            &[(1, 3, MergeTarget::Own)],
             r#"
             define RRI s_Ref_mutable_type(s_Ref_mutable_type(s_Int_i32_type()))
             // The key of the predicate of 'b: `k` with what 'a reads grafted in.
@@ -471,7 +627,7 @@ mod verification_tests {
                  next: Option<Box<List<'a, 'b>>>,
              }
              type X<'a, 'b> = Option<&'a mut Box<List<'a, 'b>>>;",
-            &[(0, 3)],
+            &[(0, 3, MergeTarget::Own)],
             r#"
             define RBL s_Ref_mutable_type(s_Box_type(s_List_type(), s_Global_type()))
             // The key of the predicates of `List`'s positions: `k` with what the
@@ -496,6 +652,58 @@ mod verification_tests {
               ensures LIST(k) == old(extend_Option(k, RBL, 0, 3))
             {
               split_ind_Option$lt$Ref_mutable$lt$Box$lt$List$com$$sp$Global$gt$$gt$$gt$_0_3(k)
+            }
+            "#,
+        );
+    }
+    /// `&'a mut i32` as `&'a mut U` with `U = i32`: the block of `U` is empty,
+    /// after `'a`; its predicate is created from nothing and dropped again.
+    #[test]
+    fn empty_block() {
+        assert_merge_split(
+            "type X<'a> = &'a mut i32;",
+            &[(1, 1, MergeTarget::Own)],
+            r#"
+            define I32 s_Int_i32_type()
+
+            method merge(k: s_Ref_mutable)
+              ensures p_Ref_mutable_ind(k, I32, 1, 1 + arity(I32))
+              ensures extend_Ref_mutable(k, I32, 1, 1 + arity(I32)) == k
+            {
+              merge_ind_Ref_mutable$lt$Int_i32$gt$_1_1(k)
+            }
+
+            method split(k: s_Ref_mutable)
+              requires p_Ref_mutable_ind(k, I32, 1, 1 + arity(I32))
+            {
+              split_ind_Ref_mutable$lt$Int_i32$gt$_1_1(k)
+            }
+            "#,
+        );
+    }
+
+    /// `i32` as a type parameter: it has no positions, so the parameter's
+    /// predicate is empty, created from nothing and dropped again.
+    #[test]
+    fn empty_block_as_param() {
+        assert_merge_split(
+            "type X = i32;",
+            &[(0, 0, MergeTarget::Param)],
+            r#"
+            define I32 s_Int_i32_type()
+            define G(k) make_generic_s_Int_i32(k)
+
+            method merge(k: s_Int_i32)
+              ensures p_Param_ind(G(k), I32, 0, arity(I32))
+              ensures extend_Param(G(k), I32, 0, arity(I32)) == G(k)
+            {
+              merge_param_ind_Int_i32_0_0(k)
+            }
+
+            method split(k: s_Int_i32)
+              requires p_Param_ind(G(k), I32, 0, arity(I32))
+            {
+              split_param_ind_Int_i32_0_0(k)
             }
             "#,
         );
