@@ -80,6 +80,13 @@ impl<'tcx> RustTyDecomposition<'tcx> {
     /// their context or lifetimes become equal. `None` if `args` contain a
     /// const parameter, whose type the new context would have to give.
     pub fn canonical(self) -> Option<Self> {
+        self.canonical_with_params().map(|(canonical, _)| canonical)
+    }
+
+    /// `canonical`, together with the type parameters of `args` that `P0`,
+    /// `P1`, .. replace: the arguments that instantiate the canonical
+    /// decomposition's context to this one.
+    pub fn canonical_with_params(self) -> Option<(Self, Vec<ty::Ty<'tcx>>)> {
         vir::with_vcx(|vcx| {
             let tcx = vcx.tcx();
             let new_param = |index: usize| {
@@ -117,10 +124,8 @@ impl<'tcx> RustTyDecomposition<'tcx> {
             }
             let context = tcx
                 .mk_args_from_iter((0..params.len()).map(|i| ty::GenericArg::from(new_param(i))));
-            Some(Self::new(
-                self.ty,
-                GArgs::new(GParams::empty_env(context), args),
-            ))
+            let canonical = Self::new(self.ty, GArgs::new(GParams::empty_env(context), args));
+            Some((canonical, params))
         })
     }
 

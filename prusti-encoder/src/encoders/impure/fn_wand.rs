@@ -4,7 +4,11 @@ use crate::encoders::{
     ty::{
         RustTyDecomposition,
         generics::{
-            GArgs, GArgsTyEnc, GParams, GenericParamsEnc, lifetime_position::LifetimePositionEnc,
+            GArgs, GArgsTyEnc, GParams, GenericParamsEnc,
+            lifetime_position::{
+                GeneralizedLifetime as TyLifetime, LifetimePosition, LifetimePositionEnc,
+            },
+            merge_split::MergeSplitEnc,
         },
         indirect_nodes::NodePredicates,
     },
@@ -18,12 +22,12 @@ use pcg::borrow_pcg::{
 use prusti_interface::PrustiError;
 use prusti_rustc_interface::{
     data_structures::fx::{FxHashMap, FxHashSet},
-    index::IndexVec,
+    index::{Idx, IndexVec},
     middle::{mir, ty},
     span::def_id::DefId,
 };
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::{CastType, HasType};
+use vir::{CastType, HasType, Reify};
 
 /// Encodes the magic wands given a function signature.
 pub struct WandEnc;
@@ -131,6 +135,14 @@ pub struct WandEncOutput<'vir> {
 /// generics are replaced by concrete types from the caller's perspective.
 pub type WandCallContext<'vir> = Option<GArgs<'vir>>;
 
+/// Whether a call's predicates are turned into the callee's before the call,
+/// or back into the caller's after it.
+#[derive(Clone, Copy)]
+enum CallSide {
+    Before,
+    After,
+}
+
 impl<'vir> WandEncOutput<'vir> {
     pub(crate) fn fn_sig(
         &self,
@@ -195,7 +207,6 @@ impl<'vir> WandEncOutput<'vir> {
         mut snap: impl FnMut(mir::Local) -> vir::ExprSnap<'vir>,
         state: Option<vir::OldLabel<'vir>>,
     ) -> Option<vir::ExprBool<'vir>> {
-        use vir::Reify;
         let g = g.into();
         let (nodes, lifetime) = self.node(vcx, deps, g)?;
         let in_state = |key| vcx.maybe_apply_label(key, state);
@@ -207,66 +218,167 @@ impl<'vir> WandEncOutput<'vir> {
         }))
     }
 
-    /// The folds that give a call with generic arguments `call_ctx` the
-    /// predicates its precondition requires for the lifetimes in a type
-    /// parameter that the call instantiates with a type without positions. The
-    /// caller's argument has no position there and so no predicate, but the
-    /// predicate of an empty interval holds nothing. `arguments` are the
-    /// snapshots of the call's arguments, in order.
-    pub fn empty_input_folds<E: TaskEncoder>(
+    /// The statements that give a call with generic arguments `call_ctx` the
+    /// predicates its precondition requires of the arguments, whose snapshots
+    /// `arguments` are in order, where they differ from the caller's.
+    pub fn before_call<E: TaskEncoder>(
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
         arguments: &[vir::ExprSnap<'vir>],
         call_ctx: GArgs<'vir>,
-    ) -> Vec<vir::Stmt<'vir>> {
-        let generics = self.generics_subst(Some(call_ctx), vcx, deps);
-        let mut folds = Vec::new();
+    ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
+        let mut stmts = Vec::new();
         for g in self.inputs() {
-            // The predicate of an argument of a type parameter's type is
-            // abstract, so it cannot be folded.
-            let arg_ty = FunctionShapeNode::from(g).ty(self.fn_sig(vcx, None));
-            if matches!(arg_ty.kind(), ty::TyKind::Param(_)) {
-                continue;
-            }
-            let Some((nodes, lifetime)) = self.node(vcx, deps, g.into()) else {
-                continue;
-            };
-            let GeneralizedLifetime::RegionsIn(regions_in) = lifetime else {
-                continue;
-            };
-            let ty::TyKind::Param(param) = regions_in.ty(vcx.tcx()).kind() else {
-                continue;
-            };
-            let arg_ty = call_ctx.args()[param.index as usize].expect_ty();
-            let arg_decomp = RustTyDecomposition::from_ty(arg_ty, call_ctx.context());
-            let graph = deps.require_dep::<LifetimePositionEnc>(arg_decomp).unwrap();
-            if graph.positions().next().is_some() {
-                continue;
-            }
             // The callee's argument locals start after the return place.
             let arg = arguments[g.mir_local().as_usize() - 1];
-            // The argument's snapshot is substituted for a placeholder
-            // together with the generic arguments, so that the substitution
-            // does not apply to the caller's own type parameters in it.
-            let placeholder = vcx.mk_local_decl("call_arg", arg.ty());
-            let mut subst = generics.clone();
-            subst.insert(placeholder.name, arg.as_dyn());
-            let subst = vcx.alloc(subst);
-            for p in nodes.positions_of(lifetime) {
-                let pred =
-                    vcx.mk_predicate_app_expr(nodes.predicate(p, vcx.mk_local_ex(placeholder)));
-                let pred = vcx.with_local_subst(subst, || {
-                    use vir::Reify;
-                    pred.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
-                });
-                let vir::ExprKindGenData::PredicateApp(app) = pred.kind else {
-                    unreachable!("a substituted predicate application is one");
-                };
-                folds.push(vcx.mk_fold_stmt(app));
+            stmts.extend(self.call_adjustments(
+                vcx,
+                deps,
+                g.into(),
+                arg,
+                call_ctx,
+                CallSide::Before,
+            )?);
+        }
+        Ok(stmts)
+    }
+
+    /// The statements that turn the predicates a call's postcondition gives
+    /// back into the caller's: those of the inputs not blocked by the result,
+    /// on the arguments' snapshots before the call `arguments`, and those of
+    /// the result, with snapshot `result`. The predicates of nested lifetimes
+    /// in the arguments that the postcondition gives back are not handled yet.
+    pub fn after_call<E: TaskEncoder>(
+        &self,
+        vcx: &'vir vir::VirCtxt<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
+        arguments: &[vir::ExprSnap<'vir>],
+        result: vir::ExprSnap<'vir>,
+        call_ctx: GArgs<'vir>,
+    ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
+        let blocked = self.blocked_inputs();
+        let inputs = self
+            .inputs()
+            .filter(|g| !blocked.contains(g))
+            .map(|g| (g.into(), arguments[g.mir_local().as_usize() - 1]));
+        let outputs = self
+            .outputs()
+            .map(FunctionShapeNode::from)
+            .filter(|g| g.mir_local() == mir::RETURN_PLACE)
+            .map(|g| (g, result));
+        let mut stmts = Vec::new();
+        for (g, snap) in inputs.chain(outputs).collect::<Vec<_>>() {
+            stmts.extend(self.call_adjustments(vcx, deps, g, snap, call_ctx, CallSide::After)?);
+        }
+        Ok(stmts)
+    }
+
+    /// The statements that turn the caller's predicates of the node `g` on a
+    /// value with snapshot `snap` into the callee's before a call with generic
+    /// arguments `call_ctx`, or the callee's back into the caller's after it.
+    /// A callee position of the lifetimes in a type parameter covers the block
+    /// of the caller's positions that the parameter's instantiation occupies:
+    /// an empty block's predicate holds nothing and is folded before the call,
+    /// and a block of several positions is merged before the call and split
+    /// after it.
+    fn call_adjustments<E: TaskEncoder>(
+        &self,
+        vcx: &'vir vir::VirCtxt<'vir>,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
+        g: FunctionShapeNode<Generalized>,
+        snap: vir::ExprSnap<'vir>,
+        call_ctx: GArgs<'vir>,
+        side: CallSide,
+    ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
+        let callee_ty = g.ty(self.fn_sig(vcx, None));
+        // The predicate of a value of a type parameter's type is abstract, so
+        // it cannot be folded, merged or split.
+        if matches!(callee_ty.kind(), ty::TyKind::Param(_)) {
+            return Ok(Vec::new());
+        }
+        let Some((nodes, lifetime)) = self.node(vcx, deps, g) else {
+            return Ok(Vec::new());
+        };
+        if !matches!(lifetime, GeneralizedLifetime::RegionsIn(_)) {
+            return Ok(Vec::new());
+        }
+        let callee_decomp = RustTyDecomposition::from_ty(callee_ty, self.g_params(vcx, None));
+        let graph = deps.require_dep::<LifetimePositionEnc>(callee_decomp)?;
+        let caller_ty = g.ty(self.fn_sig(vcx, Some(call_ctx)));
+        let caller_decomp = RustTyDecomposition::from_ty(caller_ty, call_ctx.context());
+        let mut blocks: IndexVec<LifetimePosition, (usize, usize)> = IndexVec::new();
+        let mut end = 0;
+        for p in graph.positions() {
+            let width = match graph.lifetime_in(p, caller_ty, call_ctx.context()) {
+                TyLifetime::Region(_) => 1,
+                TyLifetime::RegionsIn(ty) => deps
+                    .require_dep::<LifetimePositionEnc>(ty)?
+                    .positions()
+                    .count(),
+            };
+            blocks.push((end, end + width));
+            end += width;
+        }
+        let caller_graph = deps.require_dep::<LifetimePositionEnc>(caller_decomp)?;
+        assert_eq!(
+            end,
+            caller_graph.positions().count(),
+            "the callee's positions do not cover the caller's"
+        );
+        // The snapshot is substituted for a placeholder together with the
+        // generic arguments, so that the substitution does not apply to the
+        // caller's own type parameters in it.
+        let placeholder = vcx.mk_local_decl("call_arg", snap.ty());
+        let mut subst = self.generics_subst(Some(call_ctx), vcx, deps).clone();
+        subst.insert(placeholder.name, snap.as_dyn());
+        let subst = vcx.alloc(subst);
+        let placeholder = vcx.mk_local_ex(placeholder);
+        let mut stmts = Vec::new();
+        for p in nodes.positions_of(lifetime) {
+            let (first, end) = blocks[p];
+            match (end - first, side) {
+                (0, CallSide::Before) => {
+                    let pred = vcx.mk_predicate_app_expr(nodes.predicate(p, placeholder));
+                    let pred = vcx.with_local_subst(subst, || {
+                        pred.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
+                    });
+                    let vir::ExprKindGenData::PredicateApp(app) = pred.kind else {
+                        unreachable!("a substituted predicate application is one");
+                    };
+                    stmts.push(vcx.mk_fold_stmt(app));
+                }
+                (0, CallSide::After) | (1, _) => {}
+                _ => {
+                    let block = (
+                        caller_decomp,
+                        LifetimePosition::new(first),
+                        LifetimePosition::new(end),
+                    );
+                    let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
+                    // The methods are shared by the instantiations with the
+                    // same canonical form and take its type parameters.
+                    let (_, params) = caller_decomp
+                        .canonical_with_params()
+                        .expect("the merge/split encoder rejects const parameters");
+                    let params = vcx
+                        .tcx()
+                        .mk_args_from_iter(params.into_iter().map(ty::GenericArg::from));
+                    let args =
+                        deps.require_dep::<GArgsTyEnc>(GArgs::new(call_ctx.context(), params))?;
+                    let key = nodes.key(p, placeholder);
+                    let key = vcx.with_local_subst(subst, || {
+                        key.lazy::<(), vir::ExprKind<'vir>>().reify(vcx, ())
+                    });
+                    let method = match side {
+                        CallSide::Before => merge_split.merge,
+                        CallSide::After => merge_split.split,
+                    };
+                    stmts.push(method(key, args.get_ty(), args.get_const()).alloc());
+                }
             }
         }
-        folds
+        Ok(stmts)
     }
 
     pub fn indirect_pres<'a, E: TaskEncoder>(
