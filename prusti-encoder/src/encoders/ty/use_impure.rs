@@ -15,7 +15,10 @@ use crate::encoders::{
 use super::{
     TyUseEnc, UseTyDatas,
     data::*,
-    generics::{GArgCaster, GArgsTy, IndirectCastIdn, IndirectCasters, IndirectCastersEnc},
+    generics::{
+        GArgCaster, GArgsTy, IndirectCastIdn, IndirectCasters, IndirectCastersEnc,
+        lifetime_position::{LifetimePosition, LifetimePositionEnc},
+    },
     impure::{ImpureTyDatas, TyImpureEnc},
     indirect_nodes::NodePredicates,
     rust_ty::RustTySpecial,
@@ -81,52 +84,78 @@ pub struct TyUseImpureMutRef<'vir> {
     nodes: &'vir NodePredicates<'vir>,
     /// The casts of the referent's predicates, if the referent is a concrete
     /// type with positions.
-    referent: Option<ReferentCasts<'vir>>,
+    referent: Option<IndirectCasts<'vir>>,
 }
 
-/// The predicates of a concrete referent's positions and their casts from and
-/// to the generic type. Position `q` of the referent is position `1 + q` of
-/// the reference.
+/// The predicates of the positions of a concrete type at a place of generic
+/// type, a referent or a field, and their casts from and to the generic type.
+/// The positions are numbered as in the concrete type.
 #[derive(Debug, Clone, Copy)]
-pub struct ReferentCasts<'vir> {
+pub struct IndirectCasts<'vir> {
     nodes: &'vir NodePredicates<'vir>,
     casters: IndirectCasters<'vir>,
     ref_to_snap: vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
     args: GArgsTy<'vir>,
 }
 
-impl<'vir> ReferentCasts<'vir> {
-    /// Cast the predicates of the referent at `addr` to concrete, enclosing
-    /// positions first: the keys read the enclosing concrete predicates.
+impl<'vir> IndirectCasts<'vir> {
+    /// Cast the predicates of the value at `addr` to concrete.
     fn make_concrete(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.casts(addr, self.casters.make_concrete, false)
+        self.make_concrete_at(self.snap(addr), &self.nodes.positions())
     }
 
-    /// Cast the predicates of the referent at `addr` to generic, enclosed
-    /// positions first, while the enclosing ones are still concrete.
+    /// Cast the predicates of the value at `addr` to generic.
     fn make_generic(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.casts(addr, self.casters.make_generic, true)
+        self.make_generic_at(self.snap(addr), &self.nodes.positions())
     }
 
-    fn casts(
+    /// Cast the predicates at `positions`, given outermost first, of the value
+    /// with snapshot `snap` to concrete, enclosing positions first: the keys
+    /// read the enclosing concrete predicates.
+    pub fn make_concrete_at(
         &self,
-        addr: vir::ExprRef<'vir>,
-        cast: IndirectCastIdn<'vir>,
-        innermost_first: bool,
+        snap: vir::ExprSnap<'vir>,
+        positions: &[LifetimePosition],
     ) -> Vec<vir::Stmt<'vir>> {
-        let snap = self.ref_to_snap.call()(addr, self.args.get_ty(), self.args.get_const());
-        let mut positions = self.nodes.positions();
-        if innermost_first {
-            positions.reverse();
-        }
         positions
-            .into_iter()
-            .map(|q| {
-                let (lo, hi) = self.nodes.interval(q);
-                let key = self.nodes.key(q, snap);
-                cast(key, self.args.get_ty(), self.args.get_const(), lo, hi).alloc()
-            })
+            .iter()
+            .map(|&q| self.cast(self.casters.make_concrete, snap, q))
             .collect()
+    }
+
+    /// Cast the predicates at `positions`, given outermost first, of the value
+    /// with snapshot `snap` to generic, enclosed positions first, while the
+    /// enclosing ones are still concrete.
+    pub fn make_generic_at(
+        &self,
+        snap: vir::ExprSnap<'vir>,
+        positions: &[LifetimePosition],
+    ) -> Vec<vir::Stmt<'vir>> {
+        positions
+            .iter()
+            .rev()
+            .map(|&q| self.cast(self.casters.make_generic, snap, q))
+            .collect()
+    }
+
+    /// All positions of the concrete type, outermost first.
+    pub fn positions(&self) -> Vec<LifetimePosition> {
+        self.nodes.positions()
+    }
+
+    fn snap(&self, addr: vir::ExprRef<'vir>) -> vir::ExprSnap<'vir> {
+        self.ref_to_snap.call()(addr, self.args.get_ty(), self.args.get_const())
+    }
+
+    fn cast(
+        &self,
+        cast: IndirectCastIdn<'vir>,
+        snap: vir::ExprSnap<'vir>,
+        q: LifetimePosition,
+    ) -> vir::Stmt<'vir> {
+        let (lo, hi) = self.nodes.interval(q);
+        let key = self.nodes.key(q, snap);
+        cast(key, self.args.get_ty(), self.args.get_const(), lo, hi).alloc()
     }
 }
 
@@ -171,6 +200,9 @@ pub struct TyUseImpureField<'vir> {
     caster: FieldCaster<'vir>,
     args: GArgsTy<'vir>,
     impure: <ImpureTyDatas as TyDatas<'vir>>::FieldData,
+    /// The casts of the field's predicates, if the field's type is a type
+    /// parameter instantiated with a concrete type with positions.
+    pub indirect: Option<IndirectCasts<'vir>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,7 +305,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                     impure: *data.1,
                     ref_to_snap: ty.1.ref_to_snap,
                     nodes: self.alloc_nodes(self.decomp)?,
-                    referent: self.referent_casts(data.0.referent, ty.0.params)?,
+                    referent: self.indirect_casts(data.0.referent, ty.0.params)?,
                 })
             }
             TySpecifics::Raw(data) => {
@@ -336,22 +368,26 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
         Ok(vir::with_vcx(|vcx| vcx.alloc(nodes)))
     }
 
-    /// The casts of the referent's predicates, if it is a concrete type with
-    /// positions; a type parameter's predicate needs no cast.
-    fn referent_casts(
+    /// The casts of the predicates of a referent or field of type `inner`, if
+    /// it is a type parameter instantiated with a concrete type with positions;
+    /// a type parameter's predicate needs no cast.
+    fn indirect_casts(
         &mut self,
-        referent: LazyRustTy<'vir>,
+        inner: LazyRustTy<'vir>,
         params: GParams<'vir>,
-    ) -> EncResult<'vir, Option<ReferentCasts<'vir>>> {
-        let Some(normalized) = referent.decompose_compare_normalize(params, self.args) else {
+    ) -> EncResult<'vir, Option<IndirectCasts<'vir>>> {
+        let Some(normalized) = inner.decompose_compare_normalize(params, self.args) else {
             return Ok(None);
         };
-        let nodes = self.alloc_nodes(normalized.concrete)?;
-        if nodes.positions().is_empty() {
+        // Checked before encoding the predicates, which most fields lack.
+        let graph = self
+            .deps
+            .require_dep::<LifetimePositionEnc>(normalized.concrete)?;
+        if graph.positions().next().is_none() {
             return Ok(None);
         }
-        Ok(Some(ReferentCasts {
-            nodes,
+        Ok(Some(IndirectCasts {
+            nodes: self.alloc_nodes(normalized.concrete)?,
             casters: self
                 .deps
                 .require_ref::<IndirectCastersEnc>((normalized.param, normalized.concrete.ty))?,
@@ -416,6 +452,7 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
                     caster,
                     args: self.args_t,
                     impure: *field.1,
+                    indirect: self.indirect_casts(field.0.ty(), params)?,
                 })
             })
             .collect::<EncResult<'vir, Vec<_>>>()?;
@@ -829,7 +866,7 @@ impl<'vir> TyUseImpureStruct<'vir> {
     ) -> impl Iterator<Item = vir::Stmt<'vir>> {
         self.fields
             .iter()
-            .filter_map(|f| f.cast_to_caller_ctx(self_ref))
+            .flat_map(move |f| f.cast_to_caller_ctx(self_ref))
     }
 
     fn cast_to_callee_ctx(
@@ -838,7 +875,7 @@ impl<'vir> TyUseImpureStruct<'vir> {
     ) -> impl Iterator<Item = vir::Stmt<'vir>> {
         self.fields
             .iter()
-            .filter_map(|f| f.cast_to_callee_ctx(self_ref))
+            .flat_map(move |f| f.cast_to_callee_ctx(self_ref))
     }
 }
 
@@ -852,12 +889,24 @@ impl<'vir> TyUseImpureField<'vir> {
         self.impure.ref_to_field_ref.call()(self_ref, self.args.get_ty(), self.args.get_const())
     }
 
-    fn cast_to_caller_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Option<vir::Stmt<'vir>> {
-        self.caster.cast_to_caller_ctx(self.field_ref(self_ref))
+    /// Cast the field and then its predicates to concrete.
+    fn cast_to_caller_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
+        let addr = self.field_ref(self_ref);
+        let mut stmts = Vec::from_iter(self.caster.cast_to_caller_ctx(addr));
+        if let Some(indirect) = self.indirect {
+            stmts.extend(indirect.make_concrete(addr));
+        }
+        stmts
     }
 
-    fn cast_to_callee_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Option<vir::Stmt<'vir>> {
-        self.caster.cast_to_callee_ctx(self.field_ref(self_ref))
+    /// Cast the field's predicates and then the field to generic.
+    fn cast_to_callee_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
+        let addr = self.field_ref(self_ref);
+        let mut stmts = self
+            .indirect
+            .map_or_else(Vec::new, |indirect| indirect.make_generic(addr));
+        stmts.extend(self.caster.cast_to_callee_ctx(addr));
+        stmts
     }
 }
 

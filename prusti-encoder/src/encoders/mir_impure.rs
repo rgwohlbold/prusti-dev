@@ -30,6 +30,7 @@ use pcg::{
 };
 use prusti_interface::PrustiError;
 use prusti_rustc_interface::{
+    abi,
     data_structures::graph::Successors,
     index::{Idx, IndexVec},
     middle::{
@@ -336,11 +337,28 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             ) => {
                 let expr = self.encode_aggregate_snap(rvalue_ty, kind, fields, operand_snaps)?;
                 // The indirect predicates of the fields, which moved in with
-                // their snapshots, make up those of the new value.
+                // their snapshots, make up those of the new value. Those of a
+                // field of generic type are cast to it first.
                 let ty = self.ty_use_impure(rvalue_ty);
+                let variant = match kind {
+                    mir::AggregateKind::Adt(_, variant, ..) => *variant,
+                    _ => abi::FIRST_VARIANT,
+                };
+                let mut casts = Vec::new();
+                for (field, operand) in ty.get_variant_any(variant).fields.iter().zip(fields) {
+                    if let Some(indirect) = field.indirect {
+                        let snap = self.encode_operand_snap(operand, operand_snaps)?;
+                        casts.extend(indirect.make_generic_at(snap, &indirect.positions()));
+                    }
+                }
                 Ok(EncodedRvalue {
                     expr,
-                    post_assign_folds: Some(Box::new(move |lhs_place| ty.fold_indirect(lhs_place))),
+                    post_assign_folds: Some(Box::new(move |lhs_place| {
+                        casts
+                            .into_iter()
+                            .chain(ty.fold_indirect(lhs_place))
+                            .collect()
+                    })),
                 })
             }
 
@@ -664,6 +682,69 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
+    /// Cast the predicates of `lifetime` of the fields of generic type of a
+    /// value of type `ty` with snapshot `snap` to concrete. For an enum, only
+    /// the variant the value is in holds them.
+    fn fields_to_concrete(
+        &mut self,
+        ty: ty::Ty<'vir>,
+        snap: vir::ExprSnap<'vir>,
+        lifetime: GeneralizedLifetime<'vir>,
+    ) -> EncodeResult<'vir, (), E> {
+        let data = self.ty_use_impure(ty);
+        let pure = self.ty_use_pure(ty);
+        let snap = snap.downcast_ty();
+        let variants = match pure.get_enumlike() {
+            Some(enumlike) => enumlike
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(v, variant)| {
+                    let discr = enumlike.snap_to_discr_snap(snap);
+                    (
+                        Some(abi::VariantIdx::from_usize(v)),
+                        Some(self.vcx.mk_eq_expr(discr, variant.data.discr)),
+                    )
+                })
+                .collect(),
+            None => vec![(None, None)],
+        };
+        for (variant, is_variant) in variants {
+            let fields = data.expect_variant_opt(variant).fields.iter();
+            let pure_fields = pure.expect_variant_opt(variant).fields.iter();
+            let mut casts = Vec::new();
+            for (idx, (field, pure_field)) in fields.zip(pure_fields).enumerate() {
+                let Some(indirect) = field.indirect else {
+                    continue;
+                };
+                // The field's type is a type parameter, so its type in `ty`
+                // is the argument, which is normalized.
+                let field_ty = mir::PlaceTy::field_ty(
+                    self.vcx.tcx(),
+                    ty,
+                    variant,
+                    abi::FieldIdx::from_usize(idx),
+                )
+                .skip_normalization();
+                let nodes = NodePredicates::new(
+                    RustTyDecomposition::from_ty(field_ty, self.def_id),
+                    self.deps,
+                )?
+                .in_ty(field_ty);
+                let positions = nodes.positions_of(lifetime);
+                casts.extend(indirect.make_concrete_at(pure_field.read(snap), &positions));
+            }
+            match is_variant {
+                Some(is_variant) if !casts.is_empty() => {
+                    let casts = self.vcx.alloc_slice(&casts);
+                    self.stmt(self.vcx.mk_if_stmt(is_variant, casts, &[]));
+                }
+                _ => self.stmts(casts),
+            }
+        }
+        Ok(())
+    }
+
     fn pcs_handle_edge_conditionless(
         &mut self,
         borrows_state: &BorrowsState<'_, 'vir>,
@@ -784,6 +865,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .map(|p| self.vcx.mk_unfold_stmt(nodes.predicate(p, snap)))
                     .collect::<Vec<_>>();
                 self.stmts(unfolds);
+                self.fields_to_concrete(ty, snap, lifetime)?;
             }
             BorrowPcgEdgeKind::Deref(deref) => {
                 let frame = self.fold_or_unfold(

@@ -522,9 +522,13 @@ impl TaskEncoder for IndirectCastersEnc {
             };
             let generic_k = generic(k);
             let no_consts: &[vir::ExprCSnap<'vir>] = &[];
+            // A container holds the predicate of a field of generic type only for a non-empty
+            // interval. For an empty one the concrete predicate holds nothing, since every
+            // conjunct of its body is guarded by a non-empty interval.
             let generic_pred = vir::expr! { vcx;
                 acc([param_ind.predicate](generic_k, [..[&[ty]]], [..[no_consts]], lo, hi))
             };
+            let generic_pred = vir::expr! { vcx; ((lo) < (hi)) ==> (generic_pred) };
             let concrete_extend = generic(concrete_ind.extend.call()(k, tys, consts, lo, hi));
             let generic_extend = param_ind.extend.call()(generic_k, &[ty], no_consts, lo, hi);
             // Making a snapshot shallow does not depend on the heap, so it is the same on both
