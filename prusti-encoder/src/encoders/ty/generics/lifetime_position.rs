@@ -105,6 +105,14 @@ impl<'vir> EnclosureGraph<'vir> {
     pub fn ancestors(&self, p: LifetimePosition) -> &[LifetimePosition] {
         &self.ancestors[p]
     }
+
+    /// The positions of the generic argument `arg`, in the order of the
+    /// argument type's own positions.
+    pub fn arg_positions(&self, arg: usize) -> Vec<LifetimePosition> {
+        self.positions()
+            .filter(|&p| self.paths[p].first() == Some(&arg))
+            .collect()
+    }
 }
 
 /// The enclosure graph of a type has a cycle between distinct positions, e.g.

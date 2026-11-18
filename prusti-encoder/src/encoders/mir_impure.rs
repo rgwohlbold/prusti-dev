@@ -13,7 +13,9 @@ use pcg::{
             kind::BorrowPcgEdgeKind,
         },
         edge_data::EdgeData,
-        region_projection::{ExtractRegionsCtxt, PlaceOrConst},
+        region_projection::{
+            ExtractRegionsCtxt, LifetimeProjection, LifetimeProjectionLabel, PlaceOrConst,
+        },
         state::BorrowsState,
         unblock_graph::{BorrowPcgUnblockAction, UnblockGraph},
         validity_conditions::BranchChoices,
@@ -24,8 +26,8 @@ use pcg::{
     pcg::{CapabilityKind, EvalStmtPhase, Pcg, PcgNode, PcgSuccessor},
     results::{PcgBasicBlock, PcgLocation},
     utils::{
-        CompilerCtxt, HasPlace, Place, PrefixRelation, SnapshotLocation, display::DisplayWithCtxt,
-        maybe_old::MaybeLabelledPlace,
+        AnalysisLocation, CompilerCtxt, HasPlace, Place, PrefixRelation, SnapshotLocation,
+        display::DisplayWithCtxt, maybe_old::MaybeLabelledPlace,
     },
 };
 use prusti_interface::PrustiError;
@@ -51,7 +53,7 @@ use crate::encoders::{
     mir_shared::{EncodeResult, PureRvalueEnc, RustcIntrinsic},
     ty::{
         RustFieldAddress, RustTyDecomposition, RustTySpecial,
-        generics::GParams,
+        generics::{GParams, lifetime_position::LifetimePosition},
         indirect_nodes::NodePredicates,
         use_impure::TyUseImpure,
         use_pure::{TyUsePure, TyUsePureEnc},
@@ -183,6 +185,13 @@ where
     pub current_block_label: Option<vir::CfgBlockLabel<'vir>>,
     pub current_stmts: Option<Vec<vir::Stmt<'vir>>>,
     pub current_terminator: Option<vir::TerminatorStmt<'vir>>,
+    /// The PCG phase whose actions are being encoded.
+    pub current_phase: Option<(mir::Location, EvalStmtPhase)>,
+    /// The labels right before a place's predicate is unfolded, by the phase,
+    /// the loop prefixes of the block's copy and the place. A node labelled at
+    /// that phase reads its keys at this label: its value is still the one at
+    /// the phase's start, and the place's predicates are held.
+    pub unfold_labels: FxHashMap<(AnalysisLocation, Vec<usize>, Place<'vir>), &'vir str>,
 
     pub encoded_blocks: Vec<vir::CfgBlock<'vir>>, // TODO: use IndexVec ?
 }
@@ -580,6 +589,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             return Ok(None);
         }
 
+        if matches!(fold_or_unfold, FoldOrUnfold::Unfold) && label.is_none() {
+            self.label_before_unfold(place);
+        }
         let ref_p = self.encode_place(place)?;
 
         let place_ty = ref_p.ty;
@@ -682,17 +694,27 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    /// Cast the predicates of `lifetime` of the fields of generic type of a
-    /// value of type `ty` with snapshot `snap` to concrete. For an enum, only
+    /// Cast the predicates of the fields of generic type of a value of type
+    /// `ty` with snapshot `snap` held by the value's predicates `keys`
+    /// (position and key, outermost first) to concrete after they are unfolded
+    /// out of the value, or to generic before they are folded into it. A
+    /// field's predicate under the value's predicate with key `k` has the key
+    /// `k.field`, as in the body of the value's predicate. For an enum, only
     /// the variant the value is in holds them.
-    fn fields_to_concrete(
+    fn cast_generic_fields(
         &mut self,
         ty: ty::Ty<'vir>,
         snap: vir::ExprSnap<'vir>,
-        lifetime: GeneralizedLifetime<'vir>,
+        nodes: &NodePredicates<'vir>,
+        keys: &[(LifetimePosition, vir::ExprSnap<'vir>)],
+        fold_or_unfold: FoldOrUnfold,
     ) -> EncodeResult<'vir, (), E> {
         let data = self.ty_use_impure(ty);
         let pure = self.ty_use_pure(ty);
+        // TODO: cast the predicates of a generic referent.
+        if data.get_structlike().is_none() && data.get_enumlike().is_none() {
+            return Ok(());
+        }
         let snap = snap.downcast_ty();
         let variants = match pure.get_enumlike() {
             Some(enumlike) => enumlike
@@ -717,22 +739,36 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 let Some(indirect) = field.indirect else {
                     continue;
                 };
-                // The field's type is a type parameter, so its type in `ty`
-                // is the argument, which is normalized.
-                let field_ty = mir::PlaceTy::field_ty(
-                    self.vcx.tcx(),
-                    ty,
-                    variant,
-                    abi::FieldIdx::from_usize(idx),
-                )
-                .skip_normalization();
-                let nodes = NodePredicates::new(
-                    RustTyDecomposition::from_ty(field_ty, self.def_id),
-                    self.deps,
-                )?
-                .in_ty(field_ty);
-                let positions = nodes.positions_of(lifetime);
-                casts.extend(indirect.make_concrete_at(pure_field.read(snap), &positions));
+                // The field's type is a type parameter, whose positions in
+                // `ty` are those of its argument.
+                let ty::Adt(adt, _) = ty.kind() else {
+                    unreachable!("a struct or enum is an ADT")
+                };
+                let field_def = &adt.variant(variant.unwrap_or(abi::FIRST_VARIANT)).fields
+                    [abi::FieldIdx::from_usize(idx)];
+                let ty::Param(param) = self.vcx.tcx().type_of(field_def.did).skip_binder().kind()
+                else {
+                    unreachable!("a field with indirect predicates has a type parameter's type")
+                };
+                let arg_positions = nodes.arg_positions(param.index as usize);
+                let mut field_casts = keys
+                    .iter()
+                    .filter_map(|&(p, key)| {
+                        let q = arg_positions.iter().position(|&a| a == p)?;
+                        let field_key = pure_field.read(key.downcast_ty());
+                        Some(indirect.cast_at(
+                            field_key,
+                            LifetimePosition::new(q),
+                            matches!(fold_or_unfold, FoldOrUnfold::Fold),
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                // Enclosed positions are cast to generic first, while the
+                // enclosing ones are still concrete.
+                if matches!(fold_or_unfold, FoldOrUnfold::Fold) {
+                    field_casts.reverse();
+                }
+                casts.extend(field_casts);
             }
             match is_variant {
                 Some(is_variant) if !casts.is_empty() => {
@@ -740,6 +776,97 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     self.stmt(self.vcx.mk_if_stmt(is_variant, casts, &[]));
                 }
                 _ => self.stmts(casts),
+            }
+        }
+        Ok(())
+    }
+
+    /// Unfold the predicates of the node `base` out of its place when the
+    /// node is expanded, and fold them back when the expansion is removed.
+    /// Those of generic fields are cast to concrete after the unfold and to
+    /// generic before the fold. The keys of a labelled node are evaluated at
+    /// its label, where the enclosing predicates were held.
+    fn expand_lifetime_projection(
+        &mut self,
+        base: LifetimeProjection<'vir, MaybeLabelledPlace<'vir>>,
+        edge_action: EdgeAction,
+        label: Option<&'vir str>,
+    ) -> EncodeResult<'vir, (), E> {
+        let place = base.base();
+        if place.place().is_shared_ref(self.pcg_ctxt())
+            || place.place().projects_shared_ref(self.pcg_ctxt())
+        {
+            return Ok(());
+        }
+        // The keys of a labelled projection or of a projection of a labelled
+        // place are read at that label.
+        let label = match (base.label(), place) {
+            (Some(LifetimeProjectionLabel::Location(at)), _) => {
+                Some(self.key_label(at, place.place()))
+            }
+            (_, MaybeLabelledPlace::Labelled(snap)) => {
+                Some(self.key_label(snap.at(), snap.place()))
+            }
+            _ => label.map(vir::OldLabel::Label),
+        };
+        let place_ref = self.encode_place(place.place())?;
+        let ty = place_ref.ty.ty;
+        let data = self.ty_use_impure(ty);
+        let addr = self
+            .vcx
+            .maybe_apply_label(place_ref.expr.expect_predicate(), label);
+        let snap = self.vcx.maybe_apply_label(data.ref_to_snap(addr), label);
+        // A key reads the predicates of the positions before it, which an
+        // expansion of another lifetime may have unfolded, so the whole key is
+        // read at the label.
+        let key = |nodes: &NodePredicates<'vir>, p| {
+            self.vcx
+                .maybe_apply_label(nodes.key(p, data.ref_to_snap(addr)), label)
+        };
+        let predicate =
+            |nodes: &NodePredicates<'vir>, p| nodes.predicate_with_key(p, key(nodes, p));
+        let lifetimes: IndexVec<_, GeneralizedLifetime<'vir>> = self.pcg_ctxt().extract_regions(ty);
+        let lifetime = lifetimes[base.region_idx()];
+        let nodes = NodePredicates::new(RustTyDecomposition::from_ty(ty, self.def_id), self.deps)?
+            .in_ty(ty);
+        let positions = nodes.positions_of(lifetime);
+        let fold_or_unfold = FoldOrUnfold::for_action(edge_action);
+        let keys = positions
+            .iter()
+            .map(|&p| (p, key(&nodes, p)))
+            .collect::<Vec<_>>();
+        let pure = self.ty_use_pure(ty);
+        let referent_casts = |to_generic| match ty.kind() {
+            ty::Ref(_, _, mir::Mutability::Mut) => data.expect_mutref().cast_referent_at(
+                pure.expect_mutref(),
+                |p| key(&nodes, p),
+                &positions,
+                to_generic,
+            ),
+            _ => Vec::new(),
+        };
+        match fold_or_unfold {
+            FoldOrUnfold::Unfold => {
+                // Innermost first: the keys read the enclosing predicates.
+                let unfolds = positions
+                    .iter()
+                    .rev()
+                    .map(|&p| self.vcx.mk_unfold_stmt(predicate(&nodes, p)))
+                    .collect::<Vec<_>>();
+                self.stmts(unfolds);
+                let casts = referent_casts(false);
+                self.stmts(casts);
+                self.cast_generic_fields(ty, snap, &nodes, &keys, fold_or_unfold)?;
+            }
+            FoldOrUnfold::Fold => {
+                self.cast_generic_fields(ty, snap, &nodes, &keys, fold_or_unfold)?;
+                let casts = referent_casts(true);
+                self.stmts(casts);
+                let folds = positions
+                    .iter()
+                    .map(|&p| self.vcx.mk_fold_stmt(predicate(&nodes, p)))
+                    .collect::<Vec<_>>();
+                self.stmts(folds);
             }
         }
         Ok(())
@@ -865,7 +992,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .map(|p| self.vcx.mk_unfold_stmt(nodes.predicate(p, snap)))
                     .collect::<Vec<_>>();
                 self.stmts(unfolds);
-                self.fields_to_concrete(ty, snap, lifetime)?;
+                let keys = nodes
+                    .positions_of(lifetime)
+                    .into_iter()
+                    .map(|p| (p, nodes.key(p, snap)))
+                    .collect::<Vec<_>>();
+                self.cast_generic_fields(ty, snap, &nodes, &keys, FoldOrUnfold::Unfold)?;
             }
             BorrowPcgEdgeKind::Deref(deref) => {
                 let frame = self.fold_or_unfold(
@@ -880,7 +1012,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     self.fold_footprint(footprint, edge, frame)?;
                 }
             }
-            // Ignore expansions of lifetime projections for now
+            BorrowPcgEdgeKind::BorrowPcgExpansion(expansion)
+                if let PcgNode::LifetimeProjection(base) = expansion.base() =>
+            {
+                self.expand_lifetime_projection(base, edge_action, label)?;
+            }
             BorrowPcgEdgeKind::BorrowPcgExpansion(expansion)
                 if let PcgNode::Place(base) = expansion.base() =>
             {
@@ -1127,9 +1263,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     ) -> EncodeResult<'vir, (), E> {
         let current_fpcs = self.current_fpcs.take().unwrap();
         let cfpcs = &current_fpcs.statements[location.statement_index];
-        self.pcg_actions(&cfpcs.states[phase], &cfpcs.actions(phase), false)?;
+        self.current_phase = Some((location, phase));
+        let result = self.pcg_actions(&cfpcs.states[phase], &cfpcs.actions(phase), false);
+        self.current_phase = None;
         self.current_fpcs = Some(current_fpcs);
-        Ok(())
+        result
     }
 
     fn borrow_action(
@@ -1225,6 +1363,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 };
                 let index = guide.and_then(|guide| self.expansion_index(guide));
                 if matches!(repack_op, pcg::free_pcs::RepackOp::Expand(..)) {
+                    self.label_before_unfold(place);
                     self.stmts(data.unfold(place_ty.variant_index, place_enc, index, None, None));
                 } else if matches!(repack_op, pcg::free_pcs::RepackOp::Collapse(..)) {
                     self.stmts(data.fold(place_ty.variant_index, place_enc, index, None, None));
@@ -1653,6 +1792,51 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 self.location_label(LocationLabelPrefix::BeforeRefReassignment, location, &pres),
             ),
         }
+    }
+
+    /// Emits the label at which the nodes of `place` labelled at the current
+    /// phase read their keys, right before `place`'s predicate is unfolded.
+    fn label_before_unfold(&mut self, place: Place<'vir>) {
+        let Some((location, phase)) = self.current_phase else {
+            return;
+        };
+        let pres = self.current_block_pres.clone().unwrap_or_default();
+        let key = (AnalysisLocation::new(location, phase), pres, place);
+        if self.unfold_labels.contains_key(&key) {
+            return;
+        }
+        let projections: String = place
+            .projection
+            .iter()
+            .map(|elem| match elem {
+                mir::ProjectionElem::Deref => "_d".to_string(),
+                mir::ProjectionElem::Field(field, _) => format!("_f{}", field.index()),
+                mir::ProjectionElem::Downcast(_, variant) => format!("_v{}", variant.index()),
+                _ => "_p".to_string(),
+            })
+            .collect();
+        let name = vir::vir_format!(
+            self.vcx,
+            "{}_{:?}_unfold_l{}{projections}",
+            self.location_label(LocationLabelPrefix::Before, location, &key.1),
+            phase,
+            place.local.index()
+        );
+        self.stmt(self.vcx.mk_label_stmt(name));
+        self.unfold_labels.insert(key, name);
+    }
+
+    /// The label at which the keys of a node of `place` labelled at `at` are
+    /// read: right before `place` was unfolded in the phase of `at`, or `at`
+    /// itself if `place` was not unfolded then.
+    fn key_label(&self, at: SnapshotLocation, place: Place<'vir>) -> vir::OldLabel<'vir> {
+        if let SnapshotLocation::Before(phase) = at {
+            let pres = self.labelled_block_pres(phase.location().block);
+            if let Some(label) = self.unfold_labels.get(&(phase, pres, place)) {
+                return vir::OldLabel::Label(label);
+            }
+        }
+        self.get_location_label(at)
     }
 
     /// The pre-loop prefixes of the copy of `block` that precedes the current

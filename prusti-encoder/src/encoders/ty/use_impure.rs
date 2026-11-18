@@ -1,4 +1,4 @@
-use prusti_rustc_interface::abi;
+use prusti_rustc_interface::{abi, index::Idx};
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, PredicateIdn};
 
@@ -22,6 +22,7 @@ use super::{
     impure::{ImpureTyDatas, TyImpureEnc},
     indirect_nodes::NodePredicates,
     rust_ty::RustTySpecial,
+    use_pure::TyUsePureMutRef,
 };
 
 pub(super) type UseImpureTyDatas = UseTyDatas<Impure>;
@@ -94,35 +95,10 @@ pub struct TyUseImpureMutRef<'vir> {
 pub struct IndirectCasts<'vir> {
     nodes: &'vir NodePredicates<'vir>,
     casters: IndirectCasters<'vir>,
-    ref_to_snap: vir::FunctionIdn<'vir, (vir::Ref, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
     args: GArgsTy<'vir>,
 }
 
 impl<'vir> IndirectCasts<'vir> {
-    /// Cast the predicates of the value at `addr` to concrete.
-    fn make_concrete(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.make_concrete_at(self.snap(addr), &self.nodes.positions())
-    }
-
-    /// Cast the predicates of the value at `addr` to generic.
-    fn make_generic(&self, addr: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.make_generic_at(self.snap(addr), &self.nodes.positions())
-    }
-
-    /// Cast the predicates at `positions`, given outermost first, of the value
-    /// with snapshot `snap` to concrete, enclosing positions first: the keys
-    /// read the enclosing concrete predicates.
-    pub fn make_concrete_at(
-        &self,
-        snap: vir::ExprSnap<'vir>,
-        positions: &[LifetimePosition],
-    ) -> Vec<vir::Stmt<'vir>> {
-        positions
-            .iter()
-            .map(|&q| self.cast(self.casters.make_concrete, snap, q))
-            .collect()
-    }
-
     /// Cast the predicates at `positions`, given outermost first, of the value
     /// with snapshot `snap` to generic, enclosed positions first, while the
     /// enclosing ones are still concrete.
@@ -143,18 +119,38 @@ impl<'vir> IndirectCasts<'vir> {
         self.nodes.positions()
     }
 
-    fn snap(&self, addr: vir::ExprRef<'vir>) -> vir::ExprSnap<'vir> {
-        self.ref_to_snap.call()(addr, self.args.get_ty(), self.args.get_const())
-    }
-
     fn cast(
         &self,
         cast: IndirectCastIdn<'vir>,
         snap: vir::ExprSnap<'vir>,
         q: LifetimePosition,
     ) -> vir::Stmt<'vir> {
+        self.cast_with_key(cast, self.nodes.key(q, snap), q)
+    }
+
+    /// Cast the predicate at `q` with key `key` to concrete, or to generic if
+    /// `to_generic`.
+    pub fn cast_at(
+        &self,
+        key: vir::ExprSnap<'vir>,
+        q: LifetimePosition,
+        to_generic: bool,
+    ) -> vir::Stmt<'vir> {
+        let cast = if to_generic {
+            self.casters.make_generic
+        } else {
+            self.casters.make_concrete
+        };
+        self.cast_with_key(cast, key, q)
+    }
+
+    fn cast_with_key(
+        &self,
+        cast: IndirectCastIdn<'vir>,
+        key: vir::ExprSnap<'vir>,
+        q: LifetimePosition,
+    ) -> vir::Stmt<'vir> {
         let (lo, hi) = self.nodes.interval(q);
-        let key = self.nodes.key(q, snap);
         cast(key, self.args.get_ty(), self.args.get_const(), lo, hi).alloc()
     }
 }
@@ -391,10 +387,6 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             casters: self
                 .deps
                 .require_ref::<IndirectCastersEnc>((normalized.param, normalized.concrete.ty))?,
-            ref_to_snap: self
-                .deps
-                .require_ref::<TyImpureEnc>(normalized.concrete.ty)?
-                .ref_to_snap,
             args: self
                 .deps
                 .require_dep::<GArgsTyEnc>(normalized.concrete.args)?,
@@ -650,15 +642,10 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
             }
             TySpecifics::ImmRef(..) | TySpecifics::Raw(..) => Vec::new(),
             TySpecifics::MutRef(data) => data.fold(self_ref, label),
-            TySpecifics::StructLike(data) => data
-                .fold(self_ref, perm)
-                .chain(self.fold_indirect(self_ref))
-                .collect(),
+            TySpecifics::StructLike(data) => data.fold(self_ref, perm).collect(),
             TySpecifics::EnumLike(..) => {
                 let pred_app = self.ref_to_pred_app(self_ref, perm);
-                std::iter::once(vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred_app)))
-                    .chain(self.fold_indirect(self_ref))
-                    .collect()
+                vec![vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred_app))]
             }
         }
     }
@@ -683,16 +670,6 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
         self.indirect_predicates(self_ref)
             .into_iter()
             .map(|pred| vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred)))
-            .collect()
-    }
-
-    /// Unfold the predicates of the positions before the type's predicate,
-    /// innermost first.
-    fn unfold_indirect(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.indirect_predicates(self_ref)
-            .into_iter()
-            .rev()
-            .map(|pred| vir::with_vcx(|vcx| vcx.mk_unfold_stmt(pred)))
             .collect()
     }
 
@@ -739,22 +716,15 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
             }
             TySpecifics::ImmRef(..) | TySpecifics::Raw(..) => Vec::new(),
             TySpecifics::MutRef(data) => data.unfold(self_ref, old),
-            TySpecifics::StructLike(data) => self
-                .unfold_indirect(self_ref)
-                .into_iter()
-                .chain(data.unfold(self_ref, perm))
-                .collect(),
+            TySpecifics::StructLike(data) => data.unfold(self_ref, perm).collect(),
             TySpecifics::EnumLike(data) => {
                 let pred_app = self.ref_to_pred_app(self_ref, perm);
-                let indirect = self.unfold_indirect(self_ref);
                 vir::with_vcx(|vcx| {
                     let discr = data
                         .discr_ty()
                         .ref_to_snap(data.discr(self_ref))
                         .downcast_ty::<vir::CSnap>();
-                    indirect
-                        .into_iter()
-                        .chain(std::iter::once(vcx.mk_unfold_stmt(pred_app)))
+                    std::iter::once(vcx.mk_unfold_stmt(pred_app))
                         .chain(data.variant_inhabited.iter().map(
                             |(variant_discr, variant_inhabited)| {
                                 let is_variant = vcx.mk_eq_expr(discr, *variant_discr);
@@ -889,24 +859,15 @@ impl<'vir> TyUseImpureField<'vir> {
         self.impure.ref_to_field_ref.call()(self_ref, self.args.get_ty(), self.args.get_const())
     }
 
-    /// Cast the field and then its predicates to concrete.
+    /// Cast the field to concrete. Its predicates are cast when the lifetime
+    /// projections of the struct are expanded.
     fn cast_to_caller_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        let addr = self.field_ref(self_ref);
-        let mut stmts = Vec::from_iter(self.caster.cast_to_caller_ctx(addr));
-        if let Some(indirect) = self.indirect {
-            stmts.extend(indirect.make_concrete(addr));
-        }
-        stmts
+        Vec::from_iter(self.caster.cast_to_caller_ctx(self.field_ref(self_ref)))
     }
 
-    /// Cast the field's predicates and then the field to generic.
+    /// Cast the field to generic.
     fn cast_to_callee_ctx(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        let addr = self.field_ref(self_ref);
-        let mut stmts = self
-            .indirect
-            .map_or_else(Vec::new, |indirect| indirect.make_generic(addr));
-        stmts.extend(self.caster.cast_to_callee_ctx(addr));
-        stmts
+        Vec::from_iter(self.caster.cast_to_callee_ctx(self.field_ref(self_ref)))
     }
 }
 
@@ -948,64 +909,81 @@ impl<'vir> TyUseImpureMutRef<'vir> {
         )
     }
 
-    /// The predicates of the reference's positions, outermost first, keyed by
-    /// the reference's snapshot at `label`.
-    fn predicates(
+    /// Cast the referent's predicates held by the reference's predicates at
+    /// `positions` (outermost first, the reference's own one excluded) to
+    /// concrete, or to generic if `to_generic`. The referent's predicate under
+    /// the reference's predicate with key `k` has the key `k.value`, as in the
+    /// body of the reference's predicate.
+    pub fn cast_referent_at(
+        &self,
+        pure: &TyUsePureMutRef<'vir>,
+        key: impl Fn(LifetimePosition) -> vir::ExprSnap<'vir>,
+        positions: &[LifetimePosition],
+        to_generic: bool,
+    ) -> Vec<vir::Stmt<'vir>> {
+        let Some(referent) = self.referent else {
+            return Vec::new();
+        };
+        let own = self.nodes.positions()[0];
+        let mut casts = positions
+            .iter()
+            .filter(|&&p| p != own)
+            .map(|&p| {
+                // The reference's own position comes first; the referent's
+                // positions follow it.
+                let q = LifetimePosition::new(p.index() - 1);
+                let referent_key = pure.value_access(key(p).downcast_ty());
+                referent.cast_at(referent_key, q, to_generic)
+            })
+            .collect::<Vec<_>>();
+        if to_generic {
+            casts.reverse();
+        }
+        casts
+    }
+
+    /// The predicate of the reference's own lifetime, which holds the
+    /// referent, keyed by the reference's snapshot at `label`.
+    fn own_predicate(
         &self,
         self_ref: vir::ExprRef<'vir>,
         label: Option<vir::OldLabel<'vir>>,
-    ) -> Vec<vir::PredicateApp<'vir>> {
+    ) -> vir::PredicateApp<'vir> {
         vir::with_vcx(|vcx| {
             let snap = self.ref_to_snap.call()(self_ref, self.args.get_ty(), self.args.get_const());
             let snap = vcx.maybe_apply_label(snap, label);
-            self.nodes
-                .positions()
-                .into_iter()
-                .map(|p| self.nodes.predicate(p, snap))
-                .collect()
+            let own = self.nodes.positions()[0];
+            self.nodes.predicate(own, snap)
         })
     }
 
-    /// Give the referent back to the reference: cast it and its predicates to
-    /// generic, then fold the reference's predicates, outermost first, since
-    /// the keys of the enclosed ones read the enclosing ones.
+    /// Give the referent back to the reference: cast it to generic, then fold
+    /// the predicate of the reference's own lifetime. The predicates of the
+    /// referent's lifetimes are moved by the expansions of the reference's
+    /// lifetime projections.
     fn fold(
         &self,
         self_ref: vir::ExprRef<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> Vec<vir::Stmt<'vir>> {
         let addr = self.deref(self_ref, label);
-        let mut stmts = self
-            .referent
-            .map_or_else(Vec::new, |referent| referent.make_generic(addr));
-        stmts.extend(self.referent_caster.cast_to_callee_ctx(addr));
-        stmts.extend(
-            self.predicates(self_ref, label)
-                .into_iter()
-                .map(|pred| vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred))),
-        );
+        let mut stmts = Vec::from_iter(self.referent_caster.cast_to_callee_ctx(addr));
+        let pred = self.own_predicate(self_ref, label);
+        stmts.push(vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred)));
         stmts
     }
 
-    /// Take the referent out of the reference: unfold the reference's
-    /// predicates, innermost first, then cast the referent and its predicates
-    /// to concrete.
+    /// Take the referent out of the reference: unfold the predicate of the
+    /// reference's own lifetime, then cast the referent to concrete.
     fn unfold(
         &self,
         self_ref: vir::ExprRef<'vir>,
         label: Option<vir::OldLabel<'vir>>,
     ) -> Vec<vir::Stmt<'vir>> {
         let addr = self.deref(self_ref, label);
-        let mut stmts = self
-            .predicates(self_ref, label)
-            .into_iter()
-            .rev()
-            .map(|pred| vir::with_vcx(|vcx| vcx.mk_unfold_stmt(pred)))
-            .collect::<Vec<_>>();
+        let pred = self.own_predicate(self_ref, label);
+        let mut stmts = vec![vir::with_vcx(|vcx| vcx.mk_unfold_stmt(pred))];
         stmts.extend(self.referent_caster.cast_to_caller_ctx(addr));
-        if let Some(referent) = self.referent {
-            stmts.extend(referent.make_concrete(addr));
-        }
         stmts
     }
 }

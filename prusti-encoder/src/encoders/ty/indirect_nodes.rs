@@ -125,8 +125,23 @@ impl<'vir> NodePredicates<'vir> {
         p: LifetimePosition,
         snap: vir::ExprSnap<'vir>,
     ) -> vir::PredicateApp<'vir> {
+        self.predicate_with_key(p, self.key(p, snap))
+    }
+
+    /// The predicate of position `p` with key `key`.
+    pub fn predicate_with_key(
+        &self,
+        p: LifetimePosition,
+        key: vir::ExprSnap<'vir>,
+    ) -> vir::PredicateApp<'vir> {
         let (lo, hi) = self.graph.interval(p);
-        (self.ind.predicate)(self.key(p, snap), self.tys, self.consts, lo, hi)(None)
+        (self.ind.predicate)(key, self.tys, self.consts, lo, hi)(None)
+    }
+
+    /// The positions of the generic argument `arg`, in the order of the
+    /// argument type's own positions.
+    pub fn arg_positions(&self, arg: usize) -> Vec<LifetimePosition> {
+        self.graph.arg_positions(arg)
     }
 
     pub fn interval(&self, p: LifetimePosition) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
