@@ -196,9 +196,15 @@ fn bin_op() {
     check("(0) - (x)", |c| c.bin(Sub, c.int(0), c.i("x")));
     check("2", |c| c.bin(Add, c.int(1), c.int(1)));
     check("-(1)", |c| c.bin(Sub, c.int(1), c.int(2)));
-    check("(x) + (1)", |c| c.bin(Sub, c.i("x"), c.bin(Sub, c.int(1), c.int(2))));
-    check("(x) + (3)", |c| c.bin(Add, c.bin(Add, c.i("x"), c.int(1)), c.int(2)));
-    check("(x) + (3)", |c| c.bin(Add, c.bin(Add, c.int(1), c.i("x")), c.int(2)));
+    check("(x) + (1)", |c| {
+        c.bin(Sub, c.i("x"), c.bin(Sub, c.int(1), c.int(2)))
+    });
+    check("(x) + (3)", |c| {
+        c.bin(Add, c.bin(Add, c.i("x"), c.int(1)), c.int(2))
+    });
+    check("(x) + (3)", |c| {
+        c.bin(Add, c.bin(Add, c.int(1), c.i("x")), c.int(2))
+    });
     check("(x) + (y)", |c| c.bin(Add, c.i("x"), c.i("y")));
     check("((x) == (z)) && ((y) == (w))", |c| {
         c.bin(
