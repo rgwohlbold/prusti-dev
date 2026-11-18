@@ -448,7 +448,7 @@ impl<'vir> task_encoder::OutputRefAny for IndirectCasters<'vir> {}
 
 /// Trusted methods exchanging a type's indirect predicate with that of a type parameter,
 /// which state that extending through the predicate gives the same result on both sides, and
-/// an axiom stating the same for making any snapshot shallow.
+/// axioms stating the same for making any snapshot shallow and for grafting.
 pub struct IndirectCastersEnc;
 
 impl TaskEncoder for IndirectCastersEnc {
@@ -504,10 +504,12 @@ impl TaskEncoder for IndirectCastersEnc {
 
             let k_decl = vcx.mk_local_decl("k", snapshot);
             let s_decl = vcx.mk_local_decl("s", snapshot);
+            let t_decl = vcx.mk_local_decl("t", snapshot);
             let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
             let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
             let k: vir::ExprSnap<'vir> = vcx.mk_local_ex(k_decl);
             let s: vir::ExprSnap<'vir> = vcx.mk_local_ex(s_decl);
+            let t: vir::ExprSnap<'vir> = vcx.mk_local_ex(t_decl);
             let lo = vcx.mk_local_ex(lo_decl);
             let hi = vcx.mk_local_ex(hi_decl);
             let tys = generics.ty_exprs();
@@ -531,8 +533,8 @@ impl TaskEncoder for IndirectCastersEnc {
             let generic_pred = vir::expr! { vcx; ((lo) < (hi)) ==> (generic_pred) };
             let concrete_extend = generic(concrete_ind.extend.call()(k, tys, consts, lo, hi));
             let generic_extend = param_ind.extend.call()(generic_k, &[ty], no_consts, lo, hi);
-            // Making a snapshot shallow does not depend on the heap, so it is the same on both
-            // sides everywhere, not only after a cast.
+            // Making a snapshot shallow and grafting do not depend on the heap, so they are the
+            // same on both sides everywhere, not only after a cast.
             let concrete_shallow = concrete_ind.shallow.call()(s, tys, consts);
             let generic_shallow = param_ind.shallow.call()(generic(s), &[ty], no_consts);
             let same_shallow = generic(concrete_shallow);
@@ -541,14 +543,28 @@ impl TaskEncoder for IndirectCastersEnc {
                     :: { [generic_shallow] }
                     ([generic_shallow]) == ([same_shallow])
             };
-            let axiom = vcx.mk_domain_axiom(
+            let shallow_axiom = vcx.mk_domain_axiom(
                 vir::vir_format_identifier!(vcx, "shallow_cast_{base_name}"),
                 same_shallow,
+            );
+            let concrete_graft = concrete_ind.graft.call()(s, tys, consts, t, lo, hi);
+            let generic_graft =
+                param_ind.graft.call()(generic(s), &[ty], no_consts, generic(t), lo, hi);
+            let same_graft = generic(concrete_graft);
+            let same_graft = vir::expr! { vcx;
+                forall [s_decl], [t_decl], [lo_decl], [hi_decl],
+                    ..[generics.ty_decls()], ..[generics.const_decls()]
+                    :: { [generic_graft] }
+                    ([generic_graft]) == ([same_graft])
+            };
+            let graft_axiom = vcx.mk_domain_axiom(
+                vir::vir_format_identifier!(vcx, "graft_cast_{base_name}"),
+                same_graft,
             );
             let domain = vcx.mk_domain(
                 vir::vir_format_identifier!(vcx, "IndirectCasts_{base_name}"),
                 &[],
-                vcx.alloc_slice(&[axiom]),
+                vcx.alloc_slice(&[shallow_axiom, graft_axiom]),
                 &[],
                 None,
             );
