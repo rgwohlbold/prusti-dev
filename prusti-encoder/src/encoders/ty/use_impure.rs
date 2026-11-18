@@ -1,4 +1,4 @@
-use prusti_rustc_interface::{abi, index::Idx};
+use prusti_rustc_interface::abi;
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
 use vir::{CastType, PredicateIdn};
 
@@ -22,7 +22,6 @@ use super::{
     impure::{ImpureTyDatas, TyImpureEnc},
     indirect_nodes::NodePredicates,
     rust_ty::RustTySpecial,
-    use_pure::TyUsePureMutRef,
 };
 
 pub(super) type UseImpureTyDatas = UseTyDatas<Impure>;
@@ -53,9 +52,6 @@ pub struct TyUseImpureData<'vir> {
     args: GArgsTy<'vir>,
     impure: <ImpureTyDatas as TyDatas<'vir>>::TyData,
     inhabited: TyUseInhabitedRef<'vir>,
-    /// The predicates of a struct's or enum's positions, if it has any. They
-    /// hold the indirect predicates of its fields.
-    nodes: Option<&'vir NodePredicates<'vir>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -99,35 +95,6 @@ pub struct IndirectCasts<'vir> {
 }
 
 impl<'vir> IndirectCasts<'vir> {
-    /// Cast the predicates at `positions`, given outermost first, of the value
-    /// with snapshot `snap` to generic, enclosed positions first, while the
-    /// enclosing ones are still concrete.
-    pub fn make_generic_at(
-        &self,
-        snap: vir::ExprSnap<'vir>,
-        positions: &[LifetimePosition],
-    ) -> Vec<vir::Stmt<'vir>> {
-        positions
-            .iter()
-            .rev()
-            .map(|&q| self.cast(self.casters.make_generic, snap, q))
-            .collect()
-    }
-
-    /// All positions of the concrete type, outermost first.
-    pub fn positions(&self) -> Vec<LifetimePosition> {
-        self.nodes.positions()
-    }
-
-    fn cast(
-        &self,
-        cast: IndirectCastIdn<'vir>,
-        snap: vir::ExprSnap<'vir>,
-        q: LifetimePosition,
-    ) -> vir::Stmt<'vir> {
-        self.cast_with_key(cast, self.nodes.key(q, snap), q)
-    }
-
     /// Cast the predicate at `q` with key `key` to concrete, or to generic if
     /// `to_generic`.
     pub fn cast_at(
@@ -341,17 +308,10 @@ impl<'a, 'vir> TyUseImpureWalker<'a, 'vir> {
             }
             TySpecifics::Builtin(..) => TySpecifics::mk_builtin(()),
         };
-        let nodes = match specifics {
-            TySpecifics::StructLike(..) | TySpecifics::EnumLike(..) => {
-                Some(self.alloc_nodes(self.decomp)?).filter(|nodes| !nodes.positions().is_empty())
-            }
-            _ => None,
-        };
         let data = TyUseImpureData {
             args: self.args_t,
             impure: *ty.1,
             inhabited: self.inhabited,
-            nodes,
         };
         Ok(TyData::new(data, specifics))
     }
@@ -650,29 +610,6 @@ impl<'vir> TyData<'vir, UseImpureTyDatas> {
         }
     }
 
-    /// The predicates of a struct's or enum's positions, outermost first,
-    /// keyed by its snapshot.
-    fn indirect_predicates(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::PredicateApp<'vir>> {
-        let Some(nodes) = self.nodes else {
-            return Vec::new();
-        };
-        let snap = self.ref_to_snap(self_ref);
-        nodes
-            .positions()
-            .into_iter()
-            .map(|p| nodes.predicate(p, snap))
-            .collect()
-    }
-
-    /// Fold the predicates of the positions after the type's predicate,
-    /// outermost first: their keys read its snapshot and the enclosing ones.
-    pub fn fold_indirect(&self, self_ref: vir::ExprRef<'vir>) -> Vec<vir::Stmt<'vir>> {
-        self.indirect_predicates(self_ref)
-            .into_iter()
-            .map(|pred| vir::with_vcx(|vcx| vcx.mk_fold_stmt(pred)))
-            .collect()
-    }
-
     /// Unfold the predicate (including generic casts).
     pub fn unfold(
         &self,
@@ -909,37 +846,10 @@ impl<'vir> TyUseImpureMutRef<'vir> {
         )
     }
 
-    /// Cast the referent's predicates held by the reference's predicates at
-    /// `positions` (outermost first, the reference's own one excluded) to
-    /// concrete, or to generic if `to_generic`. The referent's predicate under
-    /// the reference's predicate with key `k` has the key `k.value`, as in the
-    /// body of the reference's predicate.
-    pub fn cast_referent_at(
-        &self,
-        pure: &TyUsePureMutRef<'vir>,
-        key: impl Fn(LifetimePosition) -> vir::ExprSnap<'vir>,
-        positions: &[LifetimePosition],
-        to_generic: bool,
-    ) -> Vec<vir::Stmt<'vir>> {
-        let Some(referent) = self.referent else {
-            return Vec::new();
-        };
-        let own = self.nodes.positions()[0];
-        let mut casts = positions
-            .iter()
-            .filter(|&&p| p != own)
-            .map(|&p| {
-                // The reference's own position comes first; the referent's
-                // positions follow it.
-                let q = LifetimePosition::new(p.index() - 1);
-                let referent_key = pure.value_access(key(p).downcast_ty());
-                referent.cast_at(referent_key, q, to_generic)
-            })
-            .collect::<Vec<_>>();
-        if to_generic {
-            casts.reverse();
-        }
-        casts
+    /// The casts of the referent's predicates, if the referent is a concrete
+    /// type with positions.
+    pub fn referent(&self) -> Option<IndirectCasts<'vir>> {
+        self.referent
     }
 
     /// The predicate of the reference's own lifetime, which holds the
