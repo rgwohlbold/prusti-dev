@@ -376,9 +376,7 @@ impl TaskEncoder for MethodEnc {
 
                     current_stmts: None,
                     current_terminator: None,
-                    node_vars: Default::default(),
-                    package_node_vars: None,
-                    node_var_decls: Vec::new(),
+                    indirect_predicate_keys: Default::default(),
                     future_edges: Vec::new(),
                     unfolded_current_nodes: Default::default(),
                     encoded_blocks,
@@ -396,7 +394,8 @@ impl TaskEncoder for MethodEnc {
                         );
                         start_stmts.extend(
                             visitor
-                                .node_var_decls
+                                .indirect_predicate_keys
+                                .method_decls()
                                 .iter()
                                 .map(|v| vcx.mk_local_decl_stmt(*v, None)),
                         );

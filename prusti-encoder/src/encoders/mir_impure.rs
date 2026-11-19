@@ -195,18 +195,12 @@ where
     pub current_block_label: Option<vir::CfgBlockLabel<'vir>>,
     pub current_stmts: Option<Vec<vir::Stmt<'vir>>>,
     pub current_terminator: Option<vir::TerminatorStmt<'vir>>,
-    /// The ghost variables holding the keys of the lifetime-projection nodes
-    /// whose predicates have been created so far (see `fold_or_unfold_node`).
-    pub node_vars: FxHashMap<NodeLp<'vir>, NodeVars<'vir>>,
-    /// The keys of the nodes whose predicates the package script being
-    /// encoded creates: a package cannot assign the method's variables.
-    pub package_node_vars: Option<FxHashMap<NodeLp<'vir>, NodeVars<'vir>>>,
-    /// The key variables, declared at the method's start: a node's keys may
-    /// be assigned in a conditional block and read after it.
-    pub node_var_decls: Vec<vir::LocalDecl<'vir, vir::Snap>>,
+    /// The keys of the lifetime-projection nodes whose predicates have been
+    /// created so far (see `fold_or_unfold_node`).
+    pub indirect_predicate_keys: IndirectPredicateKeys<'vir>,
     /// The `FromExpansion` future edges, as (source, target), as the PCG's
     /// actions add, remove and rename them: the contents of a future node
-    /// that becomes current (see `fold_current_future_nodes`).
+    /// that becomes current (see `track_future_node_renames`).
     pub future_edges: Vec<(NodeLp<'vir>, NodeLp<'vir>)>,
     /// The nodes made current from future nodes whose predicates are not
     /// folded yet: their contents may still be lent when the future node
@@ -219,14 +213,159 @@ where
 /// A lifetime-projection node of a local place.
 pub(crate) type NodeLp<'vir> = LifetimeProjection<'vir, MaybeLabelledPlace<'vir>>;
 
-/// The keys of a node's predicates: its place's snapshot when the node was
-/// created, and the key of each of the node's positions. A node's predicates
-/// are unfolded with the keys they were folded with; a fold keys them anew,
-/// by the snapshot extended with what the enclosing positions hold then.
+/// The keys of one node's indirect predicates.
 #[derive(Clone)]
-pub(crate) struct NodeVars<'vir> {
+pub(crate) struct NodeKeys<'vir> {
     snap: vir::ExprSnap<'vir>,
     keys: FxHashMap<LifetimePosition, vir::ExprSnap<'vir>>,
+}
+
+/// The keys of all nodes. Package scripts use their own layer on top.
+#[derive(Default)]
+pub(crate) struct IndirectPredicateKeys<'vir> {
+    method: KeyLayer<'vir>,
+    package: Option<KeyLayer<'vir>>,
+    /// The number of key variables so far, to name new ones uniquely.
+    var_count: usize,
+    /// The method's keys at the end of each encoded edge.
+    edge_ends: FxHashMap<(mir::BasicBlock, mir::BasicBlock), KeyMap<'vir>>,
+    /// The method's keys at the terminator, while an edge's actions are encoded.
+    terminator: Option<KeyMap<'vir>>,
+}
+
+type KeyMap<'vir> = FxHashMap<NodeLp<'vir>, Option<NodeKeys<'vir>>>;
+
+/// The keys of the nodes of a method body or a package script, and the
+/// variables declared for them there.
+#[derive(Default)]
+struct KeyLayer<'vir> {
+    /// `None` for a node whose keys were removed. In a package script, this
+    /// hides the method's keys.
+    keys: KeyMap<'vir>,
+    decls: Vec<vir::LocalDecl<'vir, vir::Snap>>,
+}
+
+impl<'vir> NodeKeys<'vir> {
+    /// Whether both are held by the same variables.
+    fn same_vars(&self, other: &Self) -> bool {
+        std::ptr::eq(self.snap, other.snap)
+            && self.keys.len() == other.keys.len()
+            && self
+                .keys
+                .iter()
+                .all(|(p, key)| other.keys.get(p).is_some_and(|k| std::ptr::eq(*k, *key)))
+    }
+}
+
+impl<'vir> IndirectPredicateKeys<'vir> {
+    fn layer(&mut self) -> &mut KeyLayer<'vir> {
+        self.package.as_mut().unwrap_or(&mut self.method)
+    }
+
+    pub(crate) fn get(&self, node: NodeLp<'vir>) -> Option<&NodeKeys<'vir>> {
+        match self
+            .package
+            .as_ref()
+            .and_then(|package| package.keys.get(&node))
+        {
+            Some(keys) => keys.as_ref(),
+            None => self.method.keys.get(&node)?.as_ref(),
+        }
+    }
+
+    pub(crate) fn insert(&mut self, node: NodeLp<'vir>, keys: NodeKeys<'vir>) {
+        self.layer().keys.insert(node, Some(keys));
+    }
+
+    pub(crate) fn remove(&mut self, node: NodeLp<'vir>) {
+        self.layer().keys.insert(node, None);
+    }
+
+    /// A new key variable, declared in the current layer.
+    pub(crate) fn new_var(
+        &mut self,
+        vcx: &'vir vir::VirCtxt<'vir>,
+        prefix: &str,
+        ty: vir::Type<'vir, vir::Snap>,
+    ) -> vir::ExprSnap<'vir> {
+        let name = vir::vir_format!(vcx, "{prefix}{}", self.var_count);
+        self.var_count += 1;
+        let local = vir::vir_local_decl! { vcx; [name] : [ty] };
+        self.layer().decls.push(local);
+        vcx.mk_local_ex(local)
+    }
+
+    /// Starts a block with its predecessors' keys. A node keeps its keys only
+    /// if all encoded predecessors hold them in the same variables; the
+    /// predecessors not encoded yet are back edges of loops.
+    pub(crate) fn enter_block(
+        &mut self,
+        block: mir::BasicBlock,
+        preds: impl IntoIterator<Item = mir::BasicBlock>,
+    ) {
+        let mut ends = preds
+            .into_iter()
+            .filter_map(|pred| self.edge_ends.get(&(pred, block)));
+        let mut keys = ends.next().cloned().unwrap_or_default();
+        for end in ends {
+            keys.retain(|node, node_keys| {
+                matches!((node_keys, end.get(node)), (Some(a), Some(Some(b))) if a.same_vars(b))
+            });
+        }
+        keys.retain(|_, node_keys| node_keys.is_some());
+        self.method.keys = keys;
+    }
+
+    /// Ends a block: its keys end each edge to `succs` without own PCG actions.
+    pub(crate) fn leave_block(
+        &mut self,
+        block: mir::BasicBlock,
+        succs: impl IntoIterator<Item = mir::BasicBlock>,
+    ) {
+        for succ in succs {
+            self.edge_ends
+                .entry((block, succ))
+                .or_insert_with(|| self.method.keys.clone());
+        }
+    }
+
+    /// Starts encoding the PCG actions of a terminator's edge.
+    pub(crate) fn enter_edge(&mut self) {
+        self.terminator = Some(self.method.keys.clone());
+    }
+
+    /// Ends encoding the PCG actions of the edge from `from` to `to`: saves
+    /// the keys for `to`, and goes back to the keys at the terminator.
+    pub(crate) fn leave_edge(&mut self, from: mir::BasicBlock, to: mir::BasicBlock) {
+        let terminator = self.terminator.take().unwrap();
+        let edge = std::mem::replace(&mut self.method.keys, terminator);
+        self.edge_ends.insert((from, to), edge);
+    }
+
+    /// Package scripts only remove edges, so they never contain a package.
+    pub(crate) fn enter_package(&mut self) {
+        assert!(self.package.is_none(), "nested package script");
+        self.package = Some(KeyLayer::default());
+    }
+
+    /// Drops the package script's keys; returns its variables to declare.
+    pub(crate) fn leave_package(&mut self) -> Vec<vir::LocalDecl<'vir, vir::Snap>> {
+        self.package.take().unwrap().decls
+    }
+
+    /// The method body's variables to declare.
+    pub(crate) fn method_decls(&self) -> &[vir::LocalDecl<'vir, vir::Snap>] {
+        &self.method.decls
+    }
+
+    /// The nodes with keys in the method body.
+    pub(crate) fn method_nodes(&self) -> impl Iterator<Item = NodeLp<'vir>> + '_ {
+        self.method
+            .keys
+            .iter()
+            .filter(|(_, keys)| keys.is_some())
+            .map(|(node, _)| *node)
+    }
 }
 
 /// A node that an edge splits a node into or joins into it, with the part of
@@ -749,24 +888,19 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    /// The keys of `node`'s predicates, from its variables.
-    fn node_vars(&self, node: NodeLp<'vir>) -> Option<&NodeVars<'vir>> {
-        self.package_node_vars
-            .as_ref()
-            .and_then(|vars| vars.get(&node))
-            .or_else(|| self.node_vars.get(&node))
-    }
-
-    fn expect_node_vars(&self, node: NodeLp<'vir>) -> EncodeResult<'vir, NodeVars<'vir>, E> {
-        self.node_vars(node).cloned().ok_or_else(|| {
-            self.unsupported(
-                format!(
-                    "INTERNAL ERROR: no key for the predicates of {}",
-                    node.to_short_string(self.pcg_ctxt())
-                ),
-                self.current_span(),
-            )
-        })
+    fn expect_node_vars(&self, node: NodeLp<'vir>) -> EncodeResult<'vir, NodeKeys<'vir>, E> {
+        self.indirect_predicate_keys
+            .get(node)
+            .cloned()
+            .ok_or_else(|| {
+                self.unsupported(
+                    format!(
+                        "INTERNAL ERROR: no key for the predicates of {}",
+                        node.to_short_string(self.pcg_ctxt())
+                    ),
+                    self.current_span(),
+                )
+            })
     }
 
     /// Stores the keys of `node`'s predicates in its variables, or, in a
@@ -777,17 +911,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         snap: vir::ExprSnap<'vir>,
         keys: Vec<(LifetimePosition, vir::ExprSnap<'vir>)>,
     ) {
-        if let Some(vars) = &mut self.package_node_vars {
-            vars.insert(
-                node,
-                NodeVars {
-                    snap,
-                    keys: keys.into_iter().collect(),
-                },
-            );
-            return;
-        }
-        let existing = self.node_vars.get(&node).cloned();
+        let existing = self.indirect_predicate_keys.get(node).cloned();
         let (snap_var, mut key_vars) = match existing {
             Some(vars) => (vars.snap, vars.keys),
             None => (self.new_node_var("_ks", snap.ty()), FxHashMap::default()),
@@ -804,9 +928,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             };
             self.stmt(self.vcx.mk_pure_assign_stmt(var, key));
         }
-        self.node_vars.insert(
+        self.indirect_predicate_keys.insert(
             node,
-            NodeVars {
+            NodeKeys {
                 snap: snap_var,
                 keys: key_vars,
             },
@@ -818,26 +942,32 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         prefix: &str,
         ty: vir::Type<'vir, vir::Snap>,
     ) -> vir::ExprSnap<'vir> {
-        let name = vir::vir_format!(self.vcx, "{prefix}{}", self.node_var_decls.len());
-        let local = vir::vir_local_decl! { self.vcx; [name] : [ty] };
-        self.node_var_decls.push(local);
-        self.vcx.mk_local_ex(local)
+        self.indirect_predicate_keys.new_var(self.vcx, prefix, ty)
     }
 
-    /// Carries the keys of the nodes renamed by a PCG action over to their new
-    /// names.
-    fn copy_renamed_node_vars(&mut self, renamed: &[NodeReplacement<'vir>]) {
-        for replacement in renamed {
-            let (PcgNode::LifetimeProjection(from), PcgNode::LifetimeProjection(to)) =
-                (replacement.from(), replacement.to())
-            else {
-                continue;
-            };
-            let (Some(from), Some(to)) = (local_node(from), local_node(to)) else {
-                continue;
-            };
-            if let Some(vars) = self.node_vars(from).cloned() {
-                self.set_node_vars(to, vars.snap, vars.keys.into_iter().collect());
+    /// Moves the keys of renamed nodes to their new names. Any other keys
+    /// under the old or new name are stale, so they are dropped.
+    fn move_renamed_node_vars(&mut self, renamed: &[NodeReplacement<'vir>]) {
+        let renamed = renamed
+            .iter()
+            .filter_map(|replacement| match (replacement.from(), replacement.to()) {
+                (PcgNode::LifetimeProjection(from), PcgNode::LifetimeProjection(to)) => {
+                    Some((local_node(from)?, local_node(to)?))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let moved = renamed
+            .iter()
+            .map(|&(from, to)| (to, self.indirect_predicate_keys.get(from).cloned()))
+            .collect::<Vec<_>>();
+        for &(from, to) in &renamed {
+            self.indirect_predicate_keys.remove(from);
+            self.indirect_predicate_keys.remove(to);
+        }
+        for (to, vars) in moved {
+            if let Some(vars) = vars {
+                self.indirect_predicate_keys.insert(to, vars);
             }
         }
     }
@@ -847,13 +977,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     /// them back.
     fn rekey_nodes_of(&mut self, locals: &[mir::Local]) -> EncodeResult<'vir, (), E> {
         let nodes = self
-            .node_vars
-            .keys()
+            .indirect_predicate_keys
+            .method_nodes()
             .filter(|node| locals.contains(&node.base().place().local))
-            .copied()
             .collect::<Vec<_>>();
         for node in nodes {
-            let snap = self.node_vars[&node].snap;
+            let snap = self.indirect_predicate_keys.get(node).unwrap().snap;
             let (_, predicates, positions) = self.node_positions(node)?;
             let keys = positions
                 .iter()
@@ -864,11 +993,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    /// Folds the predicates of the nodes that a PCG action made current from
-    /// future nodes: such a node consists of the nodes its `FromExpansion`
-    /// edges come from, e.g. `x↓'b` of `*x↓'b` once a reborrow of `*x` ends.
-    /// This keeps a current leaf's predicates folded.
-    fn fold_current_future_nodes(
+    /// Applies a PCG action's renames to `future_edges` and `unfolded_current_nodes`.
+    /// A node made current gets keys, and is folded from its `FromExpansion` sources
+    /// at its next use.
+    fn track_future_node_renames(
         &mut self,
         renamed: &[NodeReplacement<'vir>],
     ) -> EncodeResult<'vir, (), E> {
@@ -885,6 +1013,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             if from.label() != Some(LifetimeProjectionLabel::Future) || to.label().is_some() {
                 continue;
             }
+            // The node's predicates are created here, so their keys are
+            // computed from the current state, where its place is held again.
+            self.assign_current_node_vars(to)?;
             if self.future_edges.iter().any(|(_, target)| *target == from) {
                 self.unfolded_current_nodes.insert(from);
             }
@@ -956,7 +1087,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         &mut self,
         base: NodeLp<'vir>,
         base_ty: ty::Ty<'vir>,
-        base_vars: &NodeVars<'vir>,
+        base_vars: &NodeKeys<'vir>,
         base_keys: &[(LifetimePosition, vir::ExprSnap<'vir>)],
         child: Child<'vir>,
     ) -> EncodeResult<'vir, vir::ExprSnap<'vir>, E> {
@@ -1011,7 +1142,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             children
                 .iter()
                 .find(|child| child.part == part)
-                .and_then(|child| visitor.node_vars(child.node))
+                .and_then(|child| visitor.indirect_predicate_keys.get(child.node))
                 .map(|vars| {
                     let mut keys = vars.keys.iter().map(|(q, k)| (*q, *k)).collect::<Vec<_>>();
                     keys.sort_by_key(|(q, _)| q.index());
@@ -1203,7 +1334,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                         }
                         let mut child_keys = Vec::new();
                         for (&q, &(p, key)) in child_positions.iter().zip(&keys) {
-                            let part = NodeVars {
+                            let part = NodeKeys {
                                 snap: key,
                                 keys: FxHashMap::default(),
                             };
@@ -1226,7 +1357,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 // A node's predicates are folded back with the keys they had;
                 // a node that a joining edge creates gets keys from the
                 // current state, where its place is held.
-                let vars = match self.node_vars(base) {
+                let vars = match self.indirect_predicate_keys.get(base) {
                     Some(vars) => vars.clone(),
                     None if matches!(place, MaybeLabelledPlace::Current(_))
                         && base.label().is_none() =>
@@ -1363,7 +1494,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 )?;
             }
             // A node made current from a future node consists of the nodes
-            // of its `FromExpansion` edges (see `fold_current_future_nodes`);
+            // of its `FromExpansion` edges (see `track_future_node_renames`);
             // removing such an edge splits it again.
             BorrowPcgEdgeKind::BorrowFlow(borrow_flow)
                 if borrow_flow.kind().is_future_from_expansion() =>
@@ -1603,12 +1734,15 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 footprint.parts.extend(part);
             }
         }
-        let outer_package_vars = self.package_node_vars.replace(FxHashMap::default());
+        self.indirect_predicate_keys.enter_package();
         let unblock =
             self.block(|visitor| visitor.pcs_unblock_actions(borrows_state, &mut footprint));
-        self.package_node_vars = outer_package_vars;
+        let decls = self.indirect_predicate_keys.leave_package();
         let unblock = unblock?;
-        let mut script = Vec::new();
+        let mut script = decls
+            .into_iter()
+            .map(|decl| self.vcx.mk_local_decl_stmt(decl, None))
+            .collect::<Vec<_>>();
         if !footprint.parts.is_empty() {
             script.push(self.vcx.mk_assert_stmt(self.vcx.mk_conj(&footprint.parts)));
         }
@@ -1726,8 +1860,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             BorrowPcgActionKind::Restore(restore) => restore.renamed_nodes(),
             _ => &[],
         };
-        self.copy_renamed_node_vars(renamed);
-        self.fold_current_future_nodes(renamed)?;
+        self.move_renamed_node_vars(renamed);
+        self.track_future_node_renames(renamed)?;
         match action.kind() {
             //Restore(RestoreCapability<'tcx>),
             //MakePlaceOld(Place<'tcx>),
@@ -1895,7 +2029,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     ) -> EncodeResult<'vir, (), E> {
         let post_main = &cfpcs.states[EvalStmtPhase::PostMain];
         let edge_to_loop = self.loop_head_of(succ.block()).is_some();
-        self.pcg_actions(post_main, succ.actions(), edge_to_loop)
+        self.indirect_predicate_keys.enter_edge();
+        let result = self.pcg_actions(post_main, succ.actions(), edge_to_loop);
+        self.indirect_predicate_keys
+            .leave_edge(self.current_block.unwrap(), succ.block());
+        result
     }
 
     fn finish_terminator(&mut self, location: mir::Location) -> EncodeResult<'vir, (), E> {
@@ -2515,7 +2653,13 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .collect(),
             );
 
+            self.indirect_predicate_keys.enter_block(
+                block,
+                body.basic_blocks.predecessors()[block].iter().copied(),
+            );
             self.visit_basic_block_data(block, &body[block])?;
+            self.indirect_predicate_keys
+                .leave_block(block, body.basic_blocks.successors(block));
             self.current_block = None;
             self.current_block_pres = None;
             self.current_block_succs = None;
