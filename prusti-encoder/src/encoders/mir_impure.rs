@@ -994,8 +994,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     }
 
     /// Applies a PCG action's renames to `future_edges` and `unfolded_current_nodes`.
-    /// A node made current gets keys, and is folded from its `FromExpansion` sources
-    /// at its next use.
+    /// A node made current is folded from its `FromExpansion` sources at its next use.
     fn track_future_node_renames(
         &mut self,
         renamed: &[NodeReplacement<'vir>],
@@ -1013,9 +1012,6 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             if from.label() != Some(LifetimeProjectionLabel::Future) || to.label().is_some() {
                 continue;
             }
-            // The node's predicates are created here, so their keys are
-            // computed from the current state, where its place is held again.
-            self.assign_current_node_vars(to)?;
             if self.future_edges.iter().any(|(_, target)| *target == from) {
                 self.unfolded_current_nodes.insert(from);
             }
@@ -1273,6 +1269,15 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         children: &[Child<'vir>],
         fold_or_unfold: FoldOrUnfold,
     ) -> EncodeResult<'vir, (), E> {
+        if base.label() == Some(LifetimeProjectionLabel::Future) {
+            return Err(self.unsupported(
+                format!(
+                    "INTERNAL ERROR: {} is folded or unfolded while it is a future node",
+                    base.to_short_string(self.pcg_ctxt())
+                ),
+                self.current_span(),
+            ));
+        }
         let place = base.base();
         if place.place().is_shared_ref(self.pcg_ctxt())
             || place.place().projects_shared_ref(self.pcg_ctxt())
@@ -1492,6 +1497,19 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     &sources,
                     FoldOrUnfold::for_joining_action(edge_action),
                 )?;
+            }
+            // A future node is its labelled source once it becomes current, so
+            // it shares the source's key variables.
+            BorrowPcgEdgeKind::BorrowFlow(borrow_flow)
+                if borrow_flow.kind().is_future_to_self() =>
+            {
+                if edge_action.is_add()
+                    && let Some(source) = local_node(borrow_flow.long())
+                    && let Some(keys) = self.indirect_predicate_keys.get(source).cloned()
+                {
+                    self.indirect_predicate_keys
+                        .insert(borrow_flow.short(), keys);
+                }
             }
             // A node made current from a future node consists of the nodes
             // of its `FromExpansion` edges (see `track_future_node_renames`);
