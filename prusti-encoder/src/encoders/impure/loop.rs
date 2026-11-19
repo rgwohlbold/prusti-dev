@@ -3,8 +3,10 @@ use rustc_hash::FxHashMap;
 use pcg::{
     borrow_pcg::{
         GeneralizedLifetime,
+        edge::kind::BorrowPcgEdgeKind,
+        graph::BorrowsGraph,
         region_projection::{
-            ExtractRegionsCtxt, HasTy, LifetimeProjection, PcgLifetimeProjectionBase,
+            ExtractRegionsCtxt, LifetimeProjection, PcgLifetimeProjectionBase,
             PcgLifetimeProjectionBaseLike,
         },
     },
@@ -35,6 +37,7 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     pub(crate) fn get_loop_inv(
         &mut self,
         cfpcs: &PcgBasicBlock<'_, 'vir>,
+        entry_graph: &BorrowsGraph<'vir>,
         loop_place_usages: &PlaceUsages<'vir>,
         ctxt: impl HasCompilerCtxt<'a, 'vir>,
     ) -> EncodeResult<
@@ -51,29 +54,65 @@ impl<'vir: 'a, 'a, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         let loop_invariant_place_capabilities =
             cfpcs.loop_invariant_place_capabilities(loop_place_usages, ctxt);
 
-        for (place, capability) in loop_invariant_place_capabilities.iter() {
-            if capability.is_write() {
-                continue; // No permissions are encoded for places with write capabilities currently
+        // The places held at the head: the used places and the places on the
+        // way to them, e.g. the reference `w.f` of a used `*w.f`, that are
+        // initialized leaves of the owned PCG, or, behind a reference, that a
+        // deref edge of the head's borrow graph dereferences or that are
+        // leaves of it. A place the loop writes is still held if it is
+        // initialized at the head.
+        let entry_leaves = entry_graph.frozen_graph().leaf_nodes(self.pcg_ctxt());
+        let entry_derefs = entry_graph
+            .edges()
+            .filter_map(|edge| match edge.kind() {
+                BorrowPcgEdgeKind::Deref(deref) => deref.blocked_place().as_current_place(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut held = loop_invariant_place_capabilities
+            .iter()
+            .filter(|(_, capability)| !capability.is_write())
+            .map(|(place, _)| *place)
+            .collect::<Vec<_>>();
+        for usage in loop_place_usages.iter() {
+            let mut place = Some(*usage.0);
+            while let Some(current) = place {
+                place = current.last_projection().map(|(parent, _)| parent);
+                if held.contains(&current) {
+                    continue;
+                }
+                let local_state = &state.owned()[current.local];
+                if !local_state.is_allocated() {
+                    break;
+                }
+                let is_owned_leaf = local_state
+                    .expansions()
+                    .leaf_places(ctxt)
+                    .into_iter()
+                    .any(|leaf| Place::from(leaf) == current);
+                let held_owned = is_owned_leaf
+                    && state
+                        .computed_owned_capability(current, self.pcg_ctxt())
+                        .is_some_and(|capability| !capability.is_write());
+                let held_borrowed = entry_derefs.contains(&current)
+                    || entry_leaves.iter().any(|leaf| {
+                        matches!(leaf, PcgNode::Place(place) if place.as_current_place() == Some(current))
+                    });
+                if held_owned || held_borrowed {
+                    held.push(current);
+                }
             }
+        }
+        // A place's predicate is stated before those of the places behind it,
+        // whose addresses are read from its snapshot.
+        held.sort_by_key(|place| place.projection.len());
+        for place in &held {
             let (place_res, _snap, _, _) = self.encode_place_with_snap(*place)?;
             let ty = (*place).ty(self.pcg_ctxt());
             let task = RustTyDecomposition::from_ty(ty.ty, self.def_id);
             let ty_out = self.deps.require_dep::<TyUseImpureEnc>(task).unwrap();
-            let pred = ty_out.ref_to_pred(self.vcx, place_res.expr.expect_predicate(), None);
-            inv.push(pred);
-            // gets all the lifetime projections of the place
-            // for example, if we add an invariant for x and x is a reference, then we also want to add
-            // an invariant for *x
-            let projs = place
-                .with_inherent_region(ctxt)
-                .generalized_lifetime_projections(ctxt);
-            let nodes = NodePredicates::new(task, self.deps).unwrap().in_ty(ty.ty);
-            let snap = ty_out.ref_to_snap(place_res.expr.expect_predicate());
-            for proj in projs {
-                let lifetime = proj.region(ctxt);
-                inv.extend(nodes.of(lifetime, snap, |key| key));
-            }
+            inv.push(ty_out.ref_to_pred(self.vcx, place_res.expr.expect_predicate(), None));
         }
+        inv.extend(self.indirect_loop_invariant(entry_graph, &held)?);
 
         for edge in state.borrow_pcg().graph().coupled_edges() {
             let mut let_bind = WandOldOuter::LetBind(Vec::new());

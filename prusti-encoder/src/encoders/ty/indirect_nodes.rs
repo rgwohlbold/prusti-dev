@@ -119,6 +119,17 @@ impl<'vir> NodePredicates<'vir> {
         self.block(snap).key(p)
     }
 
+    /// The key of position `p` on a place with snapshot `snap`, with the data
+    /// at the enclosing positions taken from `from`, another key of `p`.
+    pub fn graft_enclosing(
+        &self,
+        p: LifetimePosition,
+        snap: vir::ExprSnap<'vir>,
+        from: vir::ExprSnap<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        self.block(snap).graft_enclosing(p, from)
+    }
+
     /// The predicate of position `p` on a place with snapshot `snap`.
     pub fn predicate(
         &self,

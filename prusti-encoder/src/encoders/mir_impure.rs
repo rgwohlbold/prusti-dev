@@ -13,6 +13,7 @@ use pcg::{
             kind::BorrowPcgEdgeKind,
         },
         edge_data::{EdgeData, NodeReplacement},
+        graph::BorrowsGraph,
         region_projection::{
             ExtractRegionsCtxt, LifetimeProjection, LifetimeProjectionLabel,
             PcgLifetimeProjectionBase, PlaceOrConst,
@@ -197,15 +198,12 @@ where
     pub current_terminator: Option<vir::TerminatorStmt<'vir>>,
     /// The keys of the lifetime-projection nodes whose predicates have been
     /// created so far (see `fold_or_unfold_node`).
-    pub indirect_predicate_keys: IndirectPredicateKeys<'vir>,
-    /// The `FromExpansion` future edges, as (source, target), as the PCG's
-    /// actions add, remove and rename them: the contents of a future node
-    /// that becomes current (see `track_future_node_renames`).
+    pub indirect_predicate_state: IndirectPredicateState<'vir>,
+    /// The `FromExpansion` future edges from a part of their target, as
+    /// (source, target): what a future node that becomes current consists of
+    /// (see `track_future_node_renames`). Taken from the PCG at the entry of
+    /// each block and updated by the block's actions.
     pub future_edges: Vec<(NodeLp<'vir>, NodeLp<'vir>)>,
-    /// The nodes made current from future nodes whose predicates are not
-    /// folded yet: their contents may still be lent when the future node
-    /// becomes current, so they are folded when the node is used next.
-    pub unfolded_current_nodes: FxHashSet<NodeLp<'vir>>,
 
     pub encoded_blocks: Vec<vir::CfgBlock<'vir>>, // TODO: use IndexVec ?
 }
@@ -220,20 +218,34 @@ pub(crate) struct NodeKeys<'vir> {
     keys: FxHashMap<LifetimePosition, vir::ExprSnap<'vir>>,
 }
 
-/// The keys of all nodes. Package scripts use their own layer on top.
+/// The encoder's state of the nodes' indirect predicates at the current
+/// program point: their keys, and the folds deferred so far. Package scripts
+/// use their own layer of keys on top.
 #[derive(Default)]
-pub(crate) struct IndirectPredicateKeys<'vir> {
+pub(crate) struct IndirectPredicateState<'vir> {
     method: KeyLayer<'vir>,
     package: Option<KeyLayer<'vir>>,
     /// The number of key variables so far, to name new ones uniquely.
     var_count: usize,
-    /// The method's keys at the end of each encoded edge.
-    edge_ends: FxHashMap<(mir::BasicBlock, mir::BasicBlock), KeyMap<'vir>>,
-    /// The method's keys at the terminator, while an edge's actions are encoded.
-    terminator: Option<KeyMap<'vir>>,
+    /// The nodes made current from future nodes whose predicates are not
+    /// folded yet: their parts may still be lent when the node becomes
+    /// current, so it is folded when it is used next.
+    pub(crate) deferred_folds: FxHashSet<NodeLp<'vir>>,
+    /// The method's state at the end of each encoded CFG edge.
+    edge_ends: FxHashMap<(mir::BasicBlock, mir::BasicBlock), EdgeEnd<'vir>>,
+    /// The method's state at the terminator, while an edge's actions are
+    /// encoded.
+    terminator: Option<EdgeEnd<'vir>>,
 }
 
 type KeyMap<'vir> = FxHashMap<NodeLp<'vir>, Option<NodeKeys<'vir>>>;
+
+/// The method's state at the end of a CFG edge.
+#[derive(Clone)]
+struct EdgeEnd<'vir> {
+    keys: KeyMap<'vir>,
+    deferred_folds: FxHashSet<NodeLp<'vir>>,
+}
 
 /// The keys of the nodes of a method body or a package script, and the
 /// variables declared for them there.
@@ -257,7 +269,7 @@ impl<'vir> NodeKeys<'vir> {
     }
 }
 
-impl<'vir> IndirectPredicateKeys<'vir> {
+impl<'vir> IndirectPredicateState<'vir> {
     fn layer(&mut self) -> &mut KeyLayer<'vir> {
         self.package.as_mut().unwrap_or(&mut self.method)
     }
@@ -301,51 +313,82 @@ impl<'vir> IndirectPredicateKeys<'vir> {
         vcx.mk_local_ex(local)
     }
 
-    /// Starts a block with its predecessors' keys. A node keeps its keys only
-    /// if all encoded predecessors hold them in the same variables; the
-    /// predecessors not encoded yet are back edges of loops.
+    fn edge_end(&self) -> EdgeEnd<'vir> {
+        EdgeEnd {
+            keys: self.method.keys.clone(),
+            deferred_folds: self.deferred_folds.clone(),
+        }
+    }
+
+    fn restore(&mut self, end: EdgeEnd<'vir>) {
+        self.method.keys = end.keys;
+        self.deferred_folds = end.deferred_folds;
+    }
+
+    /// Starts a block with its predecessors' state; the predecessors not
+    /// encoded yet are back edges of loops. A node keeps its keys only if all
+    /// of them hold the keys in the same variables. Returns the nodes whose
+    /// fold some predecessors defer and others do not.
     pub(crate) fn enter_block(
         &mut self,
         block: mir::BasicBlock,
         preds: impl IntoIterator<Item = mir::BasicBlock>,
-    ) {
+    ) -> Vec<NodeLp<'vir>> {
         let mut ends = preds
             .into_iter()
             .filter_map(|pred| self.edge_ends.get(&(pred, block)));
-        let mut keys = ends.next().cloned().unwrap_or_default();
+        let first = ends.next().cloned();
+        let mut keys = first
+            .as_ref()
+            .map(|end| end.keys.clone())
+            .unwrap_or_default();
+        let mut deferred = first
+            .as_ref()
+            .map(|end| end.deferred_folds.clone())
+            .unwrap_or_default();
+        let mut disagreeing = FxHashSet::default();
         for end in ends {
             keys.retain(|node, node_keys| {
-                matches!((node_keys, end.get(node)), (Some(a), Some(Some(b))) if a.same_vars(b))
+                matches!((node_keys, end.keys.get(node)), (Some(a), Some(Some(b))) if a.same_vars(b))
             });
+            disagreeing.extend(deferred.symmetric_difference(&end.deferred_folds).copied());
+            deferred.retain(|node| end.deferred_folds.contains(node));
         }
         keys.retain(|_, node_keys| node_keys.is_some());
-        self.method.keys = keys;
+        self.restore(EdgeEnd {
+            keys,
+            deferred_folds: deferred,
+        });
+        disagreeing.into_iter().collect()
     }
 
-    /// Ends a block: its keys end each edge to `succs` without own PCG actions.
+    /// Ends a block: its state ends each edge to `succs` without own PCG
+    /// actions.
     pub(crate) fn leave_block(
         &mut self,
         block: mir::BasicBlock,
         succs: impl IntoIterator<Item = mir::BasicBlock>,
     ) {
         for succ in succs {
-            self.edge_ends
-                .entry((block, succ))
-                .or_insert_with(|| self.method.keys.clone());
+            if !self.edge_ends.contains_key(&(block, succ)) {
+                let end = self.edge_end();
+                self.edge_ends.insert((block, succ), end);
+            }
         }
     }
 
     /// Starts encoding the PCG actions of a terminator's edge.
     pub(crate) fn enter_edge(&mut self) {
-        self.terminator = Some(self.method.keys.clone());
+        self.terminator = Some(self.edge_end());
     }
 
     /// Ends encoding the PCG actions of the edge from `from` to `to`: saves
-    /// the keys for `to`, and goes back to the keys at the terminator.
+    /// the state for `to`, and goes back to the state at the terminator.
     pub(crate) fn leave_edge(&mut self, from: mir::BasicBlock, to: mir::BasicBlock) {
+        let end = self.edge_end();
+        self.edge_ends.insert((from, to), end);
         let terminator = self.terminator.take().unwrap();
-        let edge = std::mem::replace(&mut self.method.keys, terminator);
-        self.edge_ends.insert((from, to), edge);
+        self.restore(terminator);
     }
 
     /// Package scripts only remove edges, so they never contain a package.
@@ -407,6 +450,20 @@ impl<'vir> Child<'vir> {
         };
         Some(Self { node, part })
     }
+}
+
+/// Whether a loop invariant states `node`'s predicates: a node with an old
+/// label stands for a snapshot from before the loop, which the loop does not
+/// maintain, so its predicates, if held, are framed around the loop.
+fn maintained_by_loop(node: NodeLp<'_>) -> bool {
+    node.base().is_current()
+        && match node.label() {
+            None => true,
+            Some(LifetimeProjectionLabel::Location(location)) => {
+                matches!(location, SnapshotLocation::Loop(_))
+            }
+            Some(LifetimeProjectionLabel::Future) => false,
+        }
 }
 
 /// The node of a lifetime projection of a local place.
@@ -895,7 +952,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     }
 
     fn expect_node_vars(&self, node: NodeLp<'vir>) -> EncodeResult<'vir, NodeKeys<'vir>, E> {
-        self.indirect_predicate_keys
+        self.indirect_predicate_state
             .get(node)
             .cloned()
             .ok_or_else(|| {
@@ -917,7 +974,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         snap: vir::ExprSnap<'vir>,
         keys: Vec<(LifetimePosition, vir::ExprSnap<'vir>)>,
     ) {
-        let existing = self.indirect_predicate_keys.get_in_layer(node).cloned();
+        let existing = self.indirect_predicate_state.get_in_layer(node).cloned();
         let (snap_var, mut key_vars) = match existing {
             Some(vars) => (vars.snap, vars.keys),
             None => (self.new_node_var("_ks", snap.ty()), FxHashMap::default()),
@@ -934,7 +991,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             };
             self.stmt(self.vcx.mk_pure_assign_stmt(var, key));
         }
-        self.indirect_predicate_keys.insert(
+        self.indirect_predicate_state.insert(
             node,
             NodeKeys {
                 snap: snap_var,
@@ -948,7 +1005,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         prefix: &str,
         ty: vir::Type<'vir, vir::Snap>,
     ) -> vir::ExprSnap<'vir> {
-        self.indirect_predicate_keys.new_var(self.vcx, prefix, ty)
+        self.indirect_predicate_state.new_var(self.vcx, prefix, ty)
     }
 
     /// Moves the keys of renamed nodes to their new names. Any other keys
@@ -965,15 +1022,15 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             .collect::<Vec<_>>();
         let moved = renamed
             .iter()
-            .map(|&(from, to)| (to, self.indirect_predicate_keys.get(from).cloned()))
+            .map(|&(from, to)| (to, self.indirect_predicate_state.get(from).cloned()))
             .collect::<Vec<_>>();
         for &(from, to) in &renamed {
-            self.indirect_predicate_keys.remove(from);
-            self.indirect_predicate_keys.remove(to);
+            self.indirect_predicate_state.remove(from);
+            self.indirect_predicate_state.remove(to);
         }
         for (to, vars) in moved {
             if let Some(vars) = vars {
-                self.indirect_predicate_keys.insert(to, vars);
+                self.indirect_predicate_state.insert(to, vars);
             }
         }
     }
@@ -983,12 +1040,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     /// them back.
     fn rekey_nodes_of(&mut self, locals: &[mir::Local]) -> EncodeResult<'vir, (), E> {
         let nodes = self
-            .indirect_predicate_keys
+            .indirect_predicate_state
             .method_nodes()
             .filter(|node| locals.contains(&node.base().place().local))
             .collect::<Vec<_>>();
         for node in nodes {
-            let snap = self.indirect_predicate_keys.get(node).unwrap().snap;
+            let snap = self.indirect_predicate_state.get(node).unwrap().snap;
             let (_, predicates, positions) = self.node_positions(node)?;
             let keys = positions
                 .iter()
@@ -999,7 +1056,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         Ok(())
     }
 
-    /// Applies a PCG action's renames to `future_edges` and `unfolded_current_nodes`.
+    /// Applies a PCG action's renames to `future_edges` and `deferred_folds`.
     /// A node made current is folded from its `FromExpansion` sources at its next use.
     fn track_future_node_renames(
         &mut self,
@@ -1019,7 +1076,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 continue;
             }
             if self.future_edges.iter().any(|(_, target)| *target == from) {
-                self.unfolded_current_nodes.insert(from);
+                self.indirect_predicate_state.deferred_folds.insert(from);
             }
         }
         for edge in &mut self.future_edges {
@@ -1033,8 +1090,8 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
         }
         for &(from, to) in &renamed {
-            if self.unfolded_current_nodes.remove(&from) {
-                self.unfolded_current_nodes.insert(to);
+            if self.indirect_predicate_state.deferred_folds.remove(&from) {
+                self.indirect_predicate_state.deferred_folds.insert(to);
             }
         }
         Ok(())
@@ -1044,7 +1101,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     /// node and is used for the first time, from its `FromExpansion` edges'
     /// sources.
     fn fold_if_unfolded_current_node(&mut self, node: NodeLp<'vir>) -> EncodeResult<'vir, (), E> {
-        if !self.unfolded_current_nodes.remove(&node) {
+        if !self.indirect_predicate_state.deferred_folds.remove(&node) {
             return Ok(());
         }
         let children = self
@@ -1054,6 +1111,116 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             .filter_map(|(source, _)| Child::of_place(node, *source))
             .collect::<Vec<_>>();
         self.fold_or_unfold_node(node, &children, FoldOrUnfold::Fold)
+    }
+
+    /// The borrow graph on entry to `block`, before the first statement's
+    /// actions: every edge into the block carries it. `None` for the start
+    /// block.
+    pub(crate) fn block_entry_graph(
+        &mut self,
+        block: mir::BasicBlock,
+    ) -> Option<BorrowsGraph<'vir>> {
+        for &pred in &self.body.basic_blocks.predecessors()[block] {
+            let Ok(Some(pred_pcg)) = self.fpcs_analysis.get_all_for_bb(pred) else {
+                continue;
+            };
+            if let Some(succ) = pred_pcg
+                .terminator
+                .succs
+                .iter()
+                .find(|succ| succ.block() == block)
+            {
+                return Some(succ.entry_graph().clone());
+            }
+        }
+        None
+    }
+
+    /// The `FromExpansion` future edges of `graph` whose source is a part of
+    /// their target.
+    fn future_edges_of(graph: &BorrowsGraph<'vir>) -> Vec<(NodeLp<'vir>, NodeLp<'vir>)> {
+        graph
+            .edges()
+            .filter_map(|edge| match edge.kind() {
+                BorrowPcgEdgeKind::BorrowFlow(borrow_flow)
+                    if borrow_flow.kind().is_future_from_expansion() =>
+                {
+                    let target = borrow_flow.short();
+                    let source = local_node(borrow_flow.long())?;
+                    Child::of_place(target, source).map(|_| (source, target))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The parts of a loop invariant for the indirect predicates at the loop
+    /// head with borrow graph `graph`: the predicates of the leaf nodes, keyed by
+    /// their key variables, and, for each node whose place is in `held`, that
+    /// its keys agree with the place's current snapshot. The loop havocs these
+    /// snapshots and the key variables its body assigns; the data behind
+    /// references in a key need not be stated, since a fold rebuilds it from
+    /// the children.
+    pub(crate) fn indirect_loop_invariant(
+        &mut self,
+        graph: &BorrowsGraph<'vir>,
+        held: &[Place<'vir>],
+    ) -> EncodeResult<'vir, Vec<vir::ExprBool<'vir>>, E> {
+        let mut inv = Vec::new();
+        let leaves = graph.frozen_graph().leaf_nodes(self.pcg_ctxt());
+        for leaf in leaves {
+            let PcgNode::LifetimeProjection(node) = leaf else {
+                continue;
+            };
+            let Some(node) = local_node(node.into()) else {
+                continue;
+            };
+            let place = node.base().place();
+            if !maintained_by_loop(node)
+                || place.is_shared_ref(self.pcg_ctxt())
+                || place.projects_shared_ref(self.pcg_ctxt())
+            {
+                continue;
+            }
+            let (_, nodes, positions) = self.node_positions(node)?;
+            if positions.is_empty() {
+                continue;
+            }
+            let keys = self.expect_node_vars(node)?;
+            for p in positions {
+                if let Some(&key) = keys.keys.get(&p) {
+                    inv.push(
+                        self.vcx
+                            .mk_predicate_app_expr(nodes.predicate_with_key(p, key)),
+                    );
+                }
+            }
+        }
+        let nodes_of_held = self
+            .indirect_predicate_state
+            .method_nodes()
+            .filter(|&node| {
+                maintained_by_loop(node)
+                    && matches!(node.base(), MaybeLabelledPlace::Current(place) if held.contains(&place))
+            })
+            .collect::<Vec<_>>();
+        for node in nodes_of_held {
+            let keys = self.expect_node_vars(node)?;
+            let (ty, nodes, _) = self.node_positions(node)?;
+            let place = self
+                .encode_place(node.base().place())?
+                .expr
+                .expect_predicate();
+            let snap = self.ty_use_impure(ty).ref_to_snap(place);
+            inv.push(self.vcx.mk_eq_expr(keys.snap, snap));
+            for (&p, &key) in &keys.keys {
+                inv.push(
+                    self.vcx
+                        .mk_eq_expr(key, nodes.graft_enclosing(p, snap, key)),
+                );
+            }
+        }
+        Ok(inv)
     }
 
     /// The type of `node`'s place, the predicates of its type, and the
@@ -1173,7 +1340,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         E,
     > {
         for &child in children {
-            let Some(child_keys) = self.indirect_predicate_keys.get(child.node).cloned() else {
+            let Some(child_keys) = self.indirect_predicate_state.get(child.node).cloned() else {
                 continue;
             };
             // As in `child_snapshot`, a referent's snapshot is not a part of
@@ -1215,7 +1382,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             children
                 .iter()
                 .find(|child| child.part == part)
-                .and_then(|child| visitor.indirect_predicate_keys.get(child.node))
+                .and_then(|child| visitor.indirect_predicate_state.get(child.node))
                 .map(|vars| {
                     let mut keys = vars.keys.iter().map(|(q, k)| (*q, *k)).collect::<Vec<_>>();
                     keys.sort_by_key(|(q, _)| q.index());
@@ -1439,7 +1606,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 // A node's predicates are folded back with its keys rebuilt
                 // from its children's; a node that a joining edge creates gets
                 // keys from the current state, where its place is held.
-                let vars = match self.indirect_predicate_keys.get(base) {
+                let vars = match self.indirect_predicate_state.get(base) {
                     Some(vars) => vars.clone(),
                     None if matches!(place, MaybeLabelledPlace::Current(_))
                         && base.label().is_none() =>
@@ -1590,9 +1757,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             {
                 if edge_action.is_add()
                     && let Some(source) = local_node(borrow_flow.long())
-                    && let Some(keys) = self.indirect_predicate_keys.get(source).cloned()
+                    && let Some(keys) = self.indirect_predicate_state.get(source).cloned()
                 {
-                    self.indirect_predicate_keys
+                    self.indirect_predicate_state
                         .insert(borrow_flow.short(), keys);
                 }
             }
@@ -1603,7 +1770,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 if borrow_flow.kind().is_future_from_expansion() =>
             {
                 let target = borrow_flow.short();
-                if let Some(source) = local_node(borrow_flow.long()) {
+                // A borrower's edge, e.g. `y↓'a -> x↓'a FUTURE` for
+                // `y = &mut x`, is no part of the target: what it holds is
+                // given back to the target's labelled source.
+                if let Some(source) = local_node(borrow_flow.long())
+                    && Child::of_place(target, source).is_some()
+                {
                     if edge_action.is_add() {
                         self.future_edges.push((source, target));
                     } else {
@@ -1611,7 +1783,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                         // `FromExpansion` edges at the first one's removal,
                         // unless it was never folded from them.
                         if target.label() != Some(LifetimeProjectionLabel::Future)
-                            && !self.unfolded_current_nodes.contains(&target)
+                            && !self
+                                .indirect_predicate_state
+                                .deferred_folds
+                                .contains(&target)
                         {
                             let children = self
                                 .future_edges
@@ -1620,7 +1795,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                                 .filter_map(|(source, _)| Child::of_place(target, *source))
                                 .collect::<Vec<_>>();
                             self.fold_or_unfold_node(target, &children, FoldOrUnfold::Unfold)?;
-                            self.unfolded_current_nodes.insert(target);
+                            self.indirect_predicate_state.deferred_folds.insert(target);
                         }
                         self.future_edges.retain(|edge| *edge != (source, target));
                         if !self
@@ -1628,7 +1803,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                             .iter()
                             .any(|(_, edge_target)| *edge_target == target)
                         {
-                            self.unfolded_current_nodes.remove(&target);
+                            self.indirect_predicate_state.deferred_folds.remove(&target);
                         }
                     }
                 }
@@ -1837,10 +2012,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 footprint.parts.extend(part);
             }
         }
-        self.indirect_predicate_keys.enter_package();
+        self.indirect_predicate_state.enter_package();
         let unblock =
             self.block(|visitor| visitor.pcs_unblock_actions(borrows_state, &mut footprint));
-        let decls = self.indirect_predicate_keys.leave_package();
+        let decls = self.indirect_predicate_state.leave_package();
         let unblock = unblock?;
         let mut script = decls
             .into_iter()
@@ -2132,9 +2307,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
     ) -> EncodeResult<'vir, (), E> {
         let post_main = &cfpcs.states[EvalStmtPhase::PostMain];
         let edge_to_loop = self.loop_head_of(succ.block()).is_some();
-        self.indirect_predicate_keys.enter_edge();
+        self.indirect_predicate_state.enter_edge();
         let result = self.pcg_actions(post_main, succ.actions(), edge_to_loop);
-        self.indirect_predicate_keys
+        self.indirect_predicate_state
             .leave_edge(self.current_block.unwrap(), succ.block());
         result
     }
@@ -2756,12 +2931,28 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .collect(),
             );
 
-            self.indirect_predicate_keys.enter_block(
+            let disagreeing = self.indirect_predicate_state.enter_block(
                 block,
                 body.basic_blocks.predecessors()[block].iter().copied(),
             );
+            // Cleanup blocks are not encoded (see `visit_basic_block_data`).
+            if let Some(node) = disagreeing.first()
+                && !body[block].is_cleanup
+            {
+                return Err(self.unsupported(
+                    format!(
+                        "INTERNAL ERROR: the predecessors of {block:?} disagree on whether {} is folded",
+                        node.to_short_string(self.pcg_ctxt())
+                    ),
+                    body.source_info(mir::Location { block, statement_index: 0 }).span,
+                ));
+            }
+            self.future_edges = self
+                .block_entry_graph(block)
+                .map(|graph| Self::future_edges_of(&graph))
+                .unwrap_or_default();
             self.visit_basic_block_data(block, &body[block])?;
-            self.indirect_predicate_keys
+            self.indirect_predicate_state
                 .leave_block(block, body.basic_blocks.successors(block));
             self.current_block = None;
             self.current_block_pres = None;
@@ -2961,8 +3152,11 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 .clone();
             let invariants = loop_spec.invariants.clone();
             let loop_id = loop_spec.loop_id;
+            // The borrow graph on entry to the block, before the first
+            // statement's actions: every edge into the block carries it.
+            let entry_graph = self.block_entry_graph(block).unwrap();
             let (permissions, place_capabilities) =
-                self.get_loop_inv(&cfpcs, &loop_place_usages, self.pcg_ctxt())?;
+                self.get_loop_inv(&cfpcs, &entry_graph, &loop_place_usages, self.pcg_ctxt())?;
             let pcg_state = &cfpcs.statements[0].states[EvalStmtPhase::PreOperands];
             // The Viper loop havocs the edge flags set in the loop, including
             // those set between the loop's first block and the body invariant,

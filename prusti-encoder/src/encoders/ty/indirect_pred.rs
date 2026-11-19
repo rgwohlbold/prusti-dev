@@ -124,6 +124,26 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
         self.fold(&ancestors)
     }
 
+    /// `k` with the data at the positions of the block enclosing `p` taken
+    /// from `from`, another key of `p`.
+    pub(crate) fn graft_enclosing(
+        &self,
+        p: LifetimePosition,
+        from: vir::ExprSnap<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        let mut snap = self.k;
+        for &q in self
+            .graph
+            .ancestors(p)
+            .iter()
+            .filter(|&&q| self.contains(q))
+        {
+            let (lo, hi) = self.graph.interval(q);
+            snap = self.ind.graft.call()(snap, self.tys, self.consts, from, lo, hi);
+        }
+        snap
+    }
+
     /// `k` with what each of `positions` reads through its key grafted in, in
     /// turn.
     pub(crate) fn fold(&self, positions: &[LifetimePosition]) -> vir::ExprSnap<'vir> {
