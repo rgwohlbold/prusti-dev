@@ -273,6 +273,12 @@ impl<'vir> IndirectPredicateKeys<'vir> {
         }
     }
 
+    /// The keys of `node` held by variables of the current layer: only these
+    /// may be assigned there.
+    pub(crate) fn get_in_layer(&mut self, node: NodeLp<'vir>) -> Option<&NodeKeys<'vir>> {
+        self.layer().keys.get(&node)?.as_ref()
+    }
+
     pub(crate) fn insert(&mut self, node: NodeLp<'vir>, keys: NodeKeys<'vir>) {
         self.layer().keys.insert(node, Some(keys));
     }
@@ -903,15 +909,15 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             })
     }
 
-    /// Stores the keys of `node`'s predicates in its variables, or, in a
-    /// package script, as the expressions themselves.
+    /// Assigns the keys of `node`'s predicates to its variables in the
+    /// current layer.
     fn set_node_vars(
         &mut self,
         node: NodeLp<'vir>,
         snap: vir::ExprSnap<'vir>,
         keys: Vec<(LifetimePosition, vir::ExprSnap<'vir>)>,
     ) {
-        let existing = self.indirect_predicate_keys.get(node).cloned();
+        let existing = self.indirect_predicate_keys.get_in_layer(node).cloned();
         let (snap_var, mut key_vars) = match existing {
             Some(vars) => (vars.snap, vars.keys),
             None => (self.new_node_var("_ks", snap.ty()), FxHashMap::default()),
@@ -1116,6 +1122,77 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .value_access(key.downcast_ty()))
             }
         }
+    }
+
+    /// `whole` with `child`'s part replaced by `part`: the inverse of
+    /// `child_snapshot`.
+    fn with_child_part(
+        &mut self,
+        base: NodeLp<'vir>,
+        base_ty: ty::Ty<'vir>,
+        whole: vir::ExprSnap<'vir>,
+        child: Child<'vir>,
+        part: vir::ExprSnap<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        match child.part {
+            Part::Field(field) => {
+                let variant = match base.base().place().projection.last() {
+                    Some(mir::ProjectionElem::Downcast(_, variant)) => Some(*variant),
+                    _ => None,
+                };
+                self.ty_use_pure(base_ty)
+                    .expect_variant_opt(variant)
+                    .with_field(whole.downcast_ty(), field, part)
+                    .upcast_ty()
+            }
+            Part::Variant => part,
+            Part::Referent => self
+                .ty_use_pure(base_ty)
+                .expect_mutref()
+                .with_value(whole.downcast_ty(), part)
+                .upcast_ty(),
+        }
+    }
+
+    /// The snapshot and keys of `base` with each child's part replaced by the
+    /// child's current one. A child's key changes while `base` is unfolded
+    /// when what encloses it changes, e.g. a callee redirects a reference.
+    fn keys_from_children(
+        &mut self,
+        base: NodeLp<'vir>,
+        base_ty: ty::Ty<'vir>,
+        mut snap: vir::ExprSnap<'vir>,
+        mut keys: Vec<(LifetimePosition, vir::ExprSnap<'vir>)>,
+        children: &[Child<'vir>],
+    ) -> EncodeResult<
+        'vir,
+        (
+            vir::ExprSnap<'vir>,
+            Vec<(LifetimePosition, vir::ExprSnap<'vir>)>,
+        ),
+        E,
+    > {
+        for &child in children {
+            let Some(child_keys) = self.indirect_predicate_keys.get(child.node).cloned() else {
+                continue;
+            };
+            // As in `child_snapshot`, a referent's snapshot is not a part of
+            // the reference's.
+            if child.part != Part::Referent {
+                snap = self.with_child_part(base, base_ty, snap, child, child_keys.snap);
+            }
+            let child_positions = if child.part == Part::Variant {
+                keys.iter().map(|&(p, _)| p).collect()
+            } else {
+                self.node_positions(child.node)?.2
+            };
+            for (q, (_, key)) in child_positions.iter().zip(keys.iter_mut()) {
+                if let Some(&child_key) = child_keys.keys.get(q) {
+                    *key = self.with_child_part(base, base_ty, key, child, child_key);
+                }
+            }
+        }
+        Ok((snap, keys))
     }
 
     /// Cast the predicates of the generic fields or the generic referent of
@@ -1359,9 +1436,9 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 if is_variant {
                     return Ok(());
                 }
-                // A node's predicates are folded back with the keys they had;
-                // a node that a joining edge creates gets keys from the
-                // current state, where its place is held.
+                // A node's predicates are folded back with its keys rebuilt
+                // from its children's; a node that a joining edge creates gets
+                // keys from the current state, where its place is held.
                 let vars = match self.indirect_predicate_keys.get(base) {
                     Some(vars) => vars.clone(),
                     None if matches!(place, MaybeLabelledPlace::Current(_))
@@ -1372,6 +1449,14 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     }
                     None => self.expect_node_vars(base)?,
                 };
+                let stored = positions
+                    .iter()
+                    .filter_map(|p| vars.keys.get(p).map(|key| (*p, *key)))
+                    .collect();
+                let (snap, rebuilt) =
+                    self.keys_from_children(base, ty, vars.snap, stored, children)?;
+                self.set_node_vars(base, snap, rebuilt);
+                let vars = self.expect_node_vars(base)?;
                 let keys = positions
                     .iter()
                     .map(|p| vars.keys.get(p).map(|key| (*p, *key)))
