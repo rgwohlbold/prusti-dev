@@ -93,12 +93,10 @@ impl<'vir> ReferentBlock<'vir> {
         if count <= 1 {
             return Ok(None);
         }
-        let block = (
-            ty,
-            LifetimePosition::new(1),
-            LifetimePosition::new(count),
-            MergeTarget::Own,
-        );
+        // The positions after the reference's own lifetime are those of its
+        // referent, its only generic argument.
+        let path = vir::with_vcx(|vcx| vcx.alloc_slice(&[0]));
+        let block = (ty, path, MergeTarget::Own);
         let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
         let (_, params) = ty
             .canonical_with_params()

@@ -23,10 +23,9 @@ use crate::encoders::{
     ty::{
         generics::{
             GArgsCastEnc, IndirectCastersEnc,
-            arity::ArityEnc,
             builtin_impls::BuiltinImplEnc,
-            clamp::ClampEnc,
             merge_split::MergeSplitEnc,
+            selector::SelectorEnc,
             r#trait::{AssocTypeBoundEnc, TraitEnc},
             trait_fn::TraitFnEnc,
             trait_impls::{
@@ -178,8 +177,7 @@ pub(crate) fn emit_program<'vir>() -> task_encoder::Program<'vir> {
     TraitEnc::emit_outputs(&mut program);
     AssocTypeBoundEnc::emit_outputs(&mut program);
     BuiltinImplEnc::emit_outputs(&mut program);
-    ArityEnc::emit_outputs(&mut program);
-    ClampEnc::emit_outputs(&mut program);
+    SelectorEnc::emit_outputs(&mut program);
     IndirectPredEnc::emit_outputs(&mut program);
     IndirectCastersEnc::emit_outputs(&mut program);
     MergeSplitEnc::emit_outputs(&mut program);

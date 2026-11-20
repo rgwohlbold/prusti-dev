@@ -110,6 +110,7 @@ impl_exp_type!(PSnap[TYPE_PSNAP = Domain("s_Param", &[])] => Snap | Dyn, "The ge
 impl_exp_type!(TyVal[TYPE_TYVAL = Domain("Type", &[])] => Dyn, "The type domain (`ExpType`) which gives values to types");
 
 impl_exp_type!(Pair => Dyn, TypeKind::Domain(name, args) if name == format!("Pair{}", args.len()), "A custom generic tuple type");
+impl_exp_type!(Sel => Dyn, TypeKind::Domain(name, _) if name.starts_with("p_") && name.ends_with("_lft_index"), "A selector of lifetime positions of a type (`p_X_lft_index`)");
 
 impl_exp_type!(Prim => Dyn, TypeKind::Bool | TypeKind::Int | TypeKind::Perm | TypeKind::Ref, "Represents any primitive Viper type");
 impl_exp_type!(Snap => Dyn, ref kind if matches!(kind, TypeKind::Bool | TypeKind::Int | TypeKind::Perm | TypeKind::Set(_) | TypeKind::Multiset(_) | TypeKind::Seq(_) | TypeKind::Map(..)) || matches!(kind, TypeKind::Domain(name, ..) if name.starts_with("s_")), "A Prusti snapshot type, either concrete or generic");
