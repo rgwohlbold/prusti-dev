@@ -8,11 +8,10 @@ use super::{
     data::TySpecifics,
     generics::{
         GArgsTyEnc, GenericParamsEnc, ParamTypEnc,
-        arity::{TyArityEnc, add, sub},
-        clamp::ClampEnc,
         lifetime_position::{
             EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
         },
+        selector::{SelectorArg, SelectorEnc, path_selector},
     },
     impure::TyImpureEnc,
     pure::TyPureEnc,
@@ -22,30 +21,11 @@ pub struct IndirectPredEnc;
 
 #[derive(Debug, Clone, Copy)]
 pub struct IndirectPredRef<'vir> {
-    pub predicate: PredicateIdn<
-        'vir,
-        (
-            vir::Snap,
-            vir::ManyTyVal,
-            vir::ManyCSnap,
-            vir::Int,
-            vir::Int,
-        ),
-    >,
-    /// `extend_X(k, T.., lo, hi)`: `k` extended by the positions `[lo, hi)`: the references
-    /// there hold their current referents, read through `p_X_ind(k, T.., lo, hi)`.
-    pub extend: FunctionIdn<
-        'vir,
-        (
-            vir::Snap,
-            vir::ManyTyVal,
-            vir::ManyCSnap,
-            vir::Int,
-            vir::Int,
-        ),
-        vir::Snap,
-    >,
-    /// `graft_X(s, T.., t, lo, hi)`: `s` with the references at `[lo, hi)` holding `t`'s
+    pub predicate: PredicateIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Sel)>,
+    /// `extend_X(k, T.., sel)`: `k` extended by the positions `sel`: the references
+    /// there hold their current referents, read through `p_X_ind(k, T.., sel)`.
+    pub extend: FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Sel), vir::Snap>,
+    /// `graft_X(s, T.., t, sel)`: `s` with the references at `sel` holding `t`'s
     /// referents, in which the references at other positions are collapsed.
     pub graft: FunctionIdn<
         'vir,
@@ -54,14 +34,13 @@ pub struct IndirectPredRef<'vir> {
             vir::ManyTyVal,
             vir::ManyCSnap,
             vir::Snap,
-            vir::Int,
-            vir::Int,
+            vir::Sel,
         ),
         vir::Snap,
     >,
     /// `shallow_X(s, T..)`: `s` with every reference collapsed, the shallow snapshot.
     pub shallow: FunctionIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap), vir::Snap>,
-    /// For an array, `p_X_elem_ind(i, v, T.., lo, hi)`: the predicates of the
+    /// For an array, `p_X_elem_ind(i, v, T.., sel)`: the predicates of the
     /// element `v` at index `i`. The array's predicate holds one per element;
     /// the index makes them distinct even where elements are equal.
     pub element: Option<ElementPredIdn<'vir>>,
@@ -74,15 +53,14 @@ pub type ElementPredIdn<'vir> = PredicateIdn<
         vir::PSnap,
         vir::ManyTyVal,
         vir::ManyCSnap,
-        vir::Int,
-        vir::Int,
+        vir::Sel,
     ),
 >;
 
 impl<'vir> task_encoder::OutputRefAny for IndirectPredRef<'vir> {}
 
 impl<'vir> IndirectPredRef<'vir> {
-    /// `snap` with the positions `[lo, hi)` holding what extending `key` by them reads
+    /// `snap` with the positions `sel` holding what extending `key` by them reads
     /// through the predicate on `key`.
     pub fn extend_from(
         &self,
@@ -90,14 +68,13 @@ impl<'vir> IndirectPredRef<'vir> {
         key: vir::ExprSnap<'vir>,
         tys: &'vir [vir::ExprTyVal<'vir>],
         consts: &'vir [vir::ExprCSnap<'vir>],
-        lo: vir::ExprInt<'vir>,
-        hi: vir::ExprInt<'vir>,
+        sel: vir::ExprSel<'vir>,
     ) -> vir::ExprSnap<'vir> {
         if vir::simplify::syntactic_eq(snap.as_dyn(), key.as_dyn()) {
-            self.extend.call()(snap, tys, consts, lo, hi)
+            self.extend.call()(snap, tys, consts, sel)
         } else {
-            let extended = self.extend.call()(key, tys, consts, lo, hi);
-            self.graft.call()(snap, tys, consts, extended, lo, hi)
+            let extended = self.extend.call()(key, tys, consts, sel);
+            self.graft.call()(snap, tys, consts, extended, sel)
         }
     }
 }
@@ -154,8 +131,8 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
             .iter()
             .filter(|&&q| self.contains(q))
         {
-            let (lo, hi) = self.graph.interval(q);
-            snap = self.ind.graft.call()(snap, self.tys, self.consts, from, lo, hi);
+            let sel = self.graph.selector(q);
+            snap = self.ind.graft.call()(snap, self.tys, self.consts, from, sel);
         }
         snap
     }
@@ -165,10 +142,10 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
     pub(crate) fn fold(&self, positions: &[LifetimePosition]) -> vir::ExprSnap<'vir> {
         let mut snap = self.k;
         for &q in positions {
-            let (lo, hi) = self.graph.interval(q);
+            let sel = self.graph.selector(q);
             snap = self
                 .ind
-                .extend_from(snap, self.key(q), self.tys, self.consts, lo, hi);
+                .extend_from(snap, self.key(q), self.tys, self.consts, sel);
         }
         snap
     }
@@ -176,87 +153,47 @@ impl<'vir> LifetimePositionBlock<'vir, '_> {
     pub(crate) fn predicate(
         &self,
         key: vir::ExprSnap<'vir>,
-        lo: vir::ExprInt<'vir>,
-        hi: vir::ExprInt<'vir>,
+        sel: vir::ExprSel<'vir>,
     ) -> vir::ExprBool<'vir> {
         let pred = self.ind.predicate;
         let (tys, consts) = (self.tys, self.consts);
-        vir::expr! { acc([pred](key, [..[tys]], [..[consts]], lo, hi)) }
-    }
-
-    /// The condition under which the predicate of position `p` holds
-    /// anything (see [`interval_nonempty`]).
-    pub(crate) fn nonempty(&self, p: LifetimePosition) -> Option<vir::ExprBool<'vir>> {
-        interval_nonempty(self.graph, p)
+        vir::expr! { acc([pred](key, [..[tys]], [..[consts]], sel)) }
     }
 }
 
-/// The condition under which the predicate of position `p` of `graph` holds
-/// anything, `None` where it always does. Only the interval of the regions of
-/// a type parameter or alias may be empty, as its arity is not known. A
-/// predicate over an empty interval holds nothing, and is not held: the
-/// predicates of the types containing a type parameter hold its predicate only
-/// for a non-empty interval, so it is required, folded and unfolded only then.
-pub(crate) fn interval_nonempty<'vir>(
-    graph: &EnclosureGraph<'vir>,
-    p: LifetimePosition,
-) -> Option<vir::ExprBool<'vir>> {
-    match graph.lifetime(p) {
-        GeneralizedLifetime::Region(_) => None,
-        GeneralizedLifetime::RegionsIn(_) => {
-            let (lo, hi) = graph.interval(p);
-            Some(vir::with_vcx(|vcx| vir::expr! { vcx; (lo) < (hi) }))
-        }
-    }
-}
-
-/// `perm`, the permission to an indirect predicate, required only under
-/// `nonempty` (see [`interval_nonempty`]).
-pub(crate) fn if_nonempty<'vir>(
-    nonempty: Option<vir::ExprBool<'vir>>,
-    perm: vir::ExprBool<'vir>,
-) -> vir::ExprBool<'vir> {
-    match nonempty {
-        None => perm,
-        Some(nonempty) => vir::with_vcx(|vcx| vir::expr! { vcx; (nonempty) ==> (perm) }),
-    }
-}
-
-/// The part of a query `[lo, hi)` at one own position.
+/// The part of a query `sel` at one own position.
 #[derive(Clone, Copy)]
 struct Subquery<'vir> {
     lifetime: GeneralizedLifetime<'vir>,
     /// The lifetimes of the own positions enclosing this one.
     enclosing: &'vir [GeneralizedLifetime<'vir>],
-    /// Whether the query contains part of this position.
+    /// Whether the query selects this position, or positions of it for a type parameter.
     guard: vir::ExprBool<'vir>,
-    /// The query.
-    lo: vir::ExprInt<'vir>,
-    hi: vir::ExprInt<'vir>,
-    /// The position covers `[x, x + width)` of the type.
-    x: vir::ExprInt<'vir>,
-    width: vir::ExprInt<'vir>,
-    clamp: FunctionIdn<'vir, (vir::Int, vir::Int, vir::Int), vir::Int>,
+    /// For a type parameter, the positions of it that the query selects, where `guard` holds.
+    tail: Option<vir::ExprSel<'vir>>,
 }
 
 impl<'vir> Subquery<'vir> {
-    /// The part of the query at this position, numbered as in a field type in
-    /// which the position starts at `x_f`: empty if `guard` is false.
-    fn in_field(self, x_f: vir::ExprInt<'vir>) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
-        let shift = sub(self.x, x_f);
-        let end = add(x_f, self.width);
-        (
-            self.clamp.call()(sub(self.lo, shift), x_f, end),
-            self.clamp.call()(sub(self.hi, shift), x_f, end),
-        )
+    /// The selector of this subquery at position `p` of the field type `field_ty`, one of
+    /// this subquery's lifetime, where `guard` holds: the whole position for an own
+    /// lifetime, and the selected positions of an own type parameter.
+    fn in_field<E: TaskEncoder>(
+        self,
+        field_ty: RustTyDecomposition<'vir>,
+        graph: &EnclosureGraph<'vir>,
+        p: LifetimePosition,
+        deps: &mut TaskEncoderDependencies<'vir, E>,
+    ) -> Result<vir::ExprSel<'vir>, EncodeFullError<'vir, E>> {
+        path_selector(field_ty, graph.path(p), self.tail, deps)
     }
 
-    /// Like `in_field`, where `guard` holds: the whole position for an own lifetime.
-    fn guarded_in_field(self, x_f: vir::ExprInt<'vir>) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
-        match self.lifetime {
-            GeneralizedLifetime::Region(_) => (x_f, add(x_f, self.width)),
-            GeneralizedLifetime::RegionsIn(_) => self.in_field(x_f),
-        }
+    /// `then` where `guard` holds, `otherwise` elsewhere.
+    fn if_selected(
+        self,
+        then: vir::ExprSnap<'vir>,
+        otherwise: vir::ExprSnap<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        vir::with_vcx(|vcx| vcx.mk_ternary_expr(self.guard, then, otherwise))
     }
 }
 
@@ -267,19 +204,22 @@ type Field<'vir> = (
 );
 
 impl IndirectPredEnc {
-    /// The subqueries of the query `[lo, hi)` for lifetime and type parameters of `ty`.
+    /// The subqueries of the query `sel` for lifetime and type parameters of `ty`.
     fn subqueries<'vir>(
         ty: RustTy<'vir>,
-        lo: vir::ExprInt<'vir>,
-        hi: vir::ExprInt<'vir>,
+        sel: vir::ExprSel<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<Vec<Subquery<'vir>>, EncodeFullError<'vir, Self>> {
-        let clamp = deps.require_dep::<ClampEnc>(())?;
         let graph = deps.require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(ty))?;
+        let selector = deps.require_ref::<SelectorEnc>(ty)?;
+        let param_all = deps
+            .require_ref::<SelectorEnc>(RustTyDecomposition::param())?
+            .all;
         vir::with_vcx(|vcx| {
+            let all = vcx.mk_eq_expr(sel, (selector.all)());
             // A position's predicate is on its key extended by the positions enclosing it,
             // so their predicates and extensions come first.
-            graph
+            Ok(graph
                 .positions_outermost_first()
                 .map(|p| {
                     let lifetime = graph.lifetime(p);
@@ -289,34 +229,26 @@ impl IndirectPredEnc {
                         .map(|&q| graph.lifetime(q))
                         .collect::<Vec<_>>();
                     let enclosing = vcx.alloc_slice(&enclosing);
-                    let (x, _) = graph.interval(p);
-                    let width = match lifetime {
-                        // An own lifetime is a single position, either in the query or not.
-                        GeneralizedLifetime::Region(_) => vcx.mk_uint::<1>(),
-                        GeneralizedLifetime::RegionsIn(ty) => deps.require_dep::<TyArityEnc>(ty)?,
+                    // Each own position is a generic argument of the identity
+                    // decomposition; the query selects it structurally,
+                    // independent of what a type parameter is instantiated with.
+                    let arg = selector.args[graph.path(p)[0]];
+                    let guard = arg.selects(sel);
+                    let guard = vir::expr! { vcx; (all) || (guard) };
+                    let tail = match arg {
+                        SelectorArg::Type { index, .. } => {
+                            Some(vcx.mk_ternary_expr(all, param_all(), index.call()(sel)))
+                        }
+                        _ => None,
                     };
-                    let mut subquery = Subquery {
+                    Subquery {
                         lifetime,
                         enclosing,
-                        guard: vcx.mk_bool::<true>(),
-                        lo,
-                        hi,
-                        x,
-                        width,
-                        clamp,
-                    };
-                    subquery.guard = match lifetime {
-                        GeneralizedLifetime::Region(_) => {
-                            vir::expr! { vcx; ((lo) <= (x)) && ((x) < (hi)) }
-                        }
-                        GeneralizedLifetime::RegionsIn(_) => {
-                            let (start, end) = subquery.in_field(x);
-                            vir::expr! { vcx; (start) < (end) }
-                        }
-                    };
-                    Ok(subquery)
+                        guard,
+                        tail,
+                    }
                 })
-                .collect()
+                .collect())
         })
     }
 
@@ -340,25 +272,24 @@ impl IndirectPredEnc {
             let key = Self::position_snap(
                 subqueries, outer, field_ty, graph, enclosing, field_snap, deps,
             )?;
-            let (start, end) = outer.in_field(graph.interval(enclosing).0);
-            snap = Self::extend_from(field_ty, snap, key, start, end, deps)?;
+            let sel = outer.in_field(field_ty, graph, enclosing, deps)?;
+            let extended = Self::extend_from(field_ty, snap, key, sel, deps)?;
+            snap = outer.if_selected(extended, snap);
         }
         Ok(snap)
     }
 
-    /// `snap` extended by the positions `[start, end)` of `field_ty`, whose permissions are
-    /// on `key`.
+    /// `snap` extended by the positions `sel` of `field_ty`, whose permissions are on `key`.
     fn extend_from<'vir>(
         field_ty: RustTyDecomposition<'vir>,
         snap: vir::ExprSnap<'vir>,
         key: vir::ExprSnap<'vir>,
-        start: vir::ExprInt<'vir>,
-        end: vir::ExprInt<'vir>,
+        sel: vir::ExprSel<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, Self>,
     ) -> Result<vir::ExprSnap<'vir>, EncodeFullError<'vir, Self>> {
         let field_ind = deps.require_ref::<IndirectPredEnc>(field_ty.ty)?;
         let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
-        Ok(field_ind.extend_from(snap, key, args.get_ty(), args.get_const(), start, end))
+        Ok(field_ind.extend_from(snap, key, args.get_ty(), args.get_const(), sel))
     }
 
     /// `field_snap` restricted to `p`'s ancestors in `field_ty` and, for a type parameter,
@@ -385,21 +316,20 @@ impl IndirectPredEnc {
         let mut keep = graph
             .ancestors(p)
             .iter()
-            .map(|&q| graph.interval(q))
+            .map(|&q| graph.selector(q))
             .collect::<Vec<_>>();
         if let GeneralizedLifetime::RegionsIn(_) = graph.lifetime(p) {
-            keep.push(graph.interval(p));
+            keep.push(graph.selector(p));
         }
         let mut snap = field_ind.shallow.call()(field_snap, args.get_ty(), args.get_const());
-        for (lo, hi) in keep {
-            snap =
-                field_ind.graft.call()(snap, args.get_ty(), args.get_const(), field_snap, lo, hi);
+        for sel in keep {
+            snap = field_ind.graft.call()(snap, args.get_ty(), args.get_const(), field_snap, sel);
         }
         Ok(snap)
     }
 
     /// `s_field` with the positions of `subquery` in `field_ty` grafted in from `t_field`;
-    /// unchanged where the subquery is empty, since grafting nothing changes nothing.
+    /// unchanged where the query does not select them.
     fn field_graft<'vir>(
         subquery: Subquery<'vir>,
         field_ty: RustTyDecomposition<'vir>,
@@ -421,8 +351,9 @@ impl IndirectPredEnc {
             if graph.lifetime(p) != subquery.lifetime {
                 continue;
             }
-            let (start, end) = subquery.in_field(graph.interval(p).0);
-            snap = graft.call()(snap, args.get_ty(), args.get_const(), t_field, start, end);
+            let sel = subquery.in_field(field_ty, &graph, p, deps)?;
+            let grafted = graft.call()(snap, args.get_ty(), args.get_const(), t_field, sel);
+            snap = subquery.if_selected(grafted, snap);
         }
         Ok(snap)
     }
@@ -497,9 +428,9 @@ impl IndirectPredEnc {
             let args = deps.require_dep::<GArgsTyEnc>(field_ty.args)?;
             let snap =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_snap, deps)?;
-            let (start, end) = subquery.guarded_in_field(graph.interval(p).0);
+            let sel = subquery.in_field(field_ty, &graph, p, deps)?;
             preds.push(vir::expr! {
-                acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], start, end))
+                acc([pred](snap, [..[args.get_ty()]], [..[args.get_const()]], sel))
             });
         }
         Ok(preds)
@@ -529,8 +460,9 @@ impl IndirectPredEnc {
             }
             let key =
                 Self::position_snap(subqueries, subquery, field_ty, &graph, p, field_pred, deps)?;
-            let (start, end) = subquery.in_field(graph.interval(p).0);
-            snap = Self::extend_from(field_ty, snap, key, start, end, deps)?;
+            let sel = subquery.in_field(field_ty, &graph, p, deps)?;
+            let extended = Self::extend_from(field_ty, snap, key, sel, deps)?;
+            snap = subquery.if_selected(extended, snap);
         }
         Ok(snap)
     }
@@ -592,9 +524,8 @@ impl IndirectPredEnc {
     /// The domain of `graft` and `shallow` of the type parameter `task_key`.
     /// Their results are values of the parameter's type, as the snapshots of
     /// its predicate are, so that they can be cast to the instantiated type.
-    /// Grafting an empty interval changes nothing, and grafting changes only
-    /// what references hold, not the shallow snapshot, as for every type whose
-    /// `graft` and `shallow` have bodies.
+    /// Grafting changes only what references hold, not the shallow snapshot,
+    /// as for every type whose `graft` and `shallow` have bodies.
     fn param_graft_shallow<'vir>(
         task_key: &RustTy<'vir>,
         graft: FunctionIdn<
@@ -604,8 +535,7 @@ impl IndirectPredEnc {
                 vir::ManyTyVal,
                 vir::ManyCSnap,
                 vir::Snap,
-                vir::Int,
-                vir::Int,
+                vir::Sel,
             ),
             vir::Snap,
         >,
@@ -614,28 +544,27 @@ impl IndirectPredEnc {
     ) -> Result<GraftShallowDecls<'vir>, EncodeFullError<'vir, Self>> {
         let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
         let snapshot = deps.require_dep::<TyPureEnc>(*task_key)?.data.snapshot;
+        let selector = deps.require_ref::<SelectorEnc>(*task_key)?;
         let typ = deps.require_dep::<ParamTypEnc>(())?.typ;
         vir::with_vcx(|vcx| {
             let s_decl = vcx.mk_local_decl("s", snapshot);
             let t_decl = vcx.mk_local_decl("t", snapshot);
-            let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
-            let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
+            let sel_decl = vcx.mk_local_decl("sel", selector.ty);
             let s: vir::ExprSnap<'vir> = vcx.mk_local_ex(s_decl);
             let t: vir::ExprSnap<'vir> = vcx.mk_local_ex(t_decl);
-            let lo = vcx.mk_local_ex(lo_decl);
-            let hi = vcx.mk_local_ex(hi_decl);
+            let sel = vcx.mk_local_ex(sel_decl);
             let (tys, consts) = (params.ty_exprs(), params.const_exprs());
             let param = tys[0];
-            let grafted = graft.call()(s, tys, consts, t, lo, hi);
+            let grafted = graft.call()(s, tys, consts, t, sel);
             let shallow_s = shallow.call()(s, tys, consts);
             let shallow_grafted = shallow.call()(grafted, tys, consts);
             let grafted_typ = vcx.mk_eq_expr(typ(grafted.downcast_ty()), param);
             let shallow_typ = vcx.mk_eq_expr(typ(shallow_s.downcast_ty()), param);
             let graft_facts = vir::expr! { vcx;
                 forall [s_decl], ..[params.ty_decls()], ..[params.const_decls()],
-                    [t_decl], [lo_decl], [hi_decl]
+                    [t_decl], [sel_decl]
                     :: { [grafted] }
-                    ([grafted_typ]) && (((hi) <= (lo)) ==> (([grafted]) == (s)))
+                    [grafted_typ]
             };
             let shallow_facts = vir::expr! { vcx;
                 forall [s_decl], ..[params.ty_decls()], ..[params.const_decls()]
@@ -644,7 +573,7 @@ impl IndirectPredEnc {
             };
             let shallow_graft = vir::expr! { vcx;
                 forall [s_decl], ..[params.ty_decls()], ..[params.const_decls()],
-                    [t_decl], [lo_decl], [hi_decl]
+                    [t_decl], [sel_decl]
                     :: { [shallow_grafted] }
                     ([shallow_grafted]) == ([shallow_s])
             };
@@ -700,28 +629,17 @@ impl TaskEncoder for IndirectPredEnc {
     ) -> EncodeFullResult<'vir, Self> {
         let pure = deps.require_dep::<TyPureEnc>(*task_key)?;
         let params = deps.require_dep::<GenericParamsEnc>(task_key.params)?;
+        let selector = deps.require_ref::<SelectorEnc>(*task_key)?;
         let ty = task_key.zip(pure);
         vir::with_vcx(|vcx| {
             let snapshot = pure.data.snapshot;
             let predicate = PredicateIdn::new(
                 vir::ViperIdent::new(vir::vir_format!(vcx, "p_{}_ind", task_key.name())),
-                (
-                    snapshot,
-                    params.ty_args(),
-                    params.const_args(),
-                    vir::TYPE_INT,
-                    vir::TYPE_INT,
-                ),
+                (snapshot, params.ty_args(), params.const_args(), selector.ty),
             );
             let extend = FunctionIdn::new(
                 vir::ViperIdent::new(vir::vir_format!(vcx, "extend_{}", task_key.name())),
-                (
-                    snapshot,
-                    params.ty_args(),
-                    params.const_args(),
-                    vir::TYPE_INT,
-                    vir::TYPE_INT,
-                ),
+                (snapshot, params.ty_args(), params.const_args(), selector.ty),
                 snapshot,
             );
             let graft = FunctionIdn::new(
@@ -731,8 +649,7 @@ impl TaskEncoder for IndirectPredEnc {
                     params.ty_args(),
                     params.const_args(),
                     snapshot,
-                    vir::TYPE_INT,
-                    vir::TYPE_INT,
+                    selector.ty,
                 ),
                 snapshot,
             );
@@ -753,8 +670,7 @@ impl TaskEncoder for IndirectPredEnc {
                         vir::TYPE_PSNAP,
                         params.ty_args(),
                         params.const_args(),
-                        vir::TYPE_INT,
-                        vir::TYPE_INT,
+                        selector.ty,
                     ),
                 )),
                 _ => None,
@@ -771,11 +687,9 @@ impl TaskEncoder for IndirectPredEnc {
             )?;
 
             let k_decl = vcx.mk_local_decl("k", snapshot);
-            let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
-            let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
+            let sel_decl = vcx.mk_local_decl("sel", selector.ty);
             let k: vir::ExprSnap<'vir> = vcx.mk_local_ex(k_decl);
-            let lo = vcx.mk_local_ex(lo_decl);
-            let hi = vcx.mk_local_ex(hi_decl);
+            let sel = vcx.mk_local_ex(sel_decl);
             // The snapshot arguments of `graft` and `shallow`.
             let s_decl = vcx.mk_local_decl("s", snapshot);
             let t_decl = vcx.mk_local_decl("t", snapshot);
@@ -786,9 +700,13 @@ impl TaskEncoder for IndirectPredEnc {
             let mut array_posts = (Vec::new(), Vec::new(), Vec::new());
             let mut element_decl = None;
 
+            let positionless = !ty.specifics.is_param()
+                && deps
+                    .require_dep::<LifetimePositionEnc>(RustTyDecomposition::identity(task_key))?
+                    .is_empty();
             let (body, extend_body, graft_body, shallow_body) = match &ty.specifics {
                 TySpecifics::StructLike(data) => {
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let subqueries = Self::subqueries(task_key, sel, deps)?;
                     let fields = data
                         .fields
                         .iter()
@@ -820,7 +738,7 @@ impl TaskEncoder for IndirectPredEnc {
                     )
                 }
                 TySpecifics::EnumLike(data) => {
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let subqueries = Self::subqueries(task_key, sel, deps)?;
                     let discr = data.data.1.snap_to_discr_snap;
                     // The variants with lifetime positions.
                     let mut variants = Vec::new();
@@ -911,7 +829,7 @@ impl TaskEncoder for IndirectPredEnc {
                     let referent = deps.require_dep::<TyUseImpureEnc>(referent_ty)?;
                     let addr = pure_data.deref_access.call()(k.downcast_ty());
                     let referent_pred = referent.ref_to_pred(vcx, addr, None);
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let subqueries = Self::subqueries(task_key, sel, deps)?;
                     // With 'a in the query, the referent's snapshot is read from the heap,
                     // otherwise it is the stored one.
                     let in_query = subqueries
@@ -964,10 +882,10 @@ impl TaskEncoder for IndirectPredEnc {
                     let metadata = pure_data.metadata_access.call()(k.downcast_ty());
                     let extend_body =
                         pure_data.prim_to_snap.call()(addr, metadata, value.downcast_ty());
-                    // The referent's positions in the interval are grafted in like a
+                    // The referent's positions in the query are grafted in like a
                     // field's: into `t`'s referent made shallow if 'a is in the
-                    // interval, into `s`'s otherwise. A position behind 'a that is not
-                    // in the interval is thus collapsed, even if `t` extended it.
+                    // query, into `s`'s otherwise. A position behind 'a that is not
+                    // in the query is thus collapsed, even if `t` extended it.
                     let s_addr = pure_data.deref_access.call()(s.downcast_ty());
                     let s_metadata = pure_data.metadata_access.call()(s.downcast_ty());
                     let s_value: vir::ExprSnap<'vir> =
@@ -1016,7 +934,7 @@ impl TaskEncoder for IndirectPredEnc {
                     let len: vir::ExprInt<'vir> = usize_prim
                         .snap_to_prim(params.const_exprs()[0])
                         .downcast_ty();
-                    let subqueries = Self::subqueries(task_key, lo, hi, deps)?;
+                    let subqueries = Self::subqueries(task_key, sel, deps)?;
                     let i_decl = vcx.mk_local_decl("i", usize_snap);
                     let i: vir::ExprCSnap<'vir> = vcx.mk_local_ex(i_decl);
                     let i_value: vir::ExprInt<'vir> = usize_prim.snap_to_prim(i).downcast_ty();
@@ -1027,8 +945,7 @@ impl TaskEncoder for IndirectPredEnc {
                             v.downcast_ty(),
                             params.ty_exprs(),
                             params.const_exprs(),
-                            lo,
-                            hi,
+                            sel,
                         )(None))
                     };
                     let forall = |trigger: vir::ExprSnap<'vir>, body: vir::ExprBool<'vir>| {
@@ -1058,8 +975,7 @@ impl TaskEncoder for IndirectPredEnc {
                             v_decl,
                             params.ty_decls(),
                             params.const_decls(),
-                            lo_decl,
-                            hi_decl,
+                            sel_decl,
                         ),
                         Some(vcx.mk_conj(&conjuncts)),
                     ));
@@ -1081,21 +997,18 @@ impl TaskEncoder for IndirectPredEnc {
                     }
                     // What `extend` reads at element `i`, through its predicate.
                     let array_pred =
-                        predicate(k, params.ty_exprs(), params.const_exprs(), lo, hi)(None);
+                        predicate(k, params.ty_exprs(), params.const_exprs(), sel)(None);
                     let element_pred = element(
                         i,
                         k_i.downcast_ty(),
                         params.ty_exprs(),
                         params.const_exprs(),
-                        lo,
-                        hi,
+                        sel,
                     )(None);
                     let extended = vcx.mk_unfolding_expr(
                         array_pred,
                         vcx.mk_unfolding_expr(element_pred, extended),
                     );
-                    let extended =
-                        vcx.mk_ternary_expr(vir::expr! { vcx; (lo) < (hi) }, extended, k_i);
                     array_posts
                         .0
                         .push(forall(result_i, vcx.mk_eq_expr(result_i, extended)));
@@ -1117,43 +1030,36 @@ impl TaskEncoder for IndirectPredEnc {
                 }
                 // A shared reference has no lifetime positions.
                 TySpecifics::ImmRef(_) => (Some(vcx.mk_bool::<true>()), Some(k), Some(s), Some(s)),
+                // Neither does any other type without lifetime or type
+                // parameters, e.g. a primitive type. Its predicate holds
+                // nothing, so that it can be folded wherever it is required.
+                _ if positionless => (Some(vcx.mk_bool::<true>()), Some(k), Some(s), Some(s)),
                 // TODO: the remaining types.
                 _ => (None, None, None, None),
             };
 
             let predicate_decl = vcx.mk_predicate(
                 predicate,
-                (
-                    k_decl,
-                    params.ty_decls(),
-                    params.const_decls(),
-                    lo_decl,
-                    hi_decl,
-                ),
+                (k_decl, params.ty_decls(), params.const_decls(), sel_decl),
                 body,
             );
 
-            // Fetching through an empty interval reads nothing and needs no predicate, so
-            // callers extend through a position's interval without checking whether the
-            // query contains it.
             let pre = vir::expr! { vcx;
-                ((lo) < (hi)) ==> (acc([predicate](
+                acc([predicate](
                     k,
                     [..[params.ty_exprs()]],
                     [..[params.const_exprs()]],
-                    lo,
-                    hi
-                )))
+                    sel
+                ))
             };
             let extend_body = extend_body.map(|extend_body| {
                 vir::expr! { vcx;
-                    ((lo) < (hi)) ? (unfolding ([predicate](
+                    unfolding ([predicate](
                         k,
                         [..[params.ty_exprs()]],
                         [..[params.const_exprs()]],
-                        lo,
-                        hi
-                    )) in (extend_body)) : (k)
+                        sel
+                    )) in (extend_body)
                 }
             });
             // At a type parameter, `extend`, `graft` and `shallow` are abstract. What
@@ -1174,8 +1080,7 @@ impl TaskEncoder for IndirectPredEnc {
             extend_posts.extend(param_typ);
             if ty.specifics.is_param() {
                 let result = vcx.mk_result(snapshot);
-                let grafted =
-                    graft.call()(k, params.ty_exprs(), params.const_exprs(), result, lo, hi);
+                let grafted = graft.call()(k, params.ty_exprs(), params.const_exprs(), result, sel);
                 extend_posts.push(vcx.mk_eq_expr(grafted, result));
                 let shallow_result =
                     shallow.call()(result, params.ty_exprs(), params.const_exprs());
@@ -1184,13 +1089,7 @@ impl TaskEncoder for IndirectPredEnc {
             }
             let extend_decl = vcx.mk_function(
                 extend,
-                (
-                    k_decl,
-                    params.ty_decls(),
-                    params.const_decls(),
-                    lo_decl,
-                    hi_decl,
-                ),
+                (k_decl, params.ty_decls(), params.const_decls(), sel_decl),
                 vcx.alloc_slice(&[pre]),
                 vcx.alloc_slice(&extend_posts),
                 None,
@@ -1207,8 +1106,7 @@ impl TaskEncoder for IndirectPredEnc {
                         params.ty_decls(),
                         params.const_decls(),
                         t_decl,
-                        lo_decl,
-                        hi_decl,
+                        sel_decl,
                     ),
                     &[],
                     vcx.alloc_slice(&array_posts.1),
@@ -1311,8 +1209,8 @@ mod verification_tests {
         }
     }
 
-    /// `&'a mut U`: position 0 is `'a`, the referent's positions are
-    /// `[1, 1 + arity(U))`.
+    /// `&'a mut U`: `'a` is `p_Ref_mutable_lft_0()`, the referent's positions
+    /// are `p_Ref_mutable_ty_0(p_Param_all())`.
     #[test]
     fn mutable_reference() {
         let src = "type X<'a, T> = &'a mut T;";
@@ -1321,52 +1219,50 @@ mod verification_tests {
             r#"
             // 'a holds the referent.
             method lifetime(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
               ensures p_Param(k.s_Ref_mutable_0, U)
             {
-              unfold p_Ref_mutable_ind(k, U, 0, 1)
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
             }
 
             // The referent's positions hold those of the referent, on the
             // snapshot stored in `k`.
             method referent_positions(k: s_Ref_mutable, U: Type)
-              requires 0 < arity(U)
-              requires p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
-              ensures p_Param_ind(k.s_Ref_mutable_2, U, 0, arity(U))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_ty_0(p_Param_all()))
+              ensures p_Param_ind(k.s_Ref_mutable_2, U, p_Param_all())
             {
-              unfold p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_ty_0(p_Param_all()))
             }
 
             // With 'a, they are on the referent's current snapshot.
             method all_positions(k: s_Ref_mutable, U: Type)
-              requires 0 < arity(U)
-              requires p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_all())
               ensures p_Param(k.s_Ref_mutable_0, U)
-              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, 0, arity(U))
+              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, p_Param_all())
             {
-              unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_all())
             }
 
             // Extending by 'a reads the referent's snapshot and keeps the address.
             method extend(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures extend_Ref_mutable(k, U, 0, 1).s_Ref_mutable_0 == k.s_Ref_mutable_0
-              ensures extend_Ref_mutable(k, U, 0, 1).s_Ref_mutable_2 ==
-                (unfolding p_Ref_mutable_ind(k, U, 0, 1) in p_Param_snap(k.s_Ref_mutable_0, U))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()).s_Ref_mutable_0 == k.s_Ref_mutable_0
+              ensures extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()).s_Ref_mutable_2 ==
+                (unfolding p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0()) in p_Param_snap(k.s_Ref_mutable_0, U))
             {
             }
 
             // Split off 'a, the referent's positions are on the snapshot
             // extended by 'a.
             method split(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
-              ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Ref_mutable_ind(extend_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_all())
+              ensures p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures p_Ref_mutable_ind(extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()), U, p_Ref_mutable_ty_0(p_Param_all()))
             {
-              unfold p_Ref_mutable_ind(k, U, 0, 1 + arity(U))
-              fold p_Ref_mutable_ind(k, U, 0, 1)
-              fold p_Ref_mutable_ind(extend_Ref_mutable(k, U, 0, 1), U, 1, 1 + arity(U))
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_all())
+              fold p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              fold p_Ref_mutable_ind(extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()), U, p_Ref_mutable_ty_0(p_Param_all()))
             }
             "#,
         );
@@ -1375,10 +1271,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_ty_0(p_Param_all()))
               ensures p_Param(k.s_Ref_mutable_0, U)
             {
-              unfold p_Ref_mutable_ind(k, U, 1, 1 + arity(U))
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_ty_0(p_Param_all()))
             }
             "#,
             "insufficient permission to access p_Param",
@@ -1388,12 +1284,11 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Ref_mutable, U: Type)
-              requires 0 < arity(U)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
               ensures p_Param(k.s_Ref_mutable_0, U)
-              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, 0, arity(U))
+              ensures p_Param_ind(p_Param_snap(k.s_Ref_mutable_0, U), U, p_Param_all())
             {
-              unfold p_Ref_mutable_ind(k, U, 0, 1)
+              unfold p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
             }
             "#,
             "insufficient permission to access p_Param_ind",
@@ -1408,10 +1303,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Ref_immutable, U: Type)
-              ensures p_Ref_immutable_ind(k, U, 0, 1)
-              ensures extend_Ref_immutable(k, U, 0, 1) == k
+              ensures p_Ref_immutable_ind(k, U, p_Ref_immutable_lft_0())
+              ensures extend_Ref_immutable(k, U, p_Ref_immutable_lft_0()) == k
             {
-              fold p_Ref_immutable_ind(k, U, 0, 1)
+              fold p_Ref_immutable_ind(k, U, p_Ref_immutable_lft_0())
             }
             "#,
         );
@@ -1419,9 +1314,9 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_Ref_immutable, U: Type)
-              requires p_Ref_immutable_ind(k, U, 0, 1)
+              requires p_Ref_immutable_ind(k, U, p_Ref_immutable_lft_0())
             {
-              unfold p_Ref_immutable_ind(k, U, 0, 1)
+              unfold p_Ref_immutable_ind(k, U, p_Ref_immutable_lft_0())
               assert false
             }
             "#,
@@ -1439,10 +1334,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S)
-              requires p_S_ind(k, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), 0, 1)
+              requires p_S_ind(k, p_S_lft_0())
+              ensures p_Ref_mutable_ind(k.s_S_1, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_S_ind(k, 0, 1)
+              unfold p_S_ind(k, p_S_lft_0())
             }
             "#,
         );
@@ -1450,18 +1345,18 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S)
-              requires p_S_ind(k, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
+              requires p_S_ind(k, p_S_lft_0())
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_S_ind(k, 0, 1)
+              unfold p_S_ind(k, p_S_lft_0())
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
         );
     }
 
-    /// A struct passes its positions on to its fields: `'a @ 0` and
-    /// `T @ [1, 1 + arity(T))`.
+    /// A struct passes its positions on to its fields: `'a` is `p_S_lft_0()`
+    /// and the positions of `T` are `p_S_ty_0(p_Param_all())`.
     #[test]
     fn struct_fields() {
         let src = "struct S<'a, T> { x: &'a mut i32, y: T }
@@ -1470,36 +1365,35 @@ mod verification_tests {
             src,
             r#"
             method lifetime(k: s_S, T: Type)
-              requires p_S_ind(k, T, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
+              requires p_S_ind(k, T, p_S_lft_0())
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_S_ind(k, T, 0, 1)
+              unfold p_S_ind(k, T, p_S_lft_0())
             }
 
             method type_param(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Param_ind(k.s_S_1, T, 0, arity(T))
+              requires p_S_ind(k, T, p_S_ty_0(p_Param_all()))
+              ensures p_Param_ind(k.s_S_1, T, p_Param_all())
             {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
+              unfold p_S_ind(k, T, p_S_ty_0(p_Param_all()))
             }
 
             method split(k: s_S, T: Type)
-              requires p_S_ind(k, T, 0, 1 + arity(T))
-              ensures p_S_ind(k, T, 0, 1) && p_S_ind(k, T, 1, 1 + arity(T))
+              requires p_S_ind(k, T, p_S_all())
+              ensures p_S_ind(k, T, p_S_lft_0()) && p_S_ind(k, T, p_S_ty_0(p_Param_all()))
             {
-              unfold p_S_ind(k, T, 0, 1 + arity(T))
-              fold p_S_ind(k, T, 0, 1)
-              fold p_S_ind(k, T, 1, 1 + arity(T))
+              unfold p_S_ind(k, T, p_S_all())
+              fold p_S_ind(k, T, p_S_lft_0())
+              fold p_S_ind(k, T, p_S_ty_0(p_Param_all()))
             }
 
             method merge(k: s_S, T: Type)
-              requires p_S_ind(k, T, 0, 1) && p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_S_ind(k, T, 0, 1 + arity(T))
+              requires p_S_ind(k, T, p_S_lft_0()) && p_S_ind(k, T, p_S_ty_0(p_Param_all()))
+              ensures p_S_ind(k, T, p_S_all())
             {
-              unfold p_S_ind(k, T, 0, 1)
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
-              fold p_S_ind(k, T, 0, 1 + arity(T))
+              unfold p_S_ind(k, T, p_S_lft_0())
+              unfold p_S_ind(k, T, p_S_ty_0(p_Param_all()))
+              fold p_S_ind(k, T, p_S_all())
             }
             "#,
         );
@@ -1508,10 +1402,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S, T: Type)
-              requires p_S_ind(k, T, 1, 1 + arity(T))
-              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), 0, 1)
+              requires p_S_ind(k, T, p_S_ty_0(p_Param_all()))
+              ensures p_Ref_mutable_ind(k.s_S_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_S_ind(k, T, 1, 1 + arity(T))
+              unfold p_S_ind(k, T, p_S_ty_0(p_Param_all()))
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
@@ -1521,11 +1415,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S, T: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, 0, 1)
-              ensures p_Param_ind(k.s_S_1, T, 0, arity(T))
+              requires p_S_ind(k, T, p_S_lft_0())
+              ensures p_Param_ind(k.s_S_1, T, p_Param_all())
             {
-              unfold p_S_ind(k, T, 0, 1)
+              unfold p_S_ind(k, T, p_S_lft_0())
             }
             "#,
             "insufficient permission to access p_Param_ind",
@@ -1540,22 +1433,21 @@ mod verification_tests {
             src,
             r#"
             method elements(k: s_2_Tuple, T: Type, U: Type)
-              requires 0 < arity(T) && 0 < arity(U)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              ensures p_Param_ind(k.s_2_Tuple_0, T, 0, arity(T))
-              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
+              requires p_2_Tuple_ind(k, T, U, p_2_Tuple_all())
+              ensures p_Param_ind(k.s_2_Tuple_0, T, p_Param_all())
+              ensures p_Param_ind(k.s_2_Tuple_1, U, p_Param_all())
             {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
+              unfold p_2_Tuple_ind(k, T, U, p_2_Tuple_all())
             }
 
             method split(k: s_2_Tuple, T: Type, U: Type)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              ensures p_2_Tuple_ind(k, T, U, 0, arity(T))
-              ensures p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
+              requires p_2_Tuple_ind(k, T, U, p_2_Tuple_all())
+              ensures p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_0(p_Param_all()))
+              ensures p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_1(p_Param_all()))
             {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T) + arity(U))
-              fold p_2_Tuple_ind(k, T, U, 0, arity(T))
-              fold p_2_Tuple_ind(k, T, U, arity(T), arity(T) + arity(U))
+              unfold p_2_Tuple_ind(k, T, U, p_2_Tuple_all())
+              fold p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_0(p_Param_all()))
+              fold p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_1(p_Param_all()))
             }
             "#,
         );
@@ -1564,11 +1456,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_2_Tuple, T: Type, U: Type)
-              requires 0 < arity(U)
-              requires p_2_Tuple_ind(k, T, U, 0, arity(T))
-              ensures p_Param_ind(k.s_2_Tuple_1, U, 0, arity(U))
+              requires p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_0(p_Param_all()))
+              ensures p_Param_ind(k.s_2_Tuple_1, U, p_Param_all())
             {
-              unfold p_2_Tuple_ind(k, T, U, 0, arity(T))
+              unfold p_2_Tuple_ind(k, T, U, p_2_Tuple_ty_0(p_Param_all()))
             }
             "#,
             "insufficient permission to access p_Param_ind",
@@ -1586,10 +1477,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S)
-              requires p_S_ind(k, 0, 1)
-              ensures p_Three_ind(k.s_S_0, 0, 1) && p_Three_ind(k.s_S_0, 2, 3)
+              requires p_S_ind(k, p_S_lft_0())
+              ensures p_Three_ind(k.s_S_0, p_Three_lft_0()) && p_Three_ind(k.s_S_0, p_Three_lft_2())
             {
-              unfold p_S_ind(k, 0, 1)
+              unfold p_S_ind(k, p_S_lft_0())
             }
             "#,
         );
@@ -1598,10 +1489,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S)
-              requires p_S_ind(k, 0, 1)
-              ensures p_Three_ind(k.s_S_0, 1, 2)
+              requires p_S_ind(k, p_S_lft_0())
+              ensures p_Three_ind(k.s_S_0, p_Three_lft_1())
             {
-              unfold p_S_ind(k, 0, 1)
+              unfold p_S_ind(k, p_S_lft_0())
             }
             "#,
             "insufficient permission to access p_Three_ind",
@@ -1617,14 +1508,13 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S, T: Type, U: Type)
-              requires 0 < arity(T)
-              requires p_S_ind(k, T, U, 0, arity(T))
-              ensures p_Param_ind(k.s_S_0.s_3_Tuple_0, T, 0, arity(T))
-              ensures p_Param_ind(k.s_S_0.s_3_Tuple_2, T, 0, arity(T))
+              requires p_S_ind(k, T, U, p_S_ty_0(p_Param_all()))
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_0, T, p_Param_all())
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_2, T, p_Param_all())
             {
-              unfold p_S_ind(k, T, U, 0, arity(T))
-              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, 0, arity(T))
-              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, arity(T) + arity(U), 2 * arity(T) + arity(U))
+              unfold p_S_ind(k, T, U, p_S_ty_0(p_Param_all()))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, p_3_Tuple_ty_0(p_Param_all()))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, p_3_Tuple_ty_2(p_Param_all()))
             }
             "#,
         );
@@ -1633,13 +1523,12 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_S, T: Type, U: Type)
-              requires 0 < arity(T) && 0 < arity(U)
-              requires p_S_ind(k, T, U, 0, arity(T))
-              ensures p_Param_ind(k.s_S_0.s_3_Tuple_1, U, 0, arity(U))
+              requires p_S_ind(k, T, U, p_S_ty_0(p_Param_all()))
+              ensures p_Param_ind(k.s_S_0.s_3_Tuple_1, U, p_Param_all())
             {
-              unfold p_S_ind(k, T, U, 0, arity(T))
-              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, 0, arity(T))
-              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, arity(T) + arity(U), 2 * arity(T) + arity(U))
+              unfold p_S_ind(k, T, U, p_S_ty_0(p_Param_all()))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, p_3_Tuple_ty_0(p_Param_all()))
+              unfold p_3_Tuple_ind(k.s_S_0, T, U, T, p_3_Tuple_ty_2(p_Param_all()))
             }
             "#,
             "insufficient permission to access p_Param_ind",
@@ -1656,12 +1545,12 @@ mod verification_tests {
             src,
             r#"
             method split(k: s_S)
-              requires p_S_ind(k, 0, 2)
-              ensures p_S_ind(k, 0, 1) && p_S_ind(extend_S(k, 0, 1), 1, 2)
+              requires p_S_ind(k, p_S_all())
+              ensures p_S_ind(k, p_S_lft_0()) && p_S_ind(extend_S(k, p_S_lft_0()), p_S_lft_1())
             {
-              unfold p_S_ind(k, 0, 2)
-              fold p_S_ind(k, 0, 1)
-              fold p_S_ind(extend_S(k, 0, 1), 1, 2)
+              unfold p_S_ind(k, p_S_all())
+              fold p_S_ind(k, p_S_lft_0())
+              fold p_S_ind(extend_S(k, p_S_lft_0()), p_S_lft_1())
             }
             "#,
         );
@@ -1670,12 +1559,12 @@ mod verification_tests {
             src,
             r#"
             method split(k: s_S)
-              requires p_S_ind(k, 0, 2)
-              ensures p_S_ind(k, 0, 1) && p_S_ind(k, 1, 2)
+              requires p_S_ind(k, p_S_all())
+              ensures p_S_ind(k, p_S_lft_0()) && p_S_ind(k, p_S_lft_1())
             {
-              unfold p_S_ind(k, 0, 2)
-              fold p_S_ind(k, 0, 1)
-              fold p_S_ind(k, 1, 2)
+              unfold p_S_ind(k, p_S_all())
+              fold p_S_ind(k, p_S_lft_0())
+              fold p_S_ind(k, p_S_lft_1())
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
@@ -1692,13 +1581,13 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_N)
-              requires p_N_ind(k, 0, 2)
+              requires p_N_ind(k, p_N_all())
             {
-              var all: s_N := extend_N(k, 0, 2)
-              unfold p_N_ind(k, 0, 2)
-              fold p_N_ind(k, 1, 2)
-              fold p_N_ind(extend_N(k, 1, 2), 0, 1)
-              assert all == extend_N(extend_N(k, 1, 2), 0, 1)
+              var all: s_N := extend_N(k, p_N_all())
+              unfold p_N_ind(k, p_N_all())
+              fold p_N_ind(k, p_N_lft_1())
+              fold p_N_ind(extend_N(k, p_N_lft_1()), p_N_lft_0())
+              assert all == extend_N(extend_N(k, p_N_lft_1()), p_N_lft_0())
             }
             "#,
         );
@@ -1706,12 +1595,12 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_N)
-              requires p_N_ind(k, 0, 2)
+              requires p_N_ind(k, p_N_all())
             {
-              var all: s_N := extend_N(k, 0, 2)
-              unfold p_N_ind(k, 0, 2)
-              fold p_N_ind(k, 1, 2)
-              fold p_N_ind(extend_N(k, 1, 2), 0, 1)
+              var all: s_N := extend_N(k, p_N_all())
+              unfold p_N_ind(k, p_N_all())
+              fold p_N_ind(k, p_N_lft_1())
+              fold p_N_ind(extend_N(k, p_N_lft_1()), p_N_lft_0())
               assert false
             }
             "#,
@@ -1728,12 +1617,14 @@ mod verification_tests {
         assert_verifies(
             src,
             r#"
+            // The position of the inner 'a in the field.
+            define RB p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))
             method test(k: s_E)
-              requires p_E_ind(k, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-              ensures p_Ref_mutable_ind(extend_Ref_mutable(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+              requires p_E_ind(k, p_E_lft_0())
+              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())
+              ensures p_Ref_mutable_ind(extend_Ref_mutable(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), RB)
             {
-              unfold p_E_ind(k, 0, 1)
+              unfold p_E_ind(k, p_E_lft_0())
             }
             "#,
         );
@@ -1741,11 +1632,13 @@ mod verification_tests {
         assert_fails(
             src,
             r#"
+            // The position of the inner 'a in the field.
+            define RB p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))
             method test(k: s_E)
-              requires p_E_ind(k, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+              requires p_E_ind(k, p_E_lft_0())
+              ensures p_Ref_mutable_ind(k.s_E_0, s_Ref_mutable_type(s_Int_i32_type()), RB)
             {
-              unfold p_E_ind(k, 0, 1)
+              unfold p_E_ind(k, p_E_lft_0())
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
@@ -1753,7 +1646,7 @@ mod verification_tests {
     }
 
     /// An enum passes its positions on to the fields of the variant it is
-    /// in: `'a @ 0` to variant `A`, `T @ [1, 1 + arity(T))` to variant `B`.
+    /// in: `'a` to variant `A`, the positions of `T` to variant `B`.
     #[test]
     fn enum_variants() {
         let src = "enum E<'a, T> { A(&'a mut i32), B(T), C }
@@ -1762,43 +1655,42 @@ mod verification_tests {
             src,
             r#"
             method variant_a(k: s_E, T: Type)
-              requires p_E_ind(k, T, 0, 1) && k.iss_E_0_cons
-              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+              requires p_E_ind(k, T, p_E_lft_0()) && k.iss_E_0_cons
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_E_ind(k, T, 0, 1)
+              unfold p_E_ind(k, T, p_E_lft_0())
             }
 
             method variant_b(k: s_E, T: Type)
-              requires 0 < arity(T)
-              requires p_E_ind(k, T, 1, 1 + arity(T)) && k.iss_E_1_cons
-              ensures p_Param_ind(k.s_E_1_0, T, 0, arity(T))
+              requires p_E_ind(k, T, p_E_ty_0(p_Param_all())) && k.iss_E_1_cons
+              ensures p_Param_ind(k.s_E_1_0, T, p_Param_all())
             {
-              unfold p_E_ind(k, T, 1, 1 + arity(T))
+              unfold p_E_ind(k, T, p_E_ty_0(p_Param_all()))
             }
 
             // Variant `C` holds nothing.
             method variant_c(k: s_E, T: Type)
               requires k.iss_E_2_cons
-              ensures p_E_ind(k, T, 0, 1 + arity(T))
+              ensures p_E_ind(k, T, p_E_all())
             {
-              fold p_E_ind(k, T, 0, 1 + arity(T))
+              fold p_E_ind(k, T, p_E_all())
             }
 
             // Extending keeps the variant.
             method extend(k: s_E, T: Type)
-              requires p_E_ind(k, T, 0, 1)
-              ensures p_E_ind(k, T, 0, 1)
-              ensures s_E_discr(extend_E(k, T, 0, 1)) == s_E_discr(k)
+              requires p_E_ind(k, T, p_E_lft_0())
+              ensures p_E_ind(k, T, p_E_lft_0())
+              ensures s_E_discr(extend_E(k, T, p_E_lft_0())) == s_E_discr(k)
             {
             }
 
             method split(k: s_E, T: Type)
-              requires p_E_ind(k, T, 0, 1 + arity(T))
-              ensures p_E_ind(k, T, 0, 1) && p_E_ind(k, T, 1, 1 + arity(T))
+              requires p_E_ind(k, T, p_E_all())
+              ensures p_E_ind(k, T, p_E_lft_0()) && p_E_ind(k, T, p_E_ty_0(p_Param_all()))
             {
-              unfold p_E_ind(k, T, 0, 1 + arity(T))
-              fold p_E_ind(k, T, 0, 1)
-              fold p_E_ind(k, T, 1, 1 + arity(T))
+              unfold p_E_ind(k, T, p_E_all())
+              fold p_E_ind(k, T, p_E_lft_0())
+              fold p_E_ind(k, T, p_E_ty_0(p_Param_all()))
             }
             "#,
         );
@@ -1807,10 +1699,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_E, T: Type)
-              requires p_E_ind(k, T, 0, 1)
-              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+              requires p_E_ind(k, T, p_E_lft_0())
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_E_ind(k, T, 0, 1)
+              unfold p_E_ind(k, T, p_E_lft_0())
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
@@ -1820,10 +1712,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_E, T: Type)
-              requires p_E_ind(k, T, 0, 1) && k.iss_E_1_cons
-              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), 0, 1)
+              requires p_E_ind(k, T, p_E_lft_0()) && k.iss_E_1_cons
+              ensures p_Ref_mutable_ind(k.s_E_0_0, s_Int_i32_type(), p_Ref_mutable_lft_0())
             {
-              unfold p_E_ind(k, T, 0, 1)
+              unfold p_E_ind(k, T, p_E_lft_0())
             }
             "#,
             "insufficient permission to access p_Ref_mutable_ind",
@@ -1838,48 +1730,50 @@ mod verification_tests {
         let result = verify_with_casts(
             src,
             r#"
+            // The position of 'a in `Option<&'a mut U>`.
+            define OPT_A p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))
             // The snapshot of the field of `Some` is that of a reference
             // once its type is known.
             method unfold_option(k: s_Option, U: Type)
-              requires p_Option_ind(k, s_Ref_mutable_type(U), 0, 1) && k.iss_Option_1_cons
+              requires p_Option_ind(k, s_Ref_mutable_type(U), OPT_A) && k.iss_Option_1_cons
               requires s_Param_typ(k.s_Option_1_0) == s_Ref_mutable_type(U)
               ensures p_Param(k.s_Option_1_0.make_concrete_s_Ref_mutable.s_Ref_mutable_0, U)
             {
-              unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
-              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
-              unfold p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+              unfold p_Option_ind(k, s_Ref_mutable_type(U), OPT_A)
+              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, p_Ref_mutable_lft_0())
+              unfold p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, p_Ref_mutable_lft_0())
             }
 
             // Making a snapshot shallow is the same on both sides of a cast.
             method shallow(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
             {
-              make_generic_ind_Ref_mutable(k, U, 0, 1)
+              make_generic_ind_Ref_mutable(k, U, p_Ref_mutable_lft_0())
               assert shallow_Param(make_generic_s_Ref_mutable(k, U), s_Ref_mutable_type(U)) ==
                 make_generic_s_Ref_mutable(shallow_Ref_mutable(k, U), U)
             }
 
             // Casting back and forth keeps what extending reads.
             method round_trip(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures extend_Ref_mutable(k, U, 0, 1) == old(extend_Ref_mutable(k, U, 0, 1))
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()) == old(extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()))
             {
-              make_generic_ind_Ref_mutable(k, U, 0, 1)
-              make_concrete_ind_Ref_mutable(k, U, 0, 1)
+              make_generic_ind_Ref_mutable(k, U, p_Ref_mutable_lft_0())
+              make_concrete_ind_Ref_mutable(k, U, p_Ref_mutable_lft_0())
             }
 
             // What extending the option reads is what extending the reference reads.
             method extend_option(k: s_Option, U: Type)
-              requires p_Option_ind(k, s_Ref_mutable_type(U), 0, 1) && k.iss_Option_1_cons
+              requires p_Option_ind(k, s_Ref_mutable_type(U), OPT_A) && k.iss_Option_1_cons
               requires s_Param_typ(k.s_Option_1_0) == s_Ref_mutable_type(U)
-              ensures p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
-              ensures old(extend_Option(k, s_Ref_mutable_type(U), 0, 1)).s_Option_1_0 ==
+              ensures p_Ref_mutable_ind(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, p_Ref_mutable_lft_0())
+              ensures old(extend_Option(k, s_Ref_mutable_type(U), OPT_A)).s_Option_1_0 ==
                 make_generic_s_Ref_mutable(extend_Ref_mutable(
-                  k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1), U)
+                  k.s_Option_1_0.make_concrete_s_Ref_mutable, U, p_Ref_mutable_lft_0()), U)
             {
-              unfold p_Option_ind(k, s_Ref_mutable_type(U), 0, 1)
-              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, 0, 1)
+              unfold p_Option_ind(k, s_Ref_mutable_type(U), OPT_A)
+              make_concrete_ind_Ref_mutable(k.s_Option_1_0.make_concrete_s_Ref_mutable, U, p_Ref_mutable_lft_0())
             }
             "#,
         );
@@ -1890,11 +1784,13 @@ mod verification_tests {
         let result = verify_with_casts(
             src,
             r#"
+            // The position of 'a in `Option<&'a mut U>`.
+            define OPT_A p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))
             method test(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
             {
-              make_generic_ind_Ref_mutable(k, U, 0, 1)
-              make_concrete_ind_Ref_mutable(k, U, 0, 1)
+              make_generic_ind_Ref_mutable(k, U, p_Ref_mutable_lft_0())
+              make_concrete_ind_Ref_mutable(k, U, p_Ref_mutable_lft_0())
               assert false
             }
             "#,
@@ -1919,11 +1815,11 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_B)
-              requires p_B_ind(k, 0, 1)
-              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
-              ensures p_A_ind(shallow_A(k.s_B_0), 1, 2)
+              requires p_B_ind(k, p_B_lft_0())
+              requires p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
+              ensures p_A_ind(shallow_A(k.s_B_0), p_A_lft_1())
             {
-              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
             }
             "#,
         );
@@ -1931,10 +1827,10 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_B)
-              requires p_B_ind(k, 0, 1)
-              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
+              requires p_B_ind(k, p_B_lft_0())
+              requires p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
             {
-              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
               assert false
             }
             "#,
@@ -1945,11 +1841,11 @@ mod verification_tests {
             src,
             r#"
             method test(k: s_B)
-              requires p_B_ind(k, 0, 1)
-              requires p_B_ind(extend_B(k, 0, 1), 1, 2)
-              ensures p_A_ind(k.s_B_0, 1, 2)
+              requires p_B_ind(k, p_B_lft_0())
+              requires p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
+              ensures p_A_ind(k.s_B_0, p_A_lft_1())
             {
-              unfold p_B_ind(extend_B(k, 0, 1), 1, 2)
+              unfold p_B_ind(extend_B(k, p_B_lft_0()), p_B_lft_1())
             }
             "#,
             "insufficient permission to access p_A_ind",
@@ -1974,10 +1870,10 @@ mod verification_tests {
             r#"
             method test(k: s_Outer)
               requires shallow_Outer(k) == k
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
-              ensures p_List_ind(k.s_Outer_0, 1, 2)
+              requires p_Outer_ind(k, p_Outer_lft_0()) && p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
+              ensures p_List_ind(k.s_Outer_0, p_List_lft_1())
             {
-              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
             }
             "#,
         );
@@ -1986,9 +1882,9 @@ mod verification_tests {
             r#"
             method test(k: s_Outer)
               requires shallow_Outer(k) == k
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              requires p_Outer_ind(k, p_Outer_lft_0()) && p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
             {
-              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
               assert false
             }
             "#,
@@ -2012,18 +1908,21 @@ mod verification_tests {
         let result = verify_with_casts(
             src,
             r#"
+            // The position of 'b in `Box<List<'a, 'b>>` and in `Option<Box<List<'a, 'b>>>`.
+            define BOX_B p_Box_ty_0(p_Param_List(p_List_lft_1()))
+            define OPT_B p_Option_ty_0(p_Param_Box(BOX_B))
             method test(k: s_Outer, b: s_Box)
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              requires p_Outer_ind(k, p_Outer_lft_0()) && p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
               requires k.s_Outer_0.s_List_2 ==
                 s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
-              ensures p_Box_ind(shallow_Box(b, s_List_type(), s_Global_type()), s_List_type(), s_Global_type(), 1, 2)
+              ensures p_Box_ind(shallow_Box(b, s_List_type(), s_Global_type()), s_List_type(), s_Global_type(), BOX_B)
             {
-              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
-              unfold p_List_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0), 1, 2)
-              unfold p_Option_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0).s_List_2,
-                s_Box_type(s_List_type(), s_Global_type()), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
+              unfold p_List_ind(shallow_List(extend_Outer(k, p_Outer_lft_0()).s_Outer_0), p_List_lft_1())
+              unfold p_Option_ind(shallow_List(extend_Outer(k, p_Outer_lft_0()).s_Outer_0).s_List_2,
+                s_Box_type(s_List_type(), s_Global_type()), OPT_B)
               make_concrete_ind_Box(shallow_Box(b, s_List_type(), s_Global_type()),
-                s_List_type(), s_Global_type(), 1, 2)
+                s_List_type(), s_Global_type(), BOX_B)
             }
             "#,
         );
@@ -2033,17 +1932,20 @@ mod verification_tests {
         let result = verify_with_casts(
             src,
             r#"
+            // The position of 'b in `Box<List<'a, 'b>>` and in `Option<Box<List<'a, 'b>>>`.
+            define BOX_B p_Box_ty_0(p_Param_List(p_List_lft_1()))
+            define OPT_B p_Option_ty_0(p_Param_Box(BOX_B))
             method test(k: s_Outer, b: s_Box)
-              requires p_Outer_ind(k, 0, 1) && p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
+              requires p_Outer_ind(k, p_Outer_lft_0()) && p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
               requires k.s_Outer_0.s_List_2 ==
                 s_Option_1_cons(make_generic_s_Box(b, s_List_type(), s_Global_type()))
             {
-              unfold p_Outer_ind(extend_Outer(k, 0, 1), 1, 2)
-              unfold p_List_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0), 1, 2)
-              unfold p_Option_ind(shallow_List(extend_Outer(k, 0, 1).s_Outer_0).s_List_2,
-                s_Box_type(s_List_type(), s_Global_type()), 1, 2)
+              unfold p_Outer_ind(extend_Outer(k, p_Outer_lft_0()), p_Outer_lft_1())
+              unfold p_List_ind(shallow_List(extend_Outer(k, p_Outer_lft_0()).s_Outer_0), p_List_lft_1())
+              unfold p_Option_ind(shallow_List(extend_Outer(k, p_Outer_lft_0()).s_Outer_0).s_List_2,
+                s_Box_type(s_List_type(), s_Global_type()), OPT_B)
               make_concrete_ind_Box(shallow_Box(b, s_List_type(), s_Global_type()),
-                s_List_type(), s_Global_type(), 1, 2)
+                s_List_type(), s_Global_type(), BOX_B)
               assert false
             }
             "#,
@@ -2067,8 +1969,8 @@ mod verification_tests {
                    type X<'x, 'y, 'z> = C<'x, 'y, 'z>;";
         let keys = r#"
             // The keys of 'y and 'z: `k` extended by their ancestors.
-            define KY(k) extend_C(k, 0, 1)
-            define KZ(k) extend_C(KY(k), 1, 2)
+            define KY(k) extend_C(k, p_C_lft_0())
+            define KZ(k) extend_C(KY(k), p_C_lft_1())
             "#;
         assert_verifies(
             src,
@@ -2076,13 +1978,13 @@ mod verification_tests {
                 "{keys}{}",
                 r#"
             method test(k: s_C)
-              requires p_C_ind(k, 0, 1) && p_C_ind(KY(k), 1, 2) && p_C_ind(KZ(k), 2, 3)
-              ensures p_C_ind(k, 0, 1)
-              ensures p_F_ind(KY(k).s_C_0, 1, 2) && p_F_ind(KY(k).s_C_0, 2, 3)
+              requires p_C_ind(k, p_C_lft_0()) && p_C_ind(KY(k), p_C_lft_1()) && p_C_ind(KZ(k), p_C_lft_2())
+              ensures p_C_ind(k, p_C_lft_0())
+              ensures p_F_ind(KY(k).s_C_0, p_F_lft_1()) && p_F_ind(KY(k).s_C_0, p_F_lft_2())
             {
               // 'z first: its key reads through the predicate of 'y.
-              unfold p_C_ind(KZ(k), 2, 3)
-              unfold p_C_ind(KY(k), 1, 2)
+              unfold p_C_ind(KZ(k), p_C_lft_2())
+              unfold p_C_ind(KY(k), p_C_lft_1())
             }
             "#
             ),
@@ -2093,10 +1995,10 @@ mod verification_tests {
                 "{keys}{}",
                 r#"
             method test(k: s_C)
-              requires p_C_ind(k, 0, 1) && p_C_ind(KY(k), 1, 2) && p_C_ind(KZ(k), 2, 3)
+              requires p_C_ind(k, p_C_lft_0()) && p_C_ind(KY(k), p_C_lft_1()) && p_C_ind(KZ(k), p_C_lft_2())
             {
-              unfold p_C_ind(KZ(k), 2, 3)
-              unfold p_C_ind(KY(k), 1, 2)
+              unfold p_C_ind(KZ(k), p_C_lft_2())
+              unfold p_C_ind(KY(k), p_C_lft_1())
               assert false
             }
             "#
@@ -2107,9 +2009,9 @@ mod verification_tests {
 
     /// 'l encloses `T` in `D` but not in the tuple, so `D` resets the tuple's
     /// 'l, but leaves all positions of `T` as its key has them: `D` does not
-    /// know which of them enclose the interval, the instantiation does. With
+    /// know which of them enclose the query `q`, the instantiation does. With
     /// `T = S<'a, 'b, 'c>`, where 'b and 'c enclose 'a, the key of 'a is
-    /// extended by 'b and 'c, which come after 'a.
+    /// extended by 'b and 'c.
     #[test]
     fn type_param_field_with_fewer_enclosing_positions() {
         let src = "struct D<'l, T> { c: &'l mut T, d: (&'l mut i32, T) }
@@ -2117,19 +2019,18 @@ mod verification_tests {
         let tuple = r#"
             define R s_Ref_mutable_type(s_Int_i32_type())
             define KEEP_T(k, T) graft_2_Tuple(shallow_2_Tuple(k.s_D_1, R, T), R, T,
-              k.s_D_1, 1, 1 + arity(T))
+              k.s_D_1, p_2_Tuple_ty_1(p_Param_all()))
             "#;
         assert_verifies(
             src,
             &format!(
                 "{tuple}{}",
                 r#"
-            method test(k: s_D, T: Type)
-              requires 1 <= arity(T)
-              requires p_D_ind(k, T, 1, 2)
-              ensures p_2_Tuple_ind(KEEP_T(k, T), R, T, 1, 2)
+            method test(k: s_D, T: Type, q: p_Param_lft_index)
+              requires p_D_ind(k, T, p_D_ty_0(q))
+              ensures p_2_Tuple_ind(KEEP_T(k, T), R, T, p_2_Tuple_ty_1(q))
             {
-              unfold p_D_ind(k, T, 1, 2)
+              unfold p_D_ind(k, T, p_D_ty_0(q))
             }
             "#
             ),
@@ -2139,11 +2040,10 @@ mod verification_tests {
             &format!(
                 "{tuple}{}",
                 r#"
-            method test(k: s_D, T: Type)
-              requires 1 <= arity(T)
-              requires p_D_ind(k, T, 1, 2)
+            method test(k: s_D, T: Type, q: p_Param_lft_index)
+              requires p_D_ind(k, T, p_D_ty_0(q))
             {
-              unfold p_D_ind(k, T, 1, 2)
+              unfold p_D_ind(k, T, p_D_ty_0(q))
               assert false
             }
             "#
@@ -2167,9 +2067,9 @@ mod verification_tests {
             }
 
             method extended(k: s_Ref_mutable, U: Type)
-              requires p_Ref_mutable_ind(k, U, 0, 1)
-              ensures p_Ref_mutable_ind(k, U, 0, 1)
-              ensures shallow_Ref_mutable(extend_Ref_mutable(k, U, 0, 1), U) == shallow_Ref_mutable(k, U)
+              requires p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures p_Ref_mutable_ind(k, U, p_Ref_mutable_lft_0())
+              ensures shallow_Ref_mutable(extend_Ref_mutable(k, U, p_Ref_mutable_lft_0()), U) == shallow_Ref_mutable(k, U)
             {
             }
             "#,
@@ -2184,45 +2084,6 @@ mod verification_tests {
             }
             "#,
             "Postcondition of test might not hold",
-        );
-    }
-
-    #[test]
-    fn graft_empty_interval() {
-        let src = "struct S<'a, 'b, T>(&'a mut &'b mut i32, Option<&'a mut T>);
-                   type X<'a, 'b, T> = S<'a, 'b, T>;";
-        assert_verifies(
-            src,
-            r#"
-            method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
-              requires hi <= lo
-              ensures graft_S(s, T, t, lo, hi) == s
-            {
-            }
-            "#,
-        );
-        // Plugging a position may change the snapshot.
-        assert_fails(
-            src,
-            r#"
-            method test(s: s_S, t: s_S, T: Type)
-              ensures graft_S(s, T, t, 0, 1) == s
-            {
-            }
-            "#,
-            "Postcondition of test might not hold",
-        );
-        assert_fails(
-            src,
-            r#"
-            method test(s: s_S, t: s_S, T: Type, lo: Int, hi: Int)
-              requires hi <= lo
-            {
-              assert graft_S(s, T, t, lo, hi) == s
-              assert false
-            }
-            "#,
-            "Assert might fail",
         );
     }
 }

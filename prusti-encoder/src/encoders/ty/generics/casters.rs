@@ -6,8 +6,8 @@ use vir::{CallableIdn, FunctionIdn, MethodIdn};
 use crate::encoders::{
     Impure, Pure, Purity,
     ty::{
-        RustTy, impure::TyImpureEnc, indirect_pred::IndirectPredEnc,
-        lifted::ty_constructor::TyConstructorEnc, pure::TyPureEnc,
+        RustTy, generics::selector::SelectorEnc, impure::TyImpureEnc,
+        indirect_pred::IndirectPredEnc, lifted::ty_constructor::TyConstructorEnc, pure::TyPureEnc,
     },
 };
 
@@ -425,24 +425,16 @@ impl TaskEncoder for CastersEnc<Impure> {
     }
 }
 
-/// The casts between `p_X_ind(k, ts.., lo, hi)` and
-/// `p_Param_ind(make_generic_s_X(k, ts..), X_type(ts..), lo, hi)`.
+/// The casts between `p_X_ind(k, ts.., sel)` and
+/// `p_Param_ind(make_generic_s_X(k, ts..), X_type(ts..), make_generic_sel_X(sel))`.
 #[derive(Debug, Clone, Copy)]
 pub struct IndirectCasters<'vir> {
     pub make_generic: IndirectCastIdn<'vir>,
     pub make_concrete: IndirectCastIdn<'vir>,
 }
 
-pub type IndirectCastIdn<'vir> = MethodIdn<
-    'vir,
-    (
-        vir::Snap,
-        vir::ManyTyVal,
-        vir::ManyCSnap,
-        vir::Int,
-        vir::Int,
-    ),
->;
+pub type IndirectCastIdn<'vir> =
+    MethodIdn<'vir, (vir::Snap, vir::ManyTyVal, vir::ManyCSnap, vir::Sel)>;
 
 impl<'vir> task_encoder::OutputRefAny for IndirectCasters<'vir> {}
 
@@ -474,12 +466,13 @@ impl TaskEncoder for IndirectCastersEnc {
             let base_name = concrete.name();
             let generics = deps.require_dep::<GenericParamsEnc>(concrete.params)?;
             let snapshot = deps.require_ref::<TyPureEnc>(concrete)?.snapshot;
+            let selector = deps.require_ref::<SelectorEnc>(*concrete)?;
+            let sel_casts = selector.casts.unwrap();
             let args = (
                 snapshot,
                 generics.ty_args(),
                 generics.const_args(),
-                vir::TYPE_INT,
-                vir::TYPE_INT,
+                selector.ty,
             );
             let make_generic_ident = MethodIdn::new(
                 vir::vir_format_identifier!(vcx, "make_generic_ind_{base_name}"),
@@ -501,17 +494,17 @@ impl TaskEncoder for IndirectCastersEnc {
             let ty_constructor = deps.require_ref::<TyConstructorEnc>(concrete)?;
             let concrete_ind = deps.require_ref::<IndirectPredEnc>(*concrete)?;
             let param_ind = deps.require_ref::<IndirectPredEnc>(*param)?;
+            let param_selector = deps.require_ref::<SelectorEnc>(*param)?;
 
             let k_decl = vcx.mk_local_decl("k", snapshot);
             let s_decl = vcx.mk_local_decl("s", snapshot);
             let t_decl = vcx.mk_local_decl("t", snapshot);
-            let lo_decl = vcx.mk_local_decl("lo", vir::TYPE_INT);
-            let hi_decl = vcx.mk_local_decl("hi", vir::TYPE_INT);
+            let sel_decl = vcx.mk_local_decl("sel", selector.ty);
             let k: vir::ExprSnap<'vir> = vcx.mk_local_ex(k_decl);
             let s: vir::ExprSnap<'vir> = vcx.mk_local_ex(s_decl);
             let t: vir::ExprSnap<'vir> = vcx.mk_local_ex(t_decl);
-            let lo = vcx.mk_local_ex(lo_decl);
-            let hi = vcx.mk_local_ex(hi_decl);
+            let sel = vcx.mk_local_ex(sel_decl);
+            let generic_sel = (sel_casts.make_generic)(sel);
             let tys = generics.ty_exprs();
             let consts = generics.const_exprs();
             let ty = (ty_constructor.ty_constructor)(tys, consts);
@@ -520,22 +513,15 @@ impl TaskEncoder for IndirectCastersEnc {
             };
 
             let concrete_pred = vir::expr! { vcx;
-                acc([concrete_ind.predicate](k, [..[tys]], [..[consts]], lo, hi))
+                acc([concrete_ind.predicate](k, [..[tys]], [..[consts]], sel))
             };
             let generic_k = generic(k);
             let no_consts: &[vir::ExprCSnap<'vir>] = &[];
-            // A container holds the predicate of a field of generic type only for a non-empty
-            // interval. For an empty one the concrete predicate holds nothing, since every
-            // conjunct of its body is guarded by a non-empty interval.
             let generic_pred = vir::expr! { vcx;
-                acc([param_ind.predicate](generic_k, [..[&[ty]]], [..[no_consts]], lo, hi))
+                acc([param_ind.predicate](generic_k, [..[&[ty]]], [..[no_consts]], generic_sel))
             };
-            let generic_pred = vir::expr! { vcx; ((lo) < (hi)) ==> (generic_pred) };
-            // Likewise, the concrete predicate over an empty interval is not
-            // held, as its interval may come from a type parameter's.
-            let concrete_pred = vir::expr! { vcx; ((lo) < (hi)) ==> (concrete_pred) };
-            let concrete_extend = generic(concrete_ind.extend.call()(k, tys, consts, lo, hi));
-            let generic_extend = param_ind.extend.call()(generic_k, &[ty], no_consts, lo, hi);
+            let concrete_extend = generic(concrete_ind.extend.call()(k, tys, consts, sel));
+            let generic_extend = param_ind.extend.call()(generic_k, &[ty], no_consts, generic_sel);
             // Making a snapshot shallow and grafting do not depend on the heap, so they are the
             // same on both sides everywhere, not only after a cast. Making it shallow is related
             // from either side: a key read from a value makes it shallow before the cast.
@@ -551,15 +537,21 @@ impl TaskEncoder for IndirectCastersEnc {
                 vir::vir_format_identifier!(vcx, "shallow_cast_{base_name}"),
                 same_shallow,
             );
-            let concrete_graft = concrete_ind.graft.call()(s, tys, consts, t, lo, hi);
+            // Grafting is related for the selectors of the parameter that are selectors of
+            // `X`, those that casting to `X` and back keeps.
+            let param_sel_decl = vcx.mk_local_decl("p", param_selector.ty);
+            let param_sel = vcx.mk_local_ex(param_sel_decl);
+            let concrete_sel = (sel_casts.make_concrete)(param_sel);
+            let is_concrete_sel = vcx.mk_eq_expr((sel_casts.make_generic)(concrete_sel), param_sel);
+            let concrete_graft = concrete_ind.graft.call()(s, tys, consts, t, concrete_sel);
             let generic_graft =
-                param_ind.graft.call()(generic(s), &[ty], no_consts, generic(t), lo, hi);
+                param_ind.graft.call()(generic(s), &[ty], no_consts, generic(t), param_sel);
             let same_graft = generic(concrete_graft);
             let same_graft = vir::expr! { vcx;
-                forall [s_decl], [t_decl], [lo_decl], [hi_decl],
+                forall [s_decl], [t_decl], [param_sel_decl],
                     ..[generics.ty_decls()], ..[generics.const_decls()]
                     :: { [generic_graft] }
-                    ([generic_graft]) == ([same_graft])
+                    ([is_concrete_sel]) ==> (([generic_graft]) == ([same_graft]))
             };
             let graft_axiom = vcx.mk_domain_axiom(
                 vir::vir_format_identifier!(vcx, "graft_cast_{base_name}"),
@@ -577,8 +569,7 @@ impl TaskEncoder for IndirectCastersEnc {
                 k_decl,
                 generics.ty_decls(),
                 generics.const_decls(),
-                lo_decl,
-                hi_decl,
+                sel_decl,
             );
             let make_generic = vcx.mk_method(
                 make_generic_ident,

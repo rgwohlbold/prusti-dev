@@ -23,9 +23,8 @@ use crate::encoders::{
     ty::{
         generics::{
             GArgsCastEnc, IndirectCastersEnc,
-            arity::ArityEnc,
-            clamp::ClampEnc,
             merge_split::MergeSplitEnc,
+            selector::SelectorEnc,
             sizedness::SizednessEnc,
             r#trait::TraitEnc,
             trait_fn::TraitFnEnc,
@@ -172,8 +171,7 @@ pub(crate) fn emit_program<'vir>() -> task_encoder::Program<'vir> {
     program.header("traits");
     TraitEnc::emit_outputs(&mut program);
     SizednessEnc::emit_outputs(&mut program);
-    ArityEnc::emit_outputs(&mut program);
-    ClampEnc::emit_outputs(&mut program);
+    SelectorEnc::emit_outputs(&mut program);
     IndirectPredEnc::emit_outputs(&mut program);
     IndirectCastersEnc::emit_outputs(&mut program);
     MergeSplitEnc::emit_outputs(&mut program);

@@ -117,8 +117,13 @@ impl<'vir> IndirectCasts<'vir> {
         key: vir::ExprSnap<'vir>,
         q: LifetimePosition,
     ) -> vir::Stmt<'vir> {
-        let (lo, hi) = self.nodes.interval(q);
-        cast(key, self.args.get_ty(), self.args.get_const(), lo, hi).alloc()
+        cast(
+            key,
+            self.args.get_ty(),
+            self.args.get_const(),
+            self.nodes.selector(q),
+        )
+        .alloc()
     }
 }
 

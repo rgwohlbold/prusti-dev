@@ -3,15 +3,11 @@ use prusti_rustc_interface::{
     middle::ty,
 };
 use task_encoder::{EncodeFullError, EncodeFullResult, TaskEncoder, TaskEncoderDependencies};
-use vir::CastType;
 
 use crate::encoders::ty::{
     RustParamData, RustTyDatas, RustTyDecomposition, TySpecifics,
     data::TyData,
-    generics::{
-        GParams,
-        arity::{TyArityEnc, add},
-    },
+    generics::{GParams, selector::path_selector},
 };
 
 /// Encodes the lifetime positions of a type and which of them enclose which.
@@ -43,7 +39,8 @@ impl Idx for LifetimePosition {
 #[derive(Debug, Clone)]
 pub struct EnclosureGraph<'vir> {
     lifetimes: IndexVec<LifetimePosition, GeneralizedLifetime<'vir>>,
-    intervals: IndexVec<LifetimePosition, (vir::ExprInt<'vir>, vir::ExprInt<'vir>)>,
+    /// The selector of each position (see [`path_selector`]).
+    selectors: IndexVec<LifetimePosition, vir::ExprSel<'vir>>,
     /// For each position, the positions enclosing it, transitively, outermost first.
     ancestors: IndexVec<LifetimePosition, Vec<LifetimePosition>>,
     /// For each position, the indices of the generic arguments that lead from
@@ -95,10 +92,15 @@ impl<'vir> EnclosureGraph<'vir> {
         GeneralizedLifetime::RegionsIn(RustTyDecomposition::from_ty(ty, context))
     }
 
-    /// The lifetime position numbers that `p` covers: `[x, x + 1)` for a
-    /// region, `[x, x + arity(T))` for the regions in a type parameter `T`.
-    pub fn interval(&self, p: LifetimePosition) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
-        self.intervals[p]
+    /// The selector of `p`: of a single lifetime, or of all regions in a
+    /// type parameter.
+    pub fn selector(&self, p: LifetimePosition) -> vir::ExprSel<'vir> {
+        self.selectors[p]
+    }
+
+    /// The indices of the generic arguments that lead from the type to `p`.
+    pub fn path(&self, p: LifetimePosition) -> &[usize] {
+        &self.paths[p]
     }
 
     /// The positions enclosing `p`, transitively, outermost first.
@@ -138,31 +140,25 @@ impl TaskEncoder for LifetimePositionEnc {
     ) -> EncodeFullResult<'vir, Self> {
         deps.emit_output_ref(*task_key, ())?;
         let mut lifetimes = IndexVec::new();
-        let mut intervals = IndexVec::new();
         let mut direct: IndexVec<LifetimePosition, Vec<LifetimePosition>> = IndexVec::new();
         let mut paths: IndexVec<LifetimePosition, Vec<usize>> = IndexVec::new();
         match task_key.ty.specifics {
             TySpecifics::ImmRef(_) => {}
             TySpecifics::Param(RustParamData::Generic) => {
-                let arity = deps.require_dep::<TyArityEnc>(*task_key)?;
                 lifetimes.push(GeneralizedLifetime::RegionsIn(*task_key));
-                intervals.push((int(0), arity));
                 direct.push(Vec::new());
                 paths.push(Vec::new());
             }
             _ => {
                 // The positions of each generic argument, by its index.
                 let mut arg_positions = Vec::new();
-                let mut offset = int(0);
                 for (arg_index, arg) in task_key.args.args().iter().enumerate() {
                     let base = direct.len();
                     match arg.kind() {
                         ty::GenericArgKind::Lifetime(region) => {
                             lifetimes.push(GeneralizedLifetime::Region(region));
-                            intervals.push((offset, add(offset, int(1))));
                             direct.push(Vec::new());
                             paths.push(vec![arg_index]);
-                            offset = add(offset, int(1));
                         }
                         ty::GenericArgKind::Type(arg_ty) => {
                             let arg_ty =
@@ -171,9 +167,7 @@ impl TaskEncoder for LifetimePositionEnc {
                             let shift =
                                 |p: LifetimePosition| LifetimePosition::new(base + p.index());
                             for p in arg_graph.positions() {
-                                let (lo, hi) = arg_graph.interval(p);
                                 lifetimes.push(arg_graph.lifetime(p));
-                                intervals.push((add(offset, lo), add(offset, hi)));
                                 direct.push(
                                     arg_graph.ancestors(p).iter().copied().map(shift).collect(),
                                 );
@@ -183,7 +177,6 @@ impl TaskEncoder for LifetimePositionEnc {
                                         .collect(),
                                 );
                             }
-                            offset = add(offset, deps.require_dep::<TyArityEnc>(arg_ty)?);
                         }
                         ty::GenericArgKind::Const(_) => {}
                     }
@@ -204,11 +197,15 @@ impl TaskEncoder for LifetimePositionEnc {
         }
         let ancestors = transitive_closure(direct)
             .map_err(|error| EncodeFullError::EncodingError(error, None))?;
+        let selectors = paths
+            .iter()
+            .map(|path| path_selector(*task_key, path, None, deps))
+            .collect::<Result<_, _>>()?;
         Ok((
             (),
             EnclosureGraph {
                 lifetimes,
-                intervals,
+                selectors,
                 ancestors,
                 paths,
             },
@@ -287,13 +284,6 @@ fn transitive_closure(
     Ok(ancestors)
 }
 
-fn int<'vir>(n: usize) -> vir::ExprInt<'vir> {
-    vir::with_vcx(|vcx| {
-        vcx.mk_const_expr(vir::ConstData::Int(n as u128))
-            .downcast_ty()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use prusti_rustc_interface::span::DUMMY_SP;
@@ -305,7 +295,7 @@ mod tests {
     use crate::encoders::ty::test_util::{simplified, with_type_alias};
 
     /// The positions of the type alias `X` defined in `src`, as
-    /// `lifetime @ position`, followed by `behind [i, ..]` with the indices
+    /// `lifetime @ selector`, followed by `behind [i, ..]` with the indices
     /// of the positions enclosing it, if any.
     fn positions(src: &str) -> Vec<String> {
         with_type_alias(src, |ty| {
@@ -315,7 +305,7 @@ mod tests {
             graph
                 .positions()
                 .map(|p| {
-                    let position = simplified(graph.interval(p).0);
+                    let selector = simplified(graph.selector(p));
                     let lifetime = match graph.lifetime(p) {
                         GeneralizedLifetime::Region(region) => format!("{region}"),
                         GeneralizedLifetime::RegionsIn(param) => {
@@ -328,9 +318,9 @@ mod tests {
                         .map(|q| q.index())
                         .collect::<Vec<_>>();
                     if ancestors.is_empty() {
-                        format!("{lifetime} @ {position:?}")
+                        format!("{lifetime} @ {selector:?}")
                     } else {
-                        format!("{lifetime} @ {position:?} behind {ancestors:?}")
+                        format!("{lifetime} @ {selector:?} behind {ancestors:?}")
                     }
                 })
                 .collect()
@@ -352,7 +342,10 @@ mod tests {
     fn lifetime_after_type_param() {
         assert_eq!(
             positions("type X<'a, T> = (T, &'a mut i32);"),
-            ["T @ 0", "'a @ arity(T$1)"],
+            [
+                "T @ p_2_Tuple_ty_0(p_Param_all())",
+                "'a @ p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+            ],
         );
     }
 
@@ -363,7 +356,7 @@ mod tests {
                 "struct Pair<'c, 'd>(&'c mut i32, &'d mut i32);
                  type X<'a, 'b> = Pair<'b, 'a>;"
             ),
-            ["'b @ 0", "'a @ 1"],
+            ["'b @ p_Pair_lft_0()", "'a @ p_Pair_lft_1()"],
         );
     }
 
@@ -379,7 +372,11 @@ mod tests {
                 "struct Pair<'c, 'd>(&'c mut i32, &'d mut i32);
                  type X<'a, 'b> = (&'a mut i32, Pair<'a, 'b>);"
             ),
-            ["'a @ 0", "'a @ 1", "'b @ 2"],
+            [
+                "'a @ p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+                "'a @ p_2_Tuple_ty_1(p_Param_Pair(p_Pair_lft_0()))",
+                "'b @ p_2_Tuple_ty_1(p_Param_Pair(p_Pair_lft_1()))",
+            ],
         );
     }
 
@@ -388,10 +385,10 @@ mod tests {
         assert_eq!(
             positions("type X<'a, T> = (&'a mut T, &'a mut T);"),
             [
-                "'a @ 0",
-                "T @ 1 behind [0]",
-                "'a @ (1) + (arity(T$1))",
-                "T @ (arity(T$1)) + (2) behind [2]",
+                "'a @ p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+                "T @ p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_all()))) behind [0]",
+                "'a @ p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+                "T @ p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_all()))) behind [2]",
             ],
         );
     }
@@ -400,7 +397,10 @@ mod tests {
     fn nested_mutable_references() {
         assert_eq!(
             positions("type X<'a, 'b> = &'a mut &'b mut i32;"),
-            ["'a @ 0", "'b @ 1 behind [0]"],
+            [
+                "'a @ p_Ref_mutable_lft_0()",
+                "'b @ p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())) behind [0]",
+            ],
         );
     }
 
@@ -408,7 +408,10 @@ mod tests {
     fn static_lifetime() {
         assert_eq!(
             positions("type X<T> = &'static mut T;"),
-            ["'static @ 0", "T @ 1 behind [0]"],
+            [
+                "'static @ p_Ref_mutable_lft_0()",
+                "T @ p_Ref_mutable_ty_0(p_Param_all()) behind [0]",
+            ],
         );
     }
 
@@ -416,7 +419,10 @@ mod tests {
     fn array() {
         assert_eq!(
             positions("type X<'a, T, const N: usize> = [&'a mut T; N];"),
-            ["'a @ 0", "T @ 1 behind [0]"],
+            [
+                "'a @ p_Array_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+                "T @ p_Array_ty_0(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_all()))) behind [0]",
+            ],
         );
     }
 
@@ -428,7 +434,7 @@ mod tests {
                 "struct Node<'a, 'b> { v: &'b mut i32, next: Option<&'a mut Node<'a, 'b>> }
                  type X<'a, 'b> = Node<'a, 'b>;"
             ),
-            ["'a @ 0", "'b @ 1 behind [0]"],
+            ["'a @ p_Node_lft_0()", "'b @ p_Node_lft_1() behind [0]"],
         );
     }
 
@@ -440,7 +446,7 @@ mod tests {
                 "struct Node<'b, 'a> { v: &'b mut i32, next: Option<&'a mut Node<'b, 'a>> }
                  type X<'a, 'b> = Node<'b, 'a>;"
             ),
-            ["'b @ 0 behind [1]", "'a @ 1"],
+            ["'b @ p_Node_lft_0() behind [1]", "'a @ p_Node_lft_1()"],
         );
     }
 
@@ -452,7 +458,11 @@ mod tests {
                 "struct Node<'a, 'b> { v: &'b mut i32, next: Option<&'a mut Node<'a, 'b>> }
                  type X<'a, 'b> = Option<&'a mut Node<'a, 'b>>;"
             ),
-            ["'a @ 0", "'a @ 1 behind [0]", "'b @ 2 behind [0, 1]"],
+            [
+                "'a @ p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))",
+                "'a @ p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_Node(p_Node_lft_0())))) behind [0]",
+                "'b @ p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_Node(p_Node_lft_1())))) behind [0, 1]",
+            ],
         );
     }
 
@@ -463,11 +473,11 @@ mod tests {
                    struct B<'a, 'b>(A<'a, 'b>, &'a mut &'b mut i32);";
         assert_eq!(
             positions(&format!("{src} type X<'a, 'b> = A<'a, 'b>;")),
-            ["'a @ 0", "'b @ 1"],
+            ["'a @ p_A_lft_0()", "'b @ p_A_lft_1()"],
         );
         assert_eq!(
             positions(&format!("{src} type X<'a, 'b> = B<'a, 'b>;")),
-            ["'a @ 0", "'b @ 1 behind [0]"],
+            ["'a @ p_B_lft_0()", "'b @ p_B_lft_1() behind [0]"],
         );
     }
 
@@ -480,7 +490,7 @@ mod tests {
                 "struct S<'a, 'b>(&'a mut i32, &'b mut i32, &'a &'b i32);
                  type X<'a, 'b> = S<'a, 'b>;"
             ),
-            ["'a @ 0", "'b @ 1 behind [0]"],
+            ["'a @ p_S_lft_0()", "'b @ p_S_lft_1() behind [0]"],
         );
     }
 

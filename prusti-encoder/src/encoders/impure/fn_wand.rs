@@ -6,9 +6,7 @@ use crate::encoders::{
         RustTyDecomposition,
         generics::{
             GArgs, GArgsCastEnc, GArgsTyEnc, GParams, GenericParamsEnc,
-            lifetime_position::{
-                GeneralizedLifetime as TyLifetime, LifetimePosition, LifetimePositionEnc,
-            },
+            lifetime_position::LifetimePositionEnc,
             merge_split::{MergeSplitEnc, MergeTarget},
         },
         indirect_nodes::NodePredicates,
@@ -27,7 +25,7 @@ use pcg::{
 use prusti_interface::PrustiError;
 use prusti_rustc_interface::{
     data_structures::fx::{FxHashMap, FxHashSet},
-    index::{Idx, IndexVec},
+    index::IndexVec,
     middle::{mir, ty},
     span::def_id::DefId,
 };
@@ -299,9 +297,10 @@ impl<'vir> WandEncOutput<'vir> {
     /// arguments `call_ctx`, or the callee's back into the caller's after it.
     /// A callee position of the lifetimes in a type parameter covers the block
     /// of the caller's positions that the parameter's instantiation occupies,
-    /// which may be empty or have several positions: it is merged into the
-    /// callee's predicate before the call, and split after it. For a value of
-    /// a type parameter's type, the callee's predicate is the parameter's.
+    /// at the same path of generic arguments, which may be empty or have
+    /// several positions: it is merged into the callee's predicate before the
+    /// call, and split after it. For a value of a type parameter's type, the
+    /// callee's predicate is the parameter's.
     fn call_adjustments<E: TaskEncoder>(
         &self,
         vcx: &'vir vir::VirCtxt<'vir>,
@@ -318,34 +317,17 @@ impl<'vir> WandEncOutput<'vir> {
             return Ok(Vec::new());
         }
         let callee_ty = g.ty(self.fn_sig(vcx, None));
-        let target = if matches!(callee_ty.kind(), ty::TyKind::Param(_)) {
+        let callee_decomp = RustTyDecomposition::from_ty(callee_ty, self.g_params(vcx, None));
+        // The callee's predicate of a value whose type is a type parameter or
+        // an alias, such as an associated type, is the parameter's.
+        let target = if callee_decomp.ty.specifics.is_param() {
             MergeTarget::Param
         } else {
             MergeTarget::Own
         };
-        let callee_decomp = RustTyDecomposition::from_ty(callee_ty, self.g_params(vcx, None));
         let graph = deps.require_dep::<LifetimePositionEnc>(callee_decomp)?;
         let caller_ty = g.ty(self.fn_sig(vcx, Some(call_ctx)));
         let caller_decomp = RustTyDecomposition::from_ty(caller_ty, call_ctx.context());
-        let mut blocks: IndexVec<LifetimePosition, (usize, usize)> = IndexVec::new();
-        let mut end = 0;
-        for p in graph.positions() {
-            let width = match graph.lifetime_in(p, caller_ty, call_ctx.context()) {
-                TyLifetime::Region(_) => 1,
-                TyLifetime::RegionsIn(ty) => deps
-                    .require_dep::<LifetimePositionEnc>(ty)?
-                    .positions()
-                    .count(),
-            };
-            blocks.push((end, end + width));
-            end += width;
-        }
-        let caller_graph = deps.require_dep::<LifetimePositionEnc>(caller_decomp)?;
-        assert_eq!(
-            end,
-            caller_graph.positions().count(),
-            "the callee's positions do not cover the caller's"
-        );
         // The merge/split methods are shared by the instantiations with the
         // same canonical form and take its type parameters.
         let (_, params) = caller_decomp
@@ -365,13 +347,7 @@ impl<'vir> WandEncOutput<'vir> {
         let placeholder = vcx.mk_local_ex(placeholder);
         let mut stmts = Vec::new();
         for p in nodes.positions_of(lifetime) {
-            let (first, end) = blocks[p];
-            let block = (
-                caller_decomp,
-                LifetimePosition::new(first),
-                LifetimePosition::new(end),
-                target,
-            );
+            let block = (caller_decomp, vcx.alloc_slice(graph.path(p)), target);
             let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
             // A type parameter's only position is keyed by the value's
             // snapshot, which the methods cast to the generic one themselves.
@@ -1098,9 +1074,9 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Ref_mutable_ind(result, s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(result, s_Int_i32_type(), p_Ref_mutable_lft_0())
             --*
-            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1143,14 +1119,14 @@ mod tests {
         assert_wands(
             "fn f<'a, T>(x: &'a mut Option<T>) -> Option<&'a mut T> { x.as_mut() }",
             r#"
-            p_Option_ind(result, s_Ref_mutable_type(T$0), 0, 1)
+            p_Option_ind(result, s_Ref_mutable_type(T$0), p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(x), s_Option_type(T$0), 0, 1)
+            p_Ref_mutable_ind(old(x), s_Option_type(T$0), p_Ref_mutable_lft_0())
 
-            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Option_type(T$0), 0, 1), s_Option_type(T$0), 1, (1) + (arity(T$0)))
-            p_Option_ind(extend_Option(result, s_Ref_mutable_type(T$0), 0, 1), s_Ref_mutable_type(T$0), 1, (1) + (arity(T$0)))
+            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Option_type(T$0), p_Ref_mutable_lft_0()), s_Option_type(T$0), p_Ref_mutable_ty_0(p_Param_Option(p_Option_ty_0(p_Param_all()))))
+            p_Option_ind(extend_Option(result, s_Ref_mutable_type(T$0), p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0()))), s_Ref_mutable_type(T$0), p_Option_ty_0(p_Param_Ref_mutable(p_Ref_mutable_ty_0(p_Param_all()))))
             --*
-            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Option_type(T$0), 0, 1)), s_Option_type(T$0), 1, (1) + (arity(T$0)))
+            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Option_type(T$0), p_Ref_mutable_lft_0())), s_Option_type(T$0), p_Ref_mutable_ty_0(p_Param_Option(p_Option_ty_0(p_Param_all()))))
             "#,
         );
     }
@@ -1160,13 +1136,13 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b>(x: &'a mut i32, y: &'b mut i32) -> (&'a mut i32, &'b mut i32) { (x, y) }",
             r#"
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), p_Ref_mutable_lft_0())
 
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1178,10 +1154,10 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b: 'a>(x: &'a mut i32, y: &'b mut i32) -> &'a mut i32 { x }",
             r#"
-            p_Ref_mutable_ind(result, s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(result, s_Int_i32_type(), p_Ref_mutable_lft_0())
             --*
-            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
-            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), p_Ref_mutable_lft_0())
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1193,10 +1169,10 @@ mod tests {
         assert_wands(
             "fn f<'a: 'b + 'c, 'b, 'c>(x: &'a mut i32) -> (&'b mut i32, &'c mut i32) { (x, todo!()) }",
             r#"
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(x), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(x), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1207,10 +1183,10 @@ mod tests {
         assert_wands(
             "fn f<'a>(x: &'a mut (i32, i32)) -> (&'a mut i32, &'a mut i32) { (&mut x.0, &mut x.1) }",
             r#"
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
+            p_2_Tuple_ind(result, s_Ref_mutable_type(s_Int_i32_type()), s_Ref_mutable_type(s_Int_i32_type()), p_2_Tuple_ty_1(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(x), s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()), 0, 1)
+            p_Ref_mutable_ind(old(x), s_2_Tuple_type(s_Int_i32_type(), s_Int_i32_type()), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1223,10 +1199,10 @@ mod tests {
         assert_wands(
             "fn f<'a, 'b>(x: &'a mut &'b mut i32, y: &'b mut i32) { *x = y; }",
             r#"
-            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            p_Ref_mutable_ind(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             --*
-            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
-            p_Ref_mutable_ind(old(y), s_Int_i32_type(), 0, 1)
+            p_Ref_mutable_ind(old(extend_Ref_mutable(old(x), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
+            p_Ref_mutable_ind(old(y), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1236,8 +1212,8 @@ mod tests {
         assert_contract(
             "fn f<'a>(x: &'a mut i32) -> &'a mut i32 { x }",
             r#"
-            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
-            ensures p_Ref_mutable_ind(p_Ref_mutable_snap(_0p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Int_i32_type()), s_Int_i32_type(), p_Ref_mutable_lft_0())
+            ensures p_Ref_mutable_ind(p_Ref_mutable_snap(_0p, s_Int_i32_type()), s_Int_i32_type(), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1249,10 +1225,10 @@ mod tests {
         assert_contract(
             "fn f<'a, 'b>(x: &'a mut &'b mut i32) {}",
             r#"
-            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
-            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())
+            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
             "#,
         );
     }
@@ -1263,10 +1239,10 @@ mod tests {
         assert_contract(
             "fn f<'a, 'b>(x: &'a mut &'b mut i32, y: &'b mut i32) { *x = y; }",
             r#"
-            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
-            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)
-            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_2p, s_Int_i32_type()), s_Int_i32_type(), 0, 1)
-            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), 0, 1)
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type())), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_2p, s_Int_i32_type()), s_Int_i32_type(), p_Ref_mutable_lft_0())
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, s_Ref_mutable_type(s_Int_i32_type()))), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())
             "#,
         );
     }
@@ -1276,10 +1252,10 @@ mod tests {
         assert_contract(
             "fn f<T>(x: &mut T) {}",
             r#"
-            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, T$0), T$0, 0, 1)
-            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, T$0), T$0, 0, 1), T$0, 1, (1) + (arity(T$0)))
-            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, T$0)), T$0, 0, 1)
-            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, T$0)), T$0, 0, 1), T$0, 1, (1) + (arity(T$0)))
+            requires p_Ref_mutable_ind(p_Ref_mutable_snap(_1p, T$0), T$0, p_Ref_mutable_lft_0())
+            requires p_Ref_mutable_ind(extend_Ref_mutable(p_Ref_mutable_snap(_1p, T$0), T$0, p_Ref_mutable_lft_0()), T$0, p_Ref_mutable_ty_0(p_Param_all()))
+            ensures p_Ref_mutable_ind(old(p_Ref_mutable_snap(_1p, T$0)), T$0, p_Ref_mutable_lft_0())
+            ensures p_Ref_mutable_ind(extend_Ref_mutable(old(p_Ref_mutable_snap(_1p, T$0)), T$0, p_Ref_mutable_lft_0()), T$0, p_Ref_mutable_ty_0(p_Param_all()))
             "#,
         );
     }

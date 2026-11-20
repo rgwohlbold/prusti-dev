@@ -60,7 +60,6 @@ use crate::encoders::{
             lifetime_position::{LifetimePosition, LifetimePositionEnc},
         },
         indirect_nodes::NodePredicates,
-        indirect_pred::if_nonempty,
         use_impure::TyUseImpure,
         use_pure::{TyUsePure, TyUsePureEnc},
     },
@@ -1012,11 +1011,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 .filter(|p| held.contains(p))
                 .collect::<Vec<_>>();
             for (p, key) in self.place_keys(place, &nodes, &positions, &state)? {
-                inv.push(if_nonempty(
-                    nodes.nonempty(p),
+                inv.push(
                     self.vcx
                         .mk_predicate_app_expr(nodes.predicate_with_key(p, key)),
-                ));
+                );
             }
         }
         Ok(inv)
@@ -1598,7 +1596,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
         nodes: &NodePredicates<'vir>,
         keys: &[(LifetimePosition, vir::ExprSnap<'vir>)],
         elements: &[(vir::ExprCSnap<'vir>, Option<Child<'vir>>)],
-    ) -> Vec<(Option<vir::ExprBool<'vir>>, vir::PredicateApp<'vir>)> {
+    ) -> Vec<vir::PredicateApp<'vir>> {
         let mut preds = Vec::new();
         for &(index, _) in elements {
             for &(p, key) in keys {
@@ -1606,29 +1604,10 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                     .ty_use_pure(ty)
                     .expect_array()
                     .index_generic(key.downcast_ty(), index);
-                preds.extend(
-                    nodes
-                        .element_predicate(p, index, value)
-                        .map(|pred| (nodes.nonempty(p), pred)),
-                );
+                preds.extend(nodes.element_predicate(p, index, value));
             }
         }
         preds
-    }
-
-    /// `stmt`, a fold or unfold of a predicate, under the condition `nonempty`
-    /// that its interval is non-empty (see `NodePredicates::nonempty`).
-    fn if_nonempty_stmt(
-        &self,
-        nonempty: Option<vir::ExprBool<'vir>>,
-        stmt: vir::Stmt<'vir>,
-    ) -> vir::Stmt<'vir> {
-        match nonempty {
-            None => stmt,
-            Some(nonempty) => self
-                .vcx
-                .mk_if_stmt(nonempty, self.vcx.alloc_slice(&[stmt]), &[]),
-        }
     }
 
     /// Cast the predicates of the generic fields or the generic referent of
@@ -1866,12 +1845,12 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             rest_predicates.extend(
                 rest_keys
                     .into_iter()
-                    .map(|(p, key)| (nodes.nonempty(p), nodes.predicate_with_key(p, key))),
+                    .map(|(p, key)| nodes.predicate_with_key(p, key)),
             );
         }
         let predicates = keys
             .iter()
-            .map(|&(p, key)| (nodes.nonempty(p), nodes.predicate_with_key(p, key)))
+            .map(|&(p, key)| nodes.predicate_with_key(p, key))
             .collect::<Vec<_>>();
         if unfold {
             // Innermost first: the keys read the enclosing predicates.
@@ -1879,9 +1858,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
                 .into_iter()
                 .rev()
                 .chain(element_predicates)
-                .map(|(nonempty, pred)| {
-                    self.if_nonempty_stmt(nonempty, self.vcx.mk_unfold_stmt(pred))
-                })
+                .map(|pred| self.vcx.mk_unfold_stmt(pred))
                 .collect::<Vec<_>>();
             self.stmts(unfolds);
             self.cast_children(ty, base, &state, &keys, &nodes, children, false)?;
@@ -1898,18 +1875,14 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             }
             let folds = rest_predicates
                 .into_iter()
-                .map(|(nonempty, pred)| {
-                    self.if_nonempty_stmt(nonempty, self.vcx.mk_fold_stmt(pred))
-                })
+                .map(|pred| self.vcx.mk_fold_stmt(pred))
                 .collect::<Vec<_>>();
             self.stmts(folds);
         } else {
             let unfolds = rest_predicates
                 .into_iter()
                 .rev()
-                .map(|(nonempty, pred)| {
-                    self.if_nonempty_stmt(nonempty, self.vcx.mk_unfold_stmt(pred))
-                })
+                .map(|pred| self.vcx.mk_unfold_stmt(pred))
                 .collect::<Vec<_>>();
             self.stmts(unfolds);
             self.cast_children(ty, base, &state, &keys, &nodes, children, true)?;
@@ -1923,9 +1896,7 @@ impl<'vir, 'enc, E: TaskEncoder> ImpureEncVisitor<'vir, 'enc, E> {
             let folds = element_predicates
                 .into_iter()
                 .chain(predicates)
-                .map(|(nonempty, pred)| {
-                    self.if_nonempty_stmt(nonempty, self.vcx.mk_fold_stmt(pred))
-                })
+                .map(|pred| self.vcx.mk_fold_stmt(pred))
                 .collect::<Vec<_>>();
             self.stmts(folds);
         }

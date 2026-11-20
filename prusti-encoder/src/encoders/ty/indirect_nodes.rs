@@ -14,9 +14,7 @@ use super::{
             EnclosureGraph, GeneralizedLifetime, LifetimePosition, LifetimePositionEnc,
         },
     },
-    indirect_pred::{
-        IndirectPredEnc, IndirectPredRef, LifetimePositionBlock, if_nonempty, interval_nonempty,
-    },
+    indirect_pred::{IndirectPredEnc, IndirectPredRef, LifetimePositionBlock},
 };
 
 /// The predicates of the nodes on places of a type: one `p_T_ind` per
@@ -89,13 +87,7 @@ impl<'vir> NodePredicates<'vir> {
             .positions()
             .into_iter()
             .filter(|&p| is_position_of(self.lifetimes[p], lifetime))
-            .map(|p| {
-                let (lo, hi) = self.graph.interval(p);
-                if_nonempty(
-                    block.nonempty(p),
-                    block.predicate(in_state(block.key(p)), lo, hi),
-                )
-            })
+            .map(|p| block.predicate(in_state(block.key(p)), self.graph.selector(p)))
             .collect()
     }
 
@@ -164,21 +156,13 @@ impl<'vir> NodePredicates<'vir> {
         self.predicate_with_key(p, self.key(p, snap))
     }
 
-    /// The condition under which the predicate of position `p` holds
-    /// anything, `None` where it always does (see
-    /// [`interval_nonempty`](super::indirect_pred::interval_nonempty)).
-    pub fn nonempty(&self, p: LifetimePosition) -> Option<vir::ExprBool<'vir>> {
-        interval_nonempty(&self.graph, p)
-    }
-
     /// The predicate of position `p` with key `key`.
     pub fn predicate_with_key(
         &self,
         p: LifetimePosition,
         key: vir::ExprSnap<'vir>,
     ) -> vir::PredicateApp<'vir> {
-        let (lo, hi) = self.graph.interval(p);
-        (self.ind.predicate)(key, self.tys, self.consts, lo, hi)(None)
+        (self.ind.predicate)(key, self.tys, self.consts, self.graph.selector(p))(None)
     }
 
     /// For an array, the predicate of position `p` of the element `value` at
@@ -189,15 +173,13 @@ impl<'vir> NodePredicates<'vir> {
         index: vir::ExprCSnap<'vir>,
         value: vir::ExprSnap<'vir>,
     ) -> Option<vir::PredicateApp<'vir>> {
-        let (lo, hi) = self.graph.interval(p);
         let element = self.ind.element?;
         Some(element(
             index,
             value.downcast_ty(),
             self.tys,
             self.consts,
-            lo,
-            hi,
+            self.graph.selector(p),
         )(None))
     }
 
@@ -207,8 +189,8 @@ impl<'vir> NodePredicates<'vir> {
         self.graph.arg_positions(arg)
     }
 
-    pub fn interval(&self, p: LifetimePosition) -> (vir::ExprInt<'vir>, vir::ExprInt<'vir>) {
-        self.graph.interval(p)
+    pub fn selector(&self, p: LifetimePosition) -> vir::ExprSel<'vir> {
+        self.graph.selector(p)
     }
 
     pub fn deep_snap(&self, snap: vir::ExprSnap<'vir>) -> vir::ExprSnap<'vir> {
@@ -328,12 +310,12 @@ mod tests {
         let src = "type X<'a, 'b> = &'a mut &'b mut i32;";
         assert_eq!(
             node(src, "'a"),
-            ["p_Ref_mutable_ind(x, s_Ref_mutable_type(s_Int_i32_type()), 0, 1)"],
+            ["p_Ref_mutable_ind(x, s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0())"],
         );
         assert_eq!(
             node(src, "'b"),
             [
-                "p_Ref_mutable_ind(extend_Ref_mutable(x, s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)"
+                "p_Ref_mutable_ind(extend_Ref_mutable(x, s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))"
             ],
         );
     }
@@ -345,8 +327,8 @@ mod tests {
         assert_eq!(
             node(src, "'a"),
             [
-                "p_2_Tuple_ind(x, s_Ref_mutable_type(s_Int_i32_type()), s_Pair_type(), 0, 1)",
-                "p_2_Tuple_ind(x, s_Ref_mutable_type(s_Int_i32_type()), s_Pair_type(), 1, 2)",
+                "p_2_Tuple_ind(x, s_Ref_mutable_type(s_Int_i32_type()), s_Pair_type(), p_2_Tuple_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))",
+                "p_2_Tuple_ind(x, s_Ref_mutable_type(s_Int_i32_type()), s_Pair_type(), p_2_Tuple_ty_1(p_Param_Pair(p_Pair_lft_0())))",
             ],
         );
     }
@@ -355,7 +337,9 @@ mod tests {
     fn regions_in_type_parameter() {
         assert_eq!(
             node("type X<'a, T> = &'a mut T;", "T"),
-            ["p_Ref_mutable_ind(extend_Ref_mutable(x, T$1, 0, 1), T$1, 1, (1) + (arity(T$1)))"],
+            [
+                "p_Ref_mutable_ind(extend_Ref_mutable(x, T$1, p_Ref_mutable_lft_0()), T$1, p_Ref_mutable_ty_0(p_Param_all()))"
+            ],
         );
     }
 
@@ -373,7 +357,7 @@ mod tests {
         );
         assert_eq!(
             deep_snap,
-            "extend_Ref_mutable(extend_Ref_mutable(x, s_Ref_mutable_type(s_Int_i32_type()), 0, 1), s_Ref_mutable_type(s_Int_i32_type()), 1, 2)",
+            "extend_Ref_mutable(extend_Ref_mutable(x, s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_lft_0()), s_Ref_mutable_type(s_Int_i32_type()), p_Ref_mutable_ty_0(p_Param_Ref_mutable(p_Ref_mutable_lft_0())))",
         );
     }
 }
