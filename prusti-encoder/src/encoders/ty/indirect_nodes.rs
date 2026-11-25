@@ -143,6 +143,17 @@ impl<'vir> NodePredicates<'vir> {
         self.block(snap).key(p)
     }
 
+    /// The key of the positions that exactly `enclosing` enclose, on a place
+    /// with snapshot `snap`; e.g. of the referent of a `&mut`, which may have
+    /// no positions.
+    pub fn key_enclosed_by(
+        &self,
+        enclosing: &[LifetimePosition],
+        snap: vir::ExprSnap<'vir>,
+    ) -> vir::ExprSnap<'vir> {
+        self.block(snap).fold(enclosing)
+    }
+
     /// The key of position `p` on a place with snapshot `snap`, with the data
     /// at the enclosing positions taken from `from`, another key of `p`.
     pub fn graft_enclosing(

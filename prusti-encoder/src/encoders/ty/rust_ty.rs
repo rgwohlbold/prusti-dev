@@ -77,7 +77,7 @@ impl<'tcx> RustTyDecomposition<'tcx> {
     /// The decomposition with the type parameters in `args` renamed to `P0`,
     /// `P1`, .. in order of first occurrence and bound by a context of just
     /// those, and with lifetimes erased: instantiations that differ only in
-    /// their context or lifetimes become equal. `None` if `args` contain a
+    /// their context or lifetimes become equal, as do trait objects. `None` if `args` contain a
     /// const parameter, whose type the new context would have to give.
     pub fn canonical(self) -> Option<Self> {
         self.canonical_with_params().map(|(canonical, _)| canonical)
@@ -98,6 +98,14 @@ impl<'tcx> RustTyDecomposition<'tcx> {
             let mut folder = ty::BottomUpFolder {
                 tcx,
                 ty_op: |t: ty::Ty<'tcx>| {
+                    // Trait objects are all encoded alike, without positions.
+                    if let ty::TyKind::Dynamic(..) = t.kind() {
+                        return ty::Ty::new_dynamic(
+                            tcx,
+                            ty::List::empty(),
+                            tcx.lifetimes.re_erased,
+                        );
+                    }
                     let ty::TyKind::Param(_) = t.kind() else {
                         return t;
                     };

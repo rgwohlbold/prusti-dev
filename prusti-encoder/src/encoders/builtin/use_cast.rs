@@ -14,7 +14,7 @@ use crate::encoders::{
         RustTyDecomposition, RustTySpecial, TySpecifics,
         generics::{
             GArgs, GArgsTy, GArgsTyEnc,
-            lifetime_position::{LifetimePosition, LifetimePositionEnc},
+            lifetime_position::LifetimePosition,
             merge_split::{MergeSplit, MergeSplitEnc, MergeTarget},
         },
         indirect_nodes::NodePredicates,
@@ -63,15 +63,15 @@ pub struct MirBuiltinUseCastOutput<'vir> {
     builtin: MirBuiltinCastOutput<'vir>,
     ty_args: GArgsTy<'vir>,
     /// For a `&mut` unsizing coercion, the referent blocks of the operand and
-    /// of the result, where the referent has lifetimes.
-    referent_blocks: [Option<ReferentBlock<'vir>>; 2],
+    /// of the result.
+    referent_blocks: Option<[ReferentBlock<'vir>; 2]>,
 }
 
 /// The positions of the lifetimes in the referent of a `&mut`, which follow the
 /// reference's own position. The `unsize`/`undo` methods take the predicates of
 /// a generic `&mut U`, which has one position for them, so a use merges them
 /// into one predicate before and splits them after, as a call does. Without
-/// lifetimes in the referent, that position holds nothing.
+/// lifetimes in the referent, the merge builds that predicate from nothing.
 #[derive(Debug, Clone, Copy)]
 struct ReferentBlock<'vir> {
     ty: RustTyDecomposition<'vir>,
@@ -85,17 +85,10 @@ impl<'vir> ReferentBlock<'vir> {
     fn new<E: TaskEncoder>(
         ty: RustTyDecomposition<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
-    ) -> Result<Option<Self>, EncodeFullError<'vir, E>> {
-        let count = deps
-            .require_dep::<LifetimePositionEnc>(ty)?
-            .positions()
-            .count();
-        if count <= 1 {
-            return Ok(None);
-        }
+    ) -> Result<Self, EncodeFullError<'vir, E>> {
         // The positions after the reference's own lifetime are those of its
-        // referent, its only generic argument.
-        let path = vir::with_vcx(|vcx| vcx.alloc_slice(&[0]));
+        // referent, its generic argument after the lifetime.
+        let path = vir::with_vcx(|vcx| vcx.alloc_slice(&[1]));
         let block = (ty, path, MergeTarget::Own);
         let merge_split = deps.require_ref::<MergeSplitEnc>(block)?;
         let (_, params) = ty
@@ -106,11 +99,11 @@ impl<'vir> ReferentBlock<'vir> {
                 .mk_args_from_iter(params.into_iter().map(ty::GenericArg::from))
         });
         let args = deps.require_dep::<GArgsTyEnc>(GArgs::new(ty.args.context(), params))?;
-        Ok(Some(Self {
+        Ok(Self {
             ty,
             merge_split,
             args,
-        }))
+        })
     }
 
     /// The statement that merges (or splits) the block of a reference with
@@ -121,8 +114,9 @@ impl<'vir> ReferentBlock<'vir> {
         reference: vir::ExprCSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<vir::Stmt<'vir>, EncodeFullError<'vir, E>> {
+        // The referent's positions are enclosed by the reference's own.
         let key = NodePredicates::new(self.ty, deps)?
-            .key(LifetimePosition::new(1), reference.upcast_ty());
+            .key_enclosed_by(&[LifetimePosition::new(0)], reference.upcast_ty());
         let method = if merge {
             self.merge_split.merge
         } else {
@@ -147,20 +141,15 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
         operand: vir::ExprCSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
-        let Some(unsize) = self.builtin.unsize else {
+        let (Some(unsize), Some([op, res])) = (self.builtin.unsize, self.referent_blocks) else {
             return Ok(Vec::new());
         };
-        let [op, res] = self.referent_blocks;
-        let mut stmts = Vec::new();
-        if let Some(op) = op {
-            stmts.push(op.stmt(true, operand, deps)?);
-        }
         let call = unsize.call()(operand, self.ty_args.get_ty(), self.ty_args.get_const());
-        stmts.push(vir::StmtKindGenData::alloc(call));
-        if let Some(res) = res {
-            stmts.push(res.stmt(false, self.cast(operand), deps)?);
-        }
-        Ok(stmts)
+        Ok(vec![
+            op.stmt(true, operand, deps)?,
+            vir::StmtKindGenData::alloc(call),
+            res.stmt(false, self.cast(operand), deps)?,
+        ])
     }
 
     /// The statements that undo a `&mut` unsizing coercion of the reference
@@ -170,20 +159,15 @@ impl<'vir> MirBuiltinUseCastOutput<'vir> {
         operand: vir::ExprCSnap<'vir>,
         deps: &mut TaskEncoderDependencies<'vir, E>,
     ) -> Result<Vec<vir::Stmt<'vir>>, EncodeFullError<'vir, E>> {
-        let Some(undo) = self.builtin.undo else {
+        let (Some(undo), Some([op, res])) = (self.builtin.undo, self.referent_blocks) else {
             return Ok(Vec::new());
         };
-        let [op, res] = self.referent_blocks;
-        let mut stmts = Vec::new();
-        if let Some(res) = res {
-            stmts.push(res.stmt(true, self.cast(operand), deps)?);
-        }
         let call = undo.call()(operand, self.ty_args.get_ty(), self.ty_args.get_const());
-        stmts.push(vir::StmtKindGenData::alloc(call));
-        if let Some(op) = op {
-            stmts.push(op.stmt(false, operand, deps)?);
-        }
-        Ok(stmts)
+        Ok(vec![
+            res.stmt(true, self.cast(operand), deps)?,
+            vir::StmtKindGenData::alloc(call),
+            op.stmt(false, operand, deps)?,
+        ])
     }
 }
 
@@ -258,11 +242,11 @@ impl TaskEncoder for MirBuiltinUseCastEnc {
             }
         };
         let referent_blocks = match cast.unsize {
-            Some(_) => [
+            Some(_) => Some([
                 ReferentBlock::new(operand_ty, deps)?,
                 ReferentBlock::new(result_ty, deps)?,
-            ],
-            None => [None, None],
+            ]),
+            None => None,
         };
         Ok((
             (),
