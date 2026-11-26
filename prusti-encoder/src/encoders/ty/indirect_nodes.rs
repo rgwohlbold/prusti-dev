@@ -236,6 +236,13 @@ impl<'vir> NodePredicates<'vir> {
         self.graph.arg_positions(arg)
     }
 
+    /// For a reference, the positions of its referent, in the order of the
+    /// referent type's own positions: a reference's generic arguments are
+    /// its lifetime and its referent.
+    pub fn referent_positions(&self) -> Vec<LifetimePosition> {
+        self.arg_positions(1)
+    }
+
     pub fn selector(&self, p: LifetimePosition) -> vir::ExprSel<'vir> {
         self.graph.selector(p)
     }
