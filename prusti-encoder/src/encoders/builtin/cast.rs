@@ -11,6 +11,7 @@ use crate::encoders::{
     ty::{
         LazyRustTy, RustTy, RustTyDecomposition, RustTySpecial, TySpecifics,
         generics::{GParams, GenericParamsEnc},
+        indirect_nodes::NodePredicates,
         interpretation::{
             bitvec::BitVecSize,
             float_conv::{FloatBitVecConvEnc, float_pow2_bits},
@@ -59,12 +60,16 @@ impl CastTyArgs {
         match self {
             CastTyArgs::None => GParams::empty(),
             CastTyArgs::Referents => {
-                let param = |idx, name| {
-                    ty::Ty::new_param(vcx.tcx(), idx, symbol::Symbol::intern(name)).into()
-                };
-                GParams::empty_env(vcx.tcx().mk_args(&[param(0, "U"), param(1, "V")]))
+                let [u, v] = Self::referents(vcx);
+                GParams::empty_env(vcx.tcx().mk_args(&[u.into(), v.into()]))
             }
         }
+    }
+
+    /// The referent type parameters `[U, V]` of `CastTyArgs::Referents`.
+    fn referents<'vir>(vcx: &'vir vir::VirCtxt<'vir>) -> [ty::Ty<'vir>; 2] {
+        let param = |idx, name| ty::Ty::new_param(vcx.tcx(), idx, symbol::Symbol::intern(name));
+        [param(0, "U"), param(1, "V")]
     }
 }
 
@@ -77,6 +82,9 @@ pub(super) struct MirBuiltinCastOutput<'vir> {
     /// transfer permission between the original and the coerced reference.
     pub(super) unsize: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
     pub(super) undo: Option<vir::MethodIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap)>>,
+    /// The inverse of `cast`, for a `&mut` unsizing coercion.
+    pub(super) uncast:
+        Option<FunctionIdn<'vir, (vir::CSnap, vir::ManyTyVal, vir::ManyCSnap), vir::CSnap>>,
     /// The type arguments that `cast`, `unsize` and `undo` take.
     pub(super) ty_args: CastTyArgs,
 }
@@ -88,6 +96,8 @@ pub(super) struct MirBuiltinCastLocal<'vir> {
     cast: vir::Function<'vir>,
     unsize: Option<vir::Method<'vir>>,
     undo: Option<vir::Method<'vir>>,
+    /// The domain of `uncast`.
+    uncast: Option<vir::Domain<'vir>>,
     /// Whether this encodes something the user writes rather than something
     /// rustc or the encoding adds, which the simplifier may fold away (see
     /// `add_user_adt`).
@@ -163,6 +173,11 @@ impl TaskEncoder for MirBuiltinCastEnc {
         let gparams = vir::with_vcx(|vcx| ty_args.params(vcx));
         let params = deps.require_dep::<GenericParamsEnc>(gparams)?;
         vir::with_vcx(|vcx| {
+            let cast_idn = FunctionIdn::new(
+                name,
+                (op_ty_snap, params.ty_args(), params.const_args()),
+                res_ty_snap,
+            );
             let arg_decl = vcx.mk_local_decl("arg", op_ty_snap);
             let arg_ex = vcx.mk_local_ex(arg_decl);
             // The body of the cast function, and the `unsize`/`undo` methods
@@ -378,18 +393,19 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         }
                     };
                     // For `&mut` coercions, generate the side-effecting
-                    // `unsize`/`undo` methods that move the (generic) `p_Param`
-                    // predicate of the referent between the operand and result type
-                    // at the same address (the coercion preserves it). The methods
-                    // are declared over the same `[U, V]` type params (`params`),
-                    // which `MirBuiltinUseCastEnc` instantiates with the operand
-                    // referent `U` and result referent `V`.
-                    // `new_param_ty(i).decompose(gparams)` builds a `Param`
-                    // decomposition whose arg is `gparams`' `i`th type
-                    // variable, so `ref_to_pred`/`ref_to_snap` yield
-                    // `p_Param(addr, U)` / `p_Param(addr, V)` directly; the referent
-                    // snapshot is transferred via `value_cast` (whose concrete-type
-                    // axioms are added in `MirBuiltinUseCastEnc`).
+                    // `unsize`/`undo` methods that move the indirect predicates
+                    // of the generic `&mut U` to those of `&mut V` on the cast
+                    // reference, and back. The predicate of the reference's own
+                    // position holds the referent's `p_Param` predicate, which the
+                    // coercion keeps at the same address; the others hold those of
+                    // the lifetimes in the referent, which a use merges into one
+                    // predicate before and splits after (see
+                    // `MirBuiltinUseCastOutput`). The methods are declared over the
+                    // same `[U, V]` type params (`params`), which
+                    // `MirBuiltinUseCastEnc` instantiates with the operand referent
+                    // `U` and result referent `V`. The referent snapshot is
+                    // transferred via `value_cast` (whose concrete-type axioms are
+                    // added in `MirBuiltinUseCastEnc`).
                     let methods = if is_mut {
                         let u_impure = deps.require_dep::<TyUseImpureEnc>(
                             LazyRustTy::new_param_ty(0).decompose(gparams),
@@ -397,16 +413,40 @@ impl TaskEncoder for MirBuiltinCastEnc {
                         let v_impure = deps.require_dep::<TyUseImpureEnc>(
                             LazyRustTy::new_param_ty(1).decompose(gparams),
                         )?;
+                        let tcx = vcx.tcx();
+                        let mut_ref = |referent| {
+                            let ty = ty::Ty::new_mut_ref(tcx, tcx.lifetimes.re_erased, referent);
+                            RustTyDecomposition::from_ty(ty, gparams)
+                        };
+                        let [u, v] = CastTyArgs::referents(vcx);
+                        let u_nodes = NodePredicates::new(mut_ref(u), deps)?;
+                        let v_nodes = NodePredicates::new(mut_ref(v), deps)?;
 
                         let src_mutref = op_ty.expect_mutref();
                         let src_decl = vcx.mk_local_decl("src", op_ty_snap);
                         let src_ex = vcx.mk_local_ex(src_decl);
                         let addr = src_mutref.deref_access(src_ex);
+                        let cast_ex =
+                            cast_idn.call()(src_ex, params.ty_exprs(), params.const_exprs());
 
-                        let u_pred = u_impure.ref_to_pred(vcx, addr, None);
-                        let v_pred = v_impure.ref_to_pred(vcx, addr, None);
-                        let u_snap = u_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>();
-                        let v_snap = v_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>();
+                        let u_preds = u_nodes.all(src_ex.upcast_ty());
+                        let v_preds = v_nodes.all(cast_ex.upcast_ty());
+                        // The referent's snapshot, read in the predicate of the
+                        // reference's own position, the outermost one.
+                        let referent_snap = |nodes: &NodePredicates<'vir>, reference, snap| {
+                            let own = nodes.positions()[0];
+                            vcx.mk_unfolding_expr(nodes.predicate(own, reference), snap)
+                        };
+                        let u_snap = referent_snap(
+                            &u_nodes,
+                            src_ex.upcast_ty(),
+                            u_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>(),
+                        );
+                        let v_snap = referent_snap(
+                            &v_nodes,
+                            cast_ex.upcast_ty(),
+                            v_impure.ref_to_snap(addr).downcast_ty::<vir::PSnap>(),
+                        );
 
                         // `unsize`: operand referent `U` -> result referent `V`; the
                         // new `V` value is `value_cast(old(U), U, V)`. `undo` is the
@@ -418,6 +458,67 @@ impl TaskEncoder for MirBuiltinCastEnc {
                             vcx.mk_eq_expr(v_snap, value_cast(vcx.mk_old_expr(u_snap)));
                         let undo_value =
                             vcx.mk_eq_expr(vcx.mk_old_expr(v_snap), value_cast(u_snap));
+
+                        // Names the operand's keys by the result's.
+                        let uncast_idn = FunctionIdn::new(
+                            vir::vir_format_identifier!(
+                                vcx,
+                                "mir_uncast_unsize_{}_to_{}",
+                                operand_ty.name(),
+                                result_ty.name()
+                            ),
+                            (res_ty_snap, params.ty_args(), params.const_args()),
+                            op_ty_snap,
+                        );
+                        let k_decl = vcx.mk_local_decl("k", op_ty_snap);
+                        let k_ex = vcx.mk_local_ex(k_decl);
+                        let casted = cast_idn.call()(k_ex, params.ty_exprs(), params.const_exprs());
+                        let uncasted =
+                            uncast_idn.call()(casted, params.ty_exprs(), params.const_exprs());
+                        let inverse = vir::expr! { vcx;
+                            forall [k_decl], ..[params.ty_decls()], ..[params.const_decls()]
+                                :: { [casted] }
+                                ([uncasted]) == ([k_ex])
+                        };
+                        let uncast_domain = vcx.mk_domain(
+                            vir::vir_format_identifier!(
+                                vcx,
+                                "Uncast_unsize_{}_to_{}",
+                                operand_ty.name(),
+                                result_ty.name()
+                            ),
+                            &[],
+                            vcx.alloc_slice(&[vcx.mk_domain_axiom(
+                                vir::vir_format_identifier!(
+                                    vcx,
+                                    "uncast_unsize_{}_to_{}",
+                                    operand_ty.name(),
+                                    result_ty.name()
+                                ),
+                                inverse,
+                            )]),
+                            vcx.alloc_slice(&[vcx.mk_domain_function(uncast_idn, false, None)]),
+                            None,
+                        );
+                        // The contents survive the coercion and its undo.
+                        let mut unsize_contents = Vec::new();
+                        let mut undo_contents = Vec::new();
+                        for p in u_nodes.positions() {
+                            let u_deep = u_nodes.deep_snap_at(src_ex.upcast_ty(), &[p]);
+                            let v_deep = v_nodes.deep_snap_at(cast_ex.upcast_ty(), &[p]);
+                            let cast_old = cast_idn.call()(
+                                vcx.mk_old_expr(u_deep).downcast_ty(),
+                                params.ty_exprs(),
+                                params.const_exprs(),
+                            );
+                            let uncast_old = uncast_idn.call()(
+                                vcx.mk_old_expr(v_deep).downcast_ty(),
+                                params.ty_exprs(),
+                                params.const_exprs(),
+                            );
+                            unsize_contents.push(vcx.mk_eq_expr(v_deep, cast_old.upcast_ty()));
+                            undo_contents.push(vcx.mk_eq_expr(u_deep, uncast_old.upcast_ty()));
+                        }
 
                         let unsize_idn = MethodIdn::new(
                             vir::vir_format_identifier!(
@@ -441,19 +542,33 @@ impl TaskEncoder for MirBuiltinCastEnc {
                             unsize_idn,
                             (src_decl, params.ty_decls(), params.const_decls()),
                             &[],
-                            vcx.alloc_slice(&[u_pred]),
-                            vcx.alloc_slice(&[v_pred, unsize_value]),
+                            vcx.alloc_slice(&u_preds),
+                            vcx.alloc_slice(
+                                &[
+                                    v_preds.as_slice(),
+                                    &[unsize_value],
+                                    unsize_contents.as_slice(),
+                                ]
+                                .concat(),
+                            ),
                             None,
                         );
                         let undo_method = vcx.mk_method(
                             undo_idn,
                             (src_decl, params.ty_decls(), params.const_decls()),
                             &[],
-                            vcx.alloc_slice(&[v_pred]),
-                            vcx.alloc_slice(&[u_pred, undo_value]),
+                            vcx.alloc_slice(&v_preds),
+                            vcx.alloc_slice(
+                                &[u_preds.as_slice(), &[undo_value], undo_contents.as_slice()]
+                                    .concat(),
+                            ),
                             None,
                         );
-                        Some(((unsize_method, unsize_idn), (undo_method, undo_idn)))
+                        Some((
+                            (unsize_method, unsize_idn),
+                            (undo_method, undo_idn),
+                            (uncast_domain, uncast_idn),
+                        ))
                     } else {
                         None
                     };
@@ -462,11 +577,6 @@ impl TaskEncoder for MirBuiltinCastEnc {
                 _ => unreachable!("unsupported cast kinds are rejected above"),
             };
 
-            let cast_idn = FunctionIdn::new(
-                name,
-                (op_ty_snap, params.ty_args(), params.const_args()),
-                res_ty_snap,
-            );
             let cast = vcx.mk_function(
                 cast_idn,
                 (arg_decl, params.ty_decls(), params.const_decls()),
@@ -475,20 +585,26 @@ impl TaskEncoder for MirBuiltinCastEnc {
                 None,
                 Some(expr),
             );
-            let (unsize, undo) = methods.unzip();
+            let (unsize, undo, uncast) = match methods {
+                Some((unsize, undo, uncast)) => (Some(unsize), Some(undo), Some(uncast)),
+                None => (None, None, None),
+            };
             let (unsize, unsize_idn) = unsize.unzip();
             let (undo, undo_idn) = undo.unzip();
+            let (uncast, uncast_idn) = uncast.unzip();
             Ok((
                 MirBuiltinCastLocal {
                     cast,
                     unsize,
                     undo,
+                    uncast,
                     user_level,
                 },
                 MirBuiltinCastOutput {
                     cast: cast_idn,
                     unsize: unsize_idn,
                     undo: undo_idn,
+                    uncast: uncast_idn,
                     ty_args,
                 },
             ))
@@ -507,6 +623,9 @@ impl TaskEncoder for MirBuiltinCastEnc {
             }
             if let Some(undo) = local.undo {
                 program.add_method(undo);
+            }
+            if let Some(uncast) = local.uncast {
+                program.add_domain(uncast);
             }
         }
     }
